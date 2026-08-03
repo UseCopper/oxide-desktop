@@ -6,7 +6,7 @@
 #include "common/mem.h"
 #include "config/rcxml.h"
 #include "decorations.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 
 static struct wl_list decorations;

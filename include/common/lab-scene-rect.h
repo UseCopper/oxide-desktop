@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_LAB_SCENE_RECT_H
-#define LABWC_LAB_SCENE_RECT_H
+#ifndef OXIDE_DESKTOP_LAB_SCENE_RECT_H
+#define OXIDE_DESKTOP_LAB_SCENE_RECT_H
 #include <wayland-server-core.h>
 
 struct wlr_scene_tree;
@@ -37,4 +37,4 @@ struct lab_scene_rect *lab_scene_rect_create(struct wlr_scene_tree *parent,
 
 void lab_scene_rect_set_size(struct lab_scene_rect *rect, int width, int height);
 
-#endif /* LABWC_LAB_SCENE_RECT_H */
+#endif /* OXIDE_DESKTOP_LAB_SCENE_RECT_H */

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_NODE_DESCRIPTOR_H
-#define LABWC_NODE_DESCRIPTOR_H
+#ifndef OXIDE_DESKTOP_NODE_DESCRIPTOR_H
+#define OXIDE_DESKTOP_NODE_DESCRIPTOR_H
 
 #include <wayland-server-core.h>
 #include "common/node-type.h"
@@ -67,4 +67,4 @@ struct cycle_osd_item *node_cycle_osd_item_from_node(
 struct ssd_button *node_try_ssd_button_from_node(
 	struct wlr_scene_node *wlr_scene_node);
 
-#endif /* LABWC_NODE_DESCRIPTOR_H */
+#endif /* OXIDE_DESKTOP_NODE_DESCRIPTOR_H */

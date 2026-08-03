@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SESSION_LOCK_H
-#define LABWC_SESSION_LOCK_H
+#ifndef OXIDE_DESKTOP_SESSION_LOCK_H
+#define OXIDE_DESKTOP_SESSION_LOCK_H
 
 #include <wayland-server-core.h>
 
@@ -34,4 +34,4 @@ void session_lock_init(void);
 void session_lock_output_create(struct session_lock_manager *manager, struct output *output);
 void session_lock_update_for_layout_change(void);
 
-#endif /* LABWC_SESSION_LOCK_H */
+#endif /* OXIDE_DESKTOP_SESSION_LOCK_H */

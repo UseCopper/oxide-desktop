@@ -12,7 +12,7 @@
 #include "common/mem.h"
 #include "config/rcxml.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "view.h"
 

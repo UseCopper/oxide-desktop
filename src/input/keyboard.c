@@ -15,7 +15,7 @@
 #include "idle.h"
 #include "input/ime.h"
 #include "input/key-state.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "menu/menu.h"
 #include "session-lock.h"
 #include "view.h"
@@ -71,7 +71,7 @@ keyboard_get_all_modifiers(struct seat *seat)
 	 * we need to additionally get the modifiers of the virtual keyboards in addition
 	 * to the physical ones in the keyboard group. This ensures that mousebinds with
 	 * keyboard modifiers are detected correctly when using for example a VNC client
-	 * via wayvnc to control labwc. This function also gets called to decide when to
+	 * via wayvnc to control oxide-desktop. This function also gets called to decide when to
 	 * hide the window switcher and workspace OSDs and to indicate if the user wants
 	 * to snap a window to a region during a window move operation.
 	 */
@@ -529,7 +529,7 @@ handle_compositor_keybindings(struct keyboard *keyboard,
 	}
 
 	/*
-	 * Ignore labwc keybindings if the session is locked.
+	 * Ignore oxide-desktop keybindings if the session is locked.
 	 * It's important to do this after key_state_set_pressed() to ensure
 	 * _all_ key press/releases are registered
 	 */
@@ -691,7 +691,7 @@ keyboard_set_numlock(struct wlr_keyboard *keyboard)
 	/*
 	 * This updates the xkb-state + kb->modifiers and also triggers the
 	 * keyboard->events.modifiers signal (the signal has no effect in
-	 * current labwc usage since the keyboard is not part of a
+	 * current oxide-desktop usage since the keyboard is not part of a
 	 * keyboard-group yet).
 	 */
 	wlr_keyboard_notify_modifiers(keyboard, keyboard->modifiers.depressed,

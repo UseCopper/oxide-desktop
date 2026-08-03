@@ -1,4 +1,4 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'img.c',
   'img-png.c',
   'img-xbm.c',
@@ -6,7 +6,7 @@ labwc_sources += files(
 )
 
 if have_rsvg
-  labwc_sources += files(
+  oxide_desktop_sources += files(
     'img-svg.c',
   )
 endif

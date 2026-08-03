@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_RCXML_H
-#define LABWC_RCXML_H
+#ifndef OXIDE_DESKTOP_RCXML_H
+#define OXIDE_DESKTOP_RCXML_H
 
 #include <stdbool.h>
 #include <wayland-server-core.h>
@@ -236,4 +236,4 @@ void append_parsed_actions(xmlNode *node, struct wl_list *list);
 
 uint32_t parse_privileged_interface(const char *name);
 
-#endif /* LABWC_RCXML_H */
+#endif /* OXIDE_DESKTOP_RCXML_H */

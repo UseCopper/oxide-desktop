@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_CONFIG_TYPES_H
-#define LABWC_CONFIG_TYPES_H
+#ifndef OXIDE_DESKTOP_CONFIG_TYPES_H
+#define OXIDE_DESKTOP_CONFIG_TYPES_H
 
 /*
  * Shared (basic) types related to user configuration.
@@ -130,4 +130,4 @@ enum cycle_app_id_filter {
 	CYCLE_APP_ID_CURRENT,
 };
 
-#endif /* LABWC_CONFIG_TYPES_H */
+#endif /* OXIDE_DESKTOP_CONFIG_TYPES_H */

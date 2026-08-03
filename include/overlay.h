@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_OVERLAY_H
-#define LABWC_OVERLAY_H
+#ifndef OXIDE_DESKTOP_OVERLAY_H
+#define OXIDE_DESKTOP_OVERLAY_H
 
 #include "common/edge.h"
 

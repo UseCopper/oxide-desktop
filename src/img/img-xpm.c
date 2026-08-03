@@ -8,7 +8,7 @@
  * Authors: Mark Crichton <crichton@gimp.org>
  *          Federico Mena-Quintero <federico@gimp.org>
  *
- * Adapted for labwc by John Lindgren, 2024
+ * Adapted for oxide-desktop by John Lindgren, 2024
  */
 
 #include "img/img-xpm.h"
@@ -290,7 +290,7 @@ xpm_load_to_surface(struct file_handle *handle)
 		wlr_log(WLR_DEBUG, "XPM file has image height <= 0");
 		return NULL;
 	}
-	/* Limits (width, height, colors) modified for labwc */
+	/* Limits (width, height, colors) modified for oxide-desktop */
 	if (h > 1024 || w > 1024) {
 		wlr_log(WLR_DEBUG, "XPM file is larger than 1024x1024");
 		return NULL;

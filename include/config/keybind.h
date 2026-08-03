@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_KEYBIND_H
-#define LABWC_KEYBIND_H
+#ifndef OXIDE_DESKTOP_KEYBIND_H
+#define OXIDE_DESKTOP_KEYBIND_H
 
 #include <stdbool.h>
 #include <wayland-util.h>
@@ -47,4 +47,4 @@ bool keybind_contains_keycode(struct keybind *keybind, xkb_keycode_t keycode);
 bool keybind_contains_keysym(struct keybind *keybind, xkb_keysym_t keysym);
 
 void keybind_update_keycodes(void);
-#endif /* LABWC_KEYBIND_H */
+#endif /* OXIDE_DESKTOP_KEYBIND_H */

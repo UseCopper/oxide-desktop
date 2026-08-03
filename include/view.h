@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_VIEW_H
-#define LABWC_VIEW_H
+#ifndef OXIDE_DESKTOP_VIEW_H
+#define OXIDE_DESKTOP_VIEW_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,7 +29,7 @@
 #define VIEW_FALLBACK_HEIGHT 480
 
 /*
- * In labwc, a view is a container for surfaces which can be moved around by
+ * In oxide-desktop, a view is a container for surfaces which can be moved around by
  * the user. In practice this means XDG toplevel and XWayland windows.
  */
 enum view_type {
@@ -72,7 +72,7 @@ enum view_wants_focus {
 	 * Globally Active input model per the ICCCM. These views are
 	 * offered focus and will voluntarily accept or decline it.
 	 *
-	 * In some cases, labwc needs to decide in advance whether to
+	 * In some cases, oxide-desktop needs to decide in advance whether to
 	 * focus the view. For this purpose, these views are classified
 	 * (by a heuristic) as likely or unlikely to want focus. However,
 	 * it is still ultimately up to the client whether the view gets
@@ -639,4 +639,4 @@ struct wlr_xdg_surface *xdg_surface_from_view(struct view *view);
 
 bool view_matches_criteria(struct view *view, enum lab_view_criteria criteria);
 
-#endif /* LABWC_VIEW_H */
+#endif /* OXIDE_DESKTOP_VIEW_H */

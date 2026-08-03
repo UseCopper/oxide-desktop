@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_STRING_HELPERS_H
-#define LABWC_STRING_HELPERS_H
+#ifndef OXIDE_DESKTOP_STRING_HELPERS_H
+#define OXIDE_DESKTOP_STRING_HELPERS_H
 #include <stdbool.h>
 
 /**
@@ -97,4 +97,4 @@ bool str_starts_with(const char *s, char needle, const char *ignore_chars);
  */
 bool str_equal(const char *a, const char *b);
 
-#endif /* LABWC_STRING_HELPERS_H */
+#endif /* OXIDE_DESKTOP_STRING_HELPERS_H */

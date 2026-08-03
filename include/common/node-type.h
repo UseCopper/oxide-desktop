@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_NODE_TYPE_H
-#define LABWC_NODE_TYPE_H
+#ifndef OXIDE_DESKTOP_NODE_TYPE_H
+#define OXIDE_DESKTOP_NODE_TYPE_H
 
 #include "common/edge.h"
 
 /*
- * In labwc, "node type" indicates the role of a wlr_scene_node in the
+ * In oxide-desktop, "node type" indicates the role of a wlr_scene_node in the
  * overall desktop. It also maps more-or-less to the openbox concept of
  * "context" (as used when defining mouse bindings).
  *
@@ -72,4 +72,4 @@ bool node_type_contains(enum lab_node_type whole, enum lab_node_type part);
 
 enum lab_edge node_type_to_edges(enum lab_node_type type);
 
-#endif /* LABWC_NODE_TYPE_H */
+#endif /* OXIDE_DESKTOP_NODE_TYPE_H */

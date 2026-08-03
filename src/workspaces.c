@@ -19,7 +19,7 @@
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "show-desktop.h"
 #include "theme.h"

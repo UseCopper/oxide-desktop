@@ -8,7 +8,7 @@
 - [4. Coding Style](#coding-style)
   - [4.1 Linux Kernel Style Basics](#linux-kernel-style-basics)
   - [4.2 Devault Deviations](#devault-deviations)
-  - [4.3 Labwc Specifics](#labwc-specifics)
+  - [4.3 Oxide-desktop Specifics](#oxide-desktop-specifics)
     - [4.3.1 API](#api)
     - [4.3.2 The Use of GLib](#the-use-of-glib)
     - [4.3.3 The Use of GNU Extensions](#the-use-of-gnu-extensions)
@@ -52,34 +52,34 @@ meson compile -C build/
 
 ## Debug Logs
 
-Get debug log with `labwc -d`. The log can be directed to a file with `labwc -d
+Get debug log with `oxide-desktop -d`. The log can be directed to a file with `oxide-desktop -d
 2>log.txt`
 
 To see what is happening on the wayland protocol for a specific client, run it
 with environment variable `WAYLAND_DEBUG` set to 1, for example `WAYLAND_DEBUG=1
 foot`.
 
-To see what the compositor is doing on the protocol run `labwc` nested (i.e.
-start labwc from a terminal in another instance of labwc or some other
+To see what the compositor is doing on the protocol run `oxide-desktop` nested (i.e.
+start oxide-desktop from a terminal in another instance of oxide-desktop or some other
 compositor) with `WAYLAND_DEBUG=server`. This filters out anything from clients.
 
 For wayland clients, you can get a live view of some useful info using [wlhax].
 
 ## Output
 
-If you think you've got a damage issue, you can run labwc like this:
-`WLR_SCENE_DEBUG_DAMAGE=highlight labwc` to get a visual indication of damage
+If you think you've got a damage issue, you can run oxide-desktop like this:
+`WLR_SCENE_DEBUG_DAMAGE=highlight oxide-desktop` to get a visual indication of damage
 regions.
 
 To emulate multiple outputs (even if you only have one physical monitor), run
-with `WLR_WL_OUTPUTS=2 labwc` or similar. See [`wlroots/docs/env_vars.md`] for
+with `WLR_WL_OUTPUTS=2 oxide-desktop` or similar. See [`wlroots/docs/env_vars.md`] for
 more options.
 
 For some types of bugs, it might be useful to find out which mesa driver (.so)
-you are using. This can be done with `EGL_LOG_LEVEL=debug labwc 2>&1 | grep
+you are using. This can be done with `EGL_LOG_LEVEL=debug oxide-desktop 2>&1 | grep
 MESA-LOADER`
 
-To rule out driver issues you can run with `WLR_RENDERER=pixman labwc`
+To rule out driver issues you can run with `WLR_RENDERER=pixman oxide-desktop`
 
 You can also get some useful system info with [drm_info].
 
@@ -92,7 +92,7 @@ to analyse keyboard events
 
 # Packaging
 
-Some distributions carry labwc in their repositories or user repositories.
+Some distributions carry oxide-desktop in their repositories or user repositories.
 
 - @ptrcnull (Alpine)
 - @ptr1337 (Arch)
@@ -108,12 +108,12 @@ Some distributions carry labwc in their repositories or user repositories.
 kindly maintain the packages in their respective distro.
 
 Let's keep them informed of new releases and any changes that relate to
-packaging.  If you are maintaining a labwc package for another distro feel free
+packaging.  If you are maintaining a oxide-desktop package for another distro feel free
 to open an issue so we can add you to this list.
 
 # Coding Style
 
-labwc is written in the [Linux kernel coding style] with a small number of
+oxide-desktop is written in the [Linux kernel coding style] with a small number of
 deviations to align with [Drew Devault's preferred coding style] namely:
 
 1. [Function Declaration](https://git.sr.ht/~sircmpwn/cstyle#function-declarations)
@@ -222,7 +222,7 @@ operators (for example `&&`) on the next line.
 	}
 ```
 
-## Labwc Specifics
+## Oxide-desktop Specifics
 
 ### API
 
@@ -265,7 +265,7 @@ and can keep the code simpler.
 For example, if we were going to carry out extensive string manipulation,
 GString and utf8 helpers would be okay. Some functions such as
 `g_utf8_casefold()` would be pretty hard to write from scratch and are fine to
-use. Having said that, labwc does not do much string-mangling.
+use. Having said that, oxide-desktop does not do much string-mangling.
 
 The following functions are used today and are deemed acceptable by the core
 devs:
@@ -362,11 +362,11 @@ In new files, please order `#include` lines as follows:
   compiles cleanly on its own, without implicit dependencies on other
   headers being included first.
 
-- Then list any "system" headers (those not part of labwc) in alphabetical
+- Then list any "system" headers (those not part of oxide-desktop) in alphabetical
   order, using angle brackets. This includes 3rd-party library headers
   such as `<cairo.h>`, as well as wlroots headers.
 
-- Then list any other labwc headers in alphabetical order, using quotation
+- Then list any other oxide-desktop headers in alphabetical order, using quotation
   marks and relative to the `include/` folder. Subfolders below `include/`,
   such as `common/`, should be specified even when including one header
   from another in the same folder (for example, `#include "common/buf.h"`
@@ -436,12 +436,12 @@ can be added without account.
 ### GitHub Pull Request
 
 Translators can add their `MY_LOCALE.po` files to the `po` directory
-based on `po/labwc.pot`, and issue a pull request. To do this they can
+based on `po/oxide-desktop.pot`, and issue a pull request. To do this they can
 generate their `MY_LOCALE.po` file in a few steps:
 
 1. Edit the `po/LINGUAS` file to add their locale code in English
    alphabetical order to the field of locale codes.
-2. Copy the `po/labwc.pot` to `po/MY_LOCALE.po`
+2. Copy the `po/oxide-desktop.pot` to `po/MY_LOCALE.po`
 3. Edit the newly generated `MY_LOCALE.po` file with some of their
 contact and locale details in the header of the file. Then, add the
 translation strings under each English string.
@@ -452,25 +452,25 @@ translation strings under each English string.
 
 Code contributors may need to update relevant files if their additions
 affect UI elements (at the moment only `src/menu/menu.c` and
-`src/config/rcxml.c`). In this case the `po/labwc.pot` file needs to be
+`src/config/rcxml.c`). In this case the `po/oxide-desktop.pot` file needs to be
 updated so that translators can update their translations. Remember,
 many translators are _not_ coders!
 
 The process is fairly trivial however does involve some manual steps.
 
 1. After adding and testing your code additions to satisfaction, backup
-`po/labwc.pot`. You need the custom header from that file for the newly
+`po/oxide-desktop.pot`. You need the custom header from that file for the newly
 generated .pot file in the next step.
 
 2. From the root of the repository run this:
 
 ```
-xgettext --keyword=_ --language=C --add-comments -o po/labwc.pot src/menu/menu.c src/config/rcxml.c
+xgettext --keyword=_ --language=C --add-comments -o po/oxide-desktop.pot src/menu/menu.c src/config/rcxml.c
 ```
 
-This generates a new pot file at `po/labwc.pot`
+This generates a new pot file at `po/oxide-desktop.pot`
 
-3. Copy the header from the original `labwc.pot` to the new one, keeping
+3. Copy the header from the original `oxide-desktop.pot` to the new one, keeping
 the newly generated dates, check for sanity and commit.
 
 # Tools
@@ -510,7 +510,7 @@ follow the steps to be taken:
 3. In `meson.build`, update the version, and (if required) the wlroots
    dependency version. Then run `git commit -m 'build: bump version to X.Y.Z'`
 4. Run `git tag -a X.Y.Z`. The first line of the commit message should be
-   "labwc X.Y.Z" and the body should be the `NEWS.md` additions removing
+   "oxide-desktop X.Y.Z" and the body should be the `NEWS.md` additions removing
    hash characters (#) from the headings as these will otherwise be
    ignored by git.
 5. On GitHub, create a 'Release' as some distros use this as a trigger. Set it

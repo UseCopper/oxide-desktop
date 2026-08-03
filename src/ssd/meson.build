@@ -1,4 +1,4 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'resize-indicator.c',
   'ssd.c',
   'ssd-button.c',

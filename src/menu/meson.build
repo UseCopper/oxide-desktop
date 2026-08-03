@@ -1,3 +1,3 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'menu.c',
 )

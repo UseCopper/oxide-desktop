@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Theme engine for labwc
+ * Theme engine for oxide-desktop
  *
  * Copyright (C) Johan Malm 2020-2023
  */
@@ -30,7 +30,7 @@
 #include "common/string-helpers.h"
 #include "config/rcxml.h"
 #include "img/img.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "buffer.h"
 #include "ssd.h"
 
@@ -425,7 +425,7 @@ parse_hexstr(const char *hex, float *rgba)
 		rgba[3] = atoi(hex + 8) / 100.0;
 		wlr_log(WLR_ERROR,
 			"The theme uses deprecated alpha notation %s, please convert to "
-			"#rrggbbaa to ensure your config works on newer labwc releases", hex);
+			"#rrggbbaa to ensure your config works on newer oxide-desktop releases", hex);
 	} else if (len == 9) {
 		/* Inline alpha encoding like #aabbccff */
 		rgba[3] = (hex_to_dec(hex[7]) * 16 + hex_to_dec(hex[8])) / 255.0;
@@ -522,8 +522,8 @@ parse_justification(const char *str)
  * wants to use openbox without a theme - it'll all just be black and white.
  *
  * Openbox doesn't actual start if it can't find a theme. As it's normally
- * packaged with Clearlooks, this is not a problem, but for labwc I thought
- * this was a bit hard-line. People might want to try labwc without having
+ * packaged with Clearlooks, this is not a problem, but for oxide-desktop I thought
+ * this was a bit hard-line. People might want to try oxide-desktop without having
  * Openbox (and associated themes) installed.
  *
  * theme_builtin() applies a theme that is similar to vanilla GTK
@@ -1828,7 +1828,7 @@ theme_init(struct theme *theme, const char *theme_name)
 	if (theme_name) {
 		/*
 		 * Read
-		 *   - <data-dir>/share/themes/$theme_name/labwc/themerc
+		 *   - <data-dir>/share/themes/$theme_name/oxide-desktop/themerc
 		 *   - <data-dir>/share/themes/$theme_name/openbox-3/themerc
 		 */
 		paths_theme_create(&paths, theme_name, "themerc");
@@ -1836,7 +1836,7 @@ theme_init(struct theme *theme, const char *theme_name)
 		paths_destroy(&paths);
 	}
 
-	/* Read <config-dir>/labwc/themerc-override */
+	/* Read <config-dir>/oxide-desktop/themerc-override */
 	paths_config_create(&paths, "themerc-override");
 	theme_read(theme, &paths);
 	paths_destroy(&paths);

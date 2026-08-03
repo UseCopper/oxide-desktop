@@ -12,7 +12,7 @@ i18n.gettext(
     '--directory=' + source_root,
     '--add-comments=TRANSLATORS',
     '--keyword=_',
-    '--msgid-bugs=https://github.com/labwc/labwc/issues',
+    '--msgid-bugs=https://github.com/UseCopper/oxide-desktop/issues',
   ],
   preset: 'glib',
 )

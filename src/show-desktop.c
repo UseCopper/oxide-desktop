@@ -3,7 +3,7 @@
 #include <wlr/types/wlr_seat.h>
 #include "common/array.h"
 #include "config/types.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 
 static bool is_showing_desktop;

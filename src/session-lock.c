@@ -7,7 +7,7 @@
 #include <wlr/types/wlr_session_lock_v1.h>
 #include "common/mem.h"
 #include "common/scene-helpers.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 

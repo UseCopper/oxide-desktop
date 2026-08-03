@@ -6,7 +6,7 @@
 #include <strings.h>
 #include "action.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 
 static bool

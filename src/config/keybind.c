@@ -10,7 +10,7 @@
 #include "common/list.h"
 #include "common/mem.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 
 uint32_t
 parse_modifier(const char *symname)

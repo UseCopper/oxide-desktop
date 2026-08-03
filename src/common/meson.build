@@ -1,4 +1,4 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'box.c',
   'buf.c',
   'dir.c',

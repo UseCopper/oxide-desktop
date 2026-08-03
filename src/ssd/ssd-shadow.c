@@ -5,7 +5,7 @@
 #include "buffer.h"
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "ssd.h"
 #include "ssd-internal.h"
 #include "theme.h"

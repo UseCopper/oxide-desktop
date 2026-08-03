@@ -1,5 +1,5 @@
 project(
-  'labwc',
+  'oxide-desktop',
   'c',
   version: '0.20.1',
   license: 'GPL-2.0-only',
@@ -48,7 +48,7 @@ if git.found()
     version = '"@0@"'.format(git_commit.stdout().strip())
   endif
 endif
-add_project_arguments('-DLABWC_VERSION=@0@'.format(version), language: 'c')
+add_project_arguments('-DOXIDE_DESKTOP_VERSION=@0@'.format(version), language: 'c')
 
 wlroots = dependency(
   'wlroots-0.20',
@@ -154,11 +154,11 @@ else
   conf_data.set('HAVE_NLS', 0)
 endif
 
-labwc_inc = include_directories('include')
+oxide_desktop_inc = include_directories('include')
 
 subdir('protocols')
 
-labwc_deps = [
+oxide_desktop_deps = [
   server_protos,
   wayland_server,
   wlroots,
@@ -176,12 +176,12 @@ labwc_deps = [
   png,
 ]
 if have_rsvg
-  labwc_deps += [
+  oxide_desktop_deps += [
     svg,
   ]
 endif
 if have_libsfdo
-  labwc_deps += [
+  oxide_desktop_deps += [
     sfdo_basedir,
     sfdo_desktop,
     sfdo_icon,
@@ -200,29 +200,29 @@ endif
 
 executable(
   meson.project_name(),
-  labwc_sources,
-  include_directories: [labwc_inc],
-  dependencies: labwc_deps,
+  oxide_desktop_sources,
+  include_directories: [oxide_desktop_inc],
+  dependencies: oxide_desktop_deps,
   install: true,
   link_args: link_args,
 )
 
-install_data('data/labwc.desktop', install_dir: get_option('datadir') / 'wayland-sessions')
+install_data('data/oxide-desktop.desktop', install_dir: get_option('datadir') / 'wayland-sessions')
 
-install_data('data/labwc-portals.conf', install_dir: get_option('datadir') / 'xdg-desktop-portal')
+install_data('data/oxide-desktop-portals.conf', install_dir: get_option('datadir') / 'xdg-desktop-portal')
 
-# Install labwc-session.target so that systemd user services with
+# Install oxide-desktop-session.target so that systemd user services with
 # WantedBy=graphical-session.target can be started and stopped in sync
-# with a labwc session (see labwc(1) SESSION MANAGEMENT for the opt-in
+# with an oxide-desktop session (see oxide-desktop(1) SESSION MANAGEMENT for the opt-in
 # autostart/shutdown snippet).
 systemd_feat = get_option('systemd-session')
 systemd = dependency('systemd', required: systemd_feat)
 if systemd.found()
-  install_data('data/labwc-session.target',
+  install_data('data/oxide-desktop-session.target',
     install_dir: systemd.get_variable('systemduserunitdir'))
 endif
 
-icons = ['labwc-symbolic.svg', 'labwc.svg']
+icons = ['oxide-desktop-symbolic.svg', 'oxide-desktop.svg']
 foreach icon : icons
   icon_path = join_paths('data', icon)
   install_data(icon_path, install_dir: get_option('datadir') / 'icons/hicolor/scalable/apps')

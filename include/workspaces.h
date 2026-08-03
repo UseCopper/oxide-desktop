@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_WORKSPACES_H
-#define LABWC_WORKSPACES_H
+#ifndef OXIDE_DESKTOP_WORKSPACES_H
+#define OXIDE_DESKTOP_WORKSPACES_H
 
 #include <stdbool.h>
 #include <wayland-util.h>
@@ -28,4 +28,4 @@ struct workspace *workspaces_find(struct workspace *anchor, const char *name,
 	bool wrap);
 void workspaces_reconfigure(void);
 
-#endif /* LABWC_WORKSPACES_H */
+#endif /* OXIDE_DESKTOP_WORKSPACES_H */

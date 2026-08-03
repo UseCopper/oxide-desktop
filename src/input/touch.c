@@ -14,7 +14,7 @@
 #include "config/rcxml.h"
 #include "config/touch.h"
 #include "idle.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "ssd.h"
 #include "view.h"
 
@@ -43,8 +43,8 @@ touch_get_coords(struct seat *seat, struct wlr_touch *touch, double x, double y,
 	}
 
 	/*
-	 * Do not return a surface when a labwc menu is still open.
-	 * The idea is: when a client supports touch, but a labwc root or
+	 * Do not return a surface when a oxide-desktop menu is still open.
+	 * The idea is: when a client supports touch, but a oxide-desktop root or
 	 * client menu is open, use mouse emulation for the first touch
 	 * interaction. Mouse emulation for this first touch then runs through
 	 * the normal cursor logic which closes the menu. All touch interaction

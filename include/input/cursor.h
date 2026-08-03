@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_CURSOR_H
-#define LABWC_CURSOR_H
+#ifndef OXIDE_DESKTOP_CURSOR_H
+#define OXIDE_DESKTOP_CURSOR_H
 
 #include <wayland-server-protocol.h>
 #include "common/edge.h"
@@ -14,7 +14,7 @@ struct wlr_cursor;
 struct wlr_surface;
 struct wlr_scene_node;
 
-/* Cursors used internally by labwc */
+/* Cursors used internally by oxide-desktop */
 enum lab_cursors {
 	LAB_CURSOR_CLIENT = 0,
 	LAB_CURSOR_DEFAULT,
@@ -116,11 +116,11 @@ enum lab_cursors cursor_get_from_edge(enum lab_edge resize_edges);
 void cursor_update_focus(void);
 
 /**
- * cursor_update_image - re-set the labwc cursor image
+ * cursor_update_image - re-set the oxide-desktop cursor image
  * @seat - seat
  *
  * This can be used to update the cursor image on output scale changes.
- * If the current cursor image was not set by labwc but some client
+ * If the current cursor image was not set by oxide-desktop but some client
  * this is a no-op.
  */
 void cursor_update_image(struct seat *seat);
@@ -167,4 +167,4 @@ void cursor_emulate_axis(struct seat *seat,
 		enum wl_pointer_axis_source source, uint32_t time_msec);
 void cursor_finish(struct seat *seat);
 
-#endif /* LABWC_CURSOR_H */
+#endif /* OXIDE_DESKTOP_CURSOR_H */

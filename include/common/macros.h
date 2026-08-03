@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_MACROS_H
-#define LABWC_MACROS_H
+#ifndef OXIDE_DESKTOP_MACROS_H
+#define OXIDE_DESKTOP_MACROS_H
 
 #include <limits.h>
 #include <wlr/version.h>
@@ -69,4 +69,4 @@
 
 #define LAB_WLR_VERSION_LOWER(major, minor, micro) (!LAB_WLR_VERSION_AT_LEAST(major, minor, micro))
 
-#endif /* LABWC_MACROS_H */
+#endif /* OXIDE_DESKTOP_MACROS_H */

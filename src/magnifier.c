@@ -10,7 +10,7 @@
 #include <wlr/util/transform.h>
 #include "common/box.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "theme.h"
 

@@ -9,7 +9,7 @@
 #include "common/mem.h"
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "scaled-buffer/scaled-font-buffer.h"
 #include "scaled-buffer/scaled-icon-buffer.h"

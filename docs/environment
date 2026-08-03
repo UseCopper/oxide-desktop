@@ -1,5 +1,5 @@
 ##
-## Example ~/.config/labwc/environment file.
+## Example ~/.config/oxide-desktop/environment file.
 ## Uncomment lines starting with one '#' to suit your needs.
 ##
 
@@ -46,11 +46,11 @@
 # WLR_NO_HARDWARE_CURSORS=1
 
 ##
-## In order for labwc to work out of the box, the environment variable below
+## In order for oxide-desktop to work out of the box, the environment variable below
 ## is set to "1" by default to avoid menus with incorrect offset and blank
 ## windows with Java applications such as JetBrains and Intellij Idea.
 ## See https://github.com/swaywm/sway/issues/595
-## labwc will not override any already set environment variables, so if you for
+## oxide-desktop will not override any already set environment variables, so if you for
 ## some reason do not want this, then just set it to "0" (not recommended, but
 ## mentioned here for completeness).
 ##
@@ -59,13 +59,13 @@
 
 ##
 ## This allows xdg-desktop-portal-wlr to function (e.g. for screen-recording).
-## It is automatically set to "labwc:wlroots" by labwc though, so it is only
-## included here for completeness. Again, labwc will not over-write an
+## It is automatically set to "oxide-desktop:wlroots" by oxide-desktop though, so it is only
+## included here for completeness. Again, oxide-desktop will not over-write an
 ## already set environment variable, so if you need it set to something else,
 ## then uncomment and adjust.
 ##
 
-# XDG_CURRENT_DESKTOP=labwc:wlroots
+# XDG_CURRENT_DESKTOP=oxide-desktop:wlroots
 
 ##
 ## This causes a virtual output to be created automatically whenever there
@@ -80,5 +80,5 @@
 ## resize the output to match the client resolution.
 ##
 
-# LABWC_FALLBACK_OUTPUT=NOOP-fallback
+# OXIDE_DESKTOP_FALLBACK_OUTPUT=NOOP-fallback
 

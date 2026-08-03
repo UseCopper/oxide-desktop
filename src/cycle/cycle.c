@@ -10,7 +10,7 @@
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
 #include "config/types.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "scaled-buffer/scaled-font-buffer.h"

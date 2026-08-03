@@ -1,12 +1,12 @@
-labnag(1)
+oxide-nag(1)
 
 # NAME
 
-labnag - Show dialog with message and buttons
+oxide-nag - Show dialog with message and buttons
 
 # SYNOPSIS
 
-_labnag_ [options...]
+_oxide-nag_ [options...]
 
 # OPTIONS
 
@@ -18,7 +18,7 @@ _labnag_ [options...]
 
 *-Z, --button-dismiss* <text> [<action>]
 	Create a button with the text _text_ that optionally executes _action_
-	when pressed, and dismisses labnag. Multiple buttons can be defined by
+	when pressed, and dismisses oxide-nag. Multiple buttons can be defined by
 	providing the flag multiple times. Buttons will appear in the order
 	they are provided from left to right.
 
@@ -120,18 +120,18 @@ _labnag_ [options...]
 
 # EXAMPLE
 
-This is a simple example of a _labnag_ logout GUI.
+This is a simple example of an _oxide-nag_ logout GUI.
 
 ```
 #!/bin/sh
 
-# logout with labnag
+# logout with oxide-nag
 
-labnag \\
+oxide-nag \\
  -f "Hack Regular 10"\\
  -m "Choose your logout option"\\
  -Z "  Lock   " "gtklock -d"\\
- -Z " Logout  " "labwc -e"\\
+ -Z " Logout  " "oxide-desktop -e"\\
  -Z "Shutdown " "systemctl poweroff"\\
  -Z " Reboot  " "systemctl reboot"\\
  -Z "Hibernate" "systemctl hibernate"\\

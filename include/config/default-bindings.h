@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_DEFAULT_BINDINGS_H
-#define LABWC_DEFAULT_BINDINGS_H
+#ifndef OXIDE_DESKTOP_DEFAULT_BINDINGS_H
+#define OXIDE_DESKTOP_DEFAULT_BINDINGS_H
 
 #include <stddef.h>
 
@@ -444,4 +444,4 @@ static struct mouse_combos {
 	},
 };
 
-#endif /* LABWC_DEFAULT_BINDINGS_H */
+#endif /* OXIDE_DESKTOP_DEFAULT_BINDINGS_H */

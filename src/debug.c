@@ -7,7 +7,7 @@
 #include "common/scene-helpers.h"
 #include "common/string-helpers.h"
 #include "input/ime.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "ssd.h"

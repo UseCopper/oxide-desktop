@@ -209,7 +209,7 @@ spawn_piped(const char *command, int *pipe_fd)
 		_exit(1);
 	}
 
-	/* labwc */
+	/* oxide-desktop */
 	close(pipe_rw[1]);
 
 	/*

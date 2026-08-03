@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_MAGNIFIER_H
-#define LABWC_MAGNIFIER_H
+#ifndef OXIDE_DESKTOP_MAGNIFIER_H
+#define OXIDE_DESKTOP_MAGNIFIER_H
 
 #include <stdbool.h>
 
@@ -22,4 +22,4 @@ void magnifier_draw(struct output *output, struct wlr_buffer *output_buffer,
 bool magnifier_is_enabled(void);
 void magnifier_reset(void);
 
-#endif /* LABWC_MAGNIFIER_H */
+#endif /* OXIDE_DESKTOP_MAGNIFIER_H */

@@ -7,7 +7,7 @@
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
 #include "input/cursor.h"
-#include "labwc.h"  /* for struct seat */
+#include "oxide-desktop.h"  /* for struct seat */
 #include "view.h"
 
 /* Internal DnD handlers */

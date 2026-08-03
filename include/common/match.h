@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_MATCH_H
-#define LABWC_MATCH_H
+#ifndef OXIDE_DESKTOP_MATCH_H
+#define OXIDE_DESKTOP_MATCH_H
 
 #include <stdbool.h>
 
@@ -12,4 +12,4 @@
  */
 bool match_glob(const char *pattern, const char *string);
 
-#endif /* LABWC_MATCH_H */
+#endif /* OXIDE_DESKTOP_MATCH_H */

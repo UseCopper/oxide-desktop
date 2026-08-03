@@ -22,7 +22,7 @@
 #include "debug.h"
 #include "input/keyboard.h"
 #include "input/key-state.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "magnifier.h"
 #include "menu/menu.h"
 #include "output.h"
@@ -1070,7 +1070,7 @@ run_action(struct view *view, struct action *action,
 			assert(view->impl->get_pid);
 			pid_t pid = view->impl->get_pid(view);
 			if (pid == getpid()) {
-				wlr_log(WLR_ERROR, "Preventing sending SIGTERM to labwc");
+				wlr_log(WLR_ERROR, "Preventing sending SIGTERM to oxide-desktop");
 			} else if (pid > 0) {
 				kill(pid, SIGTERM);
 			}
@@ -1334,7 +1334,7 @@ run_action(struct view *view, struct action *action,
 		break;
 	case ACTION_TYPE_MOVETO_CURSOR:
 		wlr_log(WLR_ERROR,
-			"Action MoveToCursor is deprecated. To ensure your config works in future labwc "
+			"Action MoveToCursor is deprecated. To ensure your config works in future oxide-desktop "
 			"releases, please use <action name=\"AutoPlace\" policy=\"cursor\">");
 		if (view) {
 			view_place_by_policy(view, /* allow_cursor */ true,

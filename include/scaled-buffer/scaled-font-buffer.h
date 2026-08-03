@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SCALED_FONT_BUFFER_H
-#define LABWC_SCALED_FONT_BUFFER_H
+#ifndef OXIDE_DESKTOP_SCALED_FONT_BUFFER_H
+#define OXIDE_DESKTOP_SCALED_FONT_BUFFER_H
 
 #include "common/font.h"
 
@@ -84,4 +84,4 @@ void scaled_font_buffer_update_markup(struct scaled_font_buffer *self,
 	const char *text, int max_width, struct font *font, const float *color,
 	const float *bg_color, bool use_markup);
 
-#endif /* LABWC_SCALED_FONT_BUFFER_H */
+#endif /* OXIDE_DESKTOP_SCALED_FONT_BUFFER_H */

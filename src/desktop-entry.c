@@ -12,7 +12,7 @@
 #include "common/string-helpers.h"
 #include "config/rcxml.h"
 #include "img/img.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 
 static const char *debug_libsfdo;
 
@@ -27,7 +27,7 @@ static void
 log_handler(enum sfdo_log_level level, const char *fmt, va_list args, void *tag)
 {
 	/*
-	 * libsfdo info/debug logging is only provided when LABWC_DEBUG_LIBSFDO
+	 * libsfdo info/debug logging is only provided when OXIDE_DESKTOP_DEBUG_LIBSFDO
 	 * is set to avoid disproportionately verbose logging by default for one
 	 * particularly sub-system.
 	 */
@@ -38,7 +38,7 @@ log_handler(enum sfdo_log_level level, const char *fmt, va_list args, void *tag)
 	/*
 	 * To avoid logging issues with .desktop files as errors, all libsfdo
 	 * error-logging is demoted to info level unless running with
-	 * LABWC_DEBUG_LIBSFDO.
+	 * OXIDE_DESKTOP_DEBUG_LIBSFDO.
 	 */
 	if (!debug_libsfdo && level == SFDO_LOG_LEVEL_ERROR) {
 		level = SFDO_LOG_LEVEL_INFO;
@@ -59,7 +59,7 @@ desktop_entry_init(void)
 {
 	struct sfdo *sfdo = znew(*sfdo);
 
-	debug_libsfdo = getenv("LABWC_DEBUG_LIBSFDO");
+	debug_libsfdo = getenv("OXIDE_DESKTOP_DEBUG_LIBSFDO");
 
 	struct sfdo_basedir_ctx *basedir_ctx = sfdo_basedir_ctx_create();
 	if (!basedir_ctx) {
@@ -121,7 +121,7 @@ desktop_entry_init(void)
 
 		if (!debug_libsfdo) {
 			wlr_log(WLR_ERROR, "Further information is available by setting "
-				"the LABWC_DEBUG_LIBSFDO=1 env var before starting labwc");
+				"the OXIDE_DESKTOP_DEBUG_LIBSFDO=1 env var before starting oxide-desktop");
 		}
 
 		sfdo->icon_theme = sfdo_icon_theme_load(
@@ -150,7 +150,7 @@ err_basedir_ctx:
 	wlr_log(WLR_ERROR, "Failed to initialize icon loader");
 	if (!debug_libsfdo) {
 		wlr_log(WLR_ERROR, "Further information is available by setting "
-			"the LABWC_DEBUG_LIBSFDO=1 env var before starting labwc");
+			"the OXIDE_DESKTOP_DEBUG_LIBSFDO=1 env var before starting oxide-desktop");
 	}
 }
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_INPUT_H
-#define LABWC_INPUT_H
+#ifndef OXIDE_DESKTOP_INPUT_H
+#define OXIDE_DESKTOP_INPUT_H
 
 #include <wayland-server-core.h>
 
@@ -16,4 +16,4 @@ struct input {
 void input_handlers_init(struct seat *seat);
 void input_handlers_finish(struct seat *seat);
 
-#endif /* LABWC_INPUT_H */
+#endif /* OXIDE_DESKTOP_INPUT_H */

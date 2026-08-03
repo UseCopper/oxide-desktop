@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_MOUSEBIND_H
-#define LABWC_MOUSEBIND_H
+#ifndef OXIDE_DESKTOP_MOUSEBIND_H
+#define OXIDE_DESKTOP_MOUSEBIND_H
 
 #include <stdbool.h>
 #include <wayland-util.h>
@@ -50,4 +50,4 @@ enum direction mousebind_direction_from_str(const char *str, uint32_t *modifiers
 struct mousebind *mousebind_create(const char *context);
 bool mousebind_the_same(struct mousebind *a, struct mousebind *b);
 
-#endif /* LABWC_MOUSEBIND_H */
+#endif /* OXIDE_DESKTOP_MOUSEBIND_H */

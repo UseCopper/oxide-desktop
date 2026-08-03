@@ -17,7 +17,7 @@
 #include "config/tablet.h"
 #include "input/cursor.h"
 #include "input/tablet-pad.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "idle.h"
 #include "action.h"
 #include "view.h"
@@ -311,7 +311,7 @@ notify_motion(struct drawing_tablet *tablet, struct drawing_tablet_tool *tool,
 			 * Note that Gnome/Mutter sends a pointer-leave
 			 * notification on tablet proximity-in to the client to
 			 * avoid this conflict. Going that way would probably
-			 * involve much more refactoring in labwc, and I'm not
+			 * involve much more refactoring in oxide-desktop, and I'm not
 			 * sure what will break since I have the feeling that a
 			 * lot of internals rely on correct pointer focus.
 			 */

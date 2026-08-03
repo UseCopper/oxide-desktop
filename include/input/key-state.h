@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_KEY_STATE_H
-#define LABWC_KEY_STATE_H
+#ifndef OXIDE_DESKTOP_KEY_STATE_H
+#define OXIDE_DESKTOP_KEY_STATE_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -30,4 +30,4 @@ bool key_state_corresponding_press_event_was_bound(uint32_t keycode);
 void key_state_bound_key_remove(uint32_t keycode);
 int key_state_nr_bound_keys(void);
 
-#endif /* LABWC_KEY_STATE_H */
+#endif /* OXIDE_DESKTOP_KEY_STATE_H */

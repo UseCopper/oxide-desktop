@@ -3,7 +3,7 @@
 #include <assert.h>
 #include <wlr/types/wlr_ext_foreign_toplevel_list_v1.h>
 #include "common/macros.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 
 /* ext signals */

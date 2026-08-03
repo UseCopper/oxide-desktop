@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 
-#ifndef LABWC_IME_H
-#define LABWC_IME_H
+#ifndef OXIDE_DESKTOP_IME_H
+#define OXIDE_DESKTOP_IME_H
 
 #include <wayland-server-core.h>
 

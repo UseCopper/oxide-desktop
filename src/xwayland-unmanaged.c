@@ -7,7 +7,7 @@
 #include "common/list.h"
 #include "common/macros.h"
 #include "common/mem.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "xwayland.h"
 
 static void

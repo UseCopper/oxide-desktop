@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_WLR_FOREIGN_TOPLEVEL_H
-#define LABWC_WLR_FOREIGN_TOPLEVEL_H
+#ifndef OXIDE_DESKTOP_WLR_FOREIGN_TOPLEVEL_H
+#define OXIDE_DESKTOP_WLR_FOREIGN_TOPLEVEL_H
 
 #include <wayland-server-core.h>
 
@@ -36,4 +36,4 @@ void wlr_foreign_toplevel_set_parent(struct wlr_foreign_toplevel *wlr_toplevel,
 	struct wlr_foreign_toplevel *parent);
 void wlr_foreign_toplevel_finish(struct wlr_foreign_toplevel *wlr_toplevel);
 
-#endif /* LABWC_WLR_FOREIGN_TOPLEVEL_H */
+#endif /* OXIDE_DESKTOP_WLR_FOREIGN_TOPLEVEL_H */

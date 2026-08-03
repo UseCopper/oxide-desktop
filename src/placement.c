@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include "common/mem.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "ssd.h"
 #include "view.h"

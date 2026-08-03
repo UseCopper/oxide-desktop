@@ -11,7 +11,7 @@
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
 #include "dnd.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "layers.h"
 #include "node.h"
 #include "output.h"

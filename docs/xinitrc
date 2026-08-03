@@ -1,10 +1,10 @@
 #!/bin/sh
 
-## This file is run every time labwc launches Xwayland.
+## This file is run every time oxide-desktop launches Xwayland.
 ##
 ## In the default configuration, Xwayland will be launched lazily, and will
 ## terminate after several seconds when no X11 clients are connected. Thus,
-## this script may run repeatedly throughout a single labwc session.
+## this script may run repeatedly throughout a single oxide-desktop session.
 
 # Configure the X resource database if a file is provided
 #

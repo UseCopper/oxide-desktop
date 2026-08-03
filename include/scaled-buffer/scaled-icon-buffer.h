@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SCALED_ICON_BUFFER_H
-#define LABWC_SCALED_ICON_BUFFER_H
+#ifndef OXIDE_DESKTOP_SCALED_ICON_BUFFER_H
+#define OXIDE_DESKTOP_SCALED_ICON_BUFFER_H
 
 #include <stdbool.h>
 #include <wayland-server-core.h>
@@ -46,4 +46,4 @@ void scaled_icon_buffer_set_view(struct scaled_icon_buffer *self,
 void scaled_icon_buffer_set_icon_name(struct scaled_icon_buffer *self,
 	const char *icon_name);
 
-#endif /* LABWC_SCALED_ICON_BUFFER_H */
+#endif /* OXIDE_DESKTOP_SCALED_ICON_BUFFER_H */

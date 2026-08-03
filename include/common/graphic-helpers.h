@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_GRAPHIC_HELPERS_H
-#define LABWC_GRAPHIC_HELPERS_H
+#ifndef OXIDE_DESKTOP_GRAPHIC_HELPERS_H
+#define OXIDE_DESKTOP_GRAPHIC_HELPERS_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -33,4 +33,4 @@ void draw_cairo_border(cairo_t *cairo, struct wlr_fbox fbox, double line_width);
 /* Converts X11 color name to ARGB32 (with alpha = 255) */
 bool lookup_named_color(const char *name, uint32_t *argb);
 
-#endif /* LABWC_GRAPHIC_HELPERS_H */
+#endif /* OXIDE_DESKTOP_GRAPHIC_HELPERS_H */

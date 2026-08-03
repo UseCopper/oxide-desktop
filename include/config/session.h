@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SESSION_H
-#define LABWC_SESSION_H
+#ifndef OXIDE_DESKTOP_SESSION_H
+#define OXIDE_DESKTOP_SESSION_H
 
 struct server;
 
@@ -12,21 +12,21 @@ void session_run_script(const char *script);
 
 /**
  * session_environment_init - set environment variables based on <key>=<value>
- * pairs in `${XDG_CONFIG_DIRS:-/etc/xdg}/labwc/environment` with user override
+ * pairs in `${XDG_CONFIG_DIRS:-/etc/xdg}/oxide-desktop/environment` with user override
  * in `${XDG_CONFIG_HOME:-$HOME/.config}`
  */
 void session_environment_init(void);
 
 /**
  * session_autostart_init - run autostart file as shell script
- * Note: Same as `sh ~/.config/labwc/autostart` (or equivalent XDG config dir)
+ * Note: Same as `sh ~/.config/oxide-desktop/autostart` (or equivalent XDG config dir)
  */
 void session_autostart_init(void);
 
 /**
  * session_shutdown - run session shutdown file as shell script
- * Note: Same as `sh ~/.config/labwc/shutdown` (or equivalent XDG config dir)
+ * Note: Same as `sh ~/.config/oxide-desktop/shutdown` (or equivalent XDG config dir)
  */
 void session_shutdown(void);
 
-#endif /* LABWC_SESSION_H */
+#endif /* OXIDE_DESKTOP_SESSION_H */

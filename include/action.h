@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_ACTION_H
-#define LABWC_ACTION_H
+#ifndef OXIDE_DESKTOP_ACTION_H
+#define OXIDE_DESKTOP_ACTION_H
 
 #include <stdbool.h>
 #include <sys/types.h>
@@ -55,4 +55,4 @@ bool action_check_prompt_result(pid_t pid, int exit_code);
 void action_free(struct action *action);
 void action_list_free(struct wl_list *action_list);
 
-#endif /* LABWC_ACTION_H */
+#endif /* OXIDE_DESKTOP_ACTION_H */

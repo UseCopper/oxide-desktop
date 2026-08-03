@@ -6,7 +6,7 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include "common/string-helpers.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 
 static struct wlr_output *fallback_output = NULL;
@@ -112,7 +112,7 @@ void
 output_virtual_update_fallback(void)
 {
 	struct wl_list *layout_outputs = &server.output_layout->outputs;
-	const char *fallback_output_name = getenv("LABWC_FALLBACK_OUTPUT");
+	const char *fallback_output_name = getenv("OXIDE_DESKTOP_FALLBACK_OUTPUT");
 
 	if (!fallback_output && wl_list_empty(layout_outputs)
 			&& !string_null_or_empty(fallback_output_name)) {

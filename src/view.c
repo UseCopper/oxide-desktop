@@ -19,7 +19,7 @@
 #include "cycle.h"
 #include "foreign-toplevel/foreign.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "menu/menu.h"
 #include "output.h"
 #include "placement.h"

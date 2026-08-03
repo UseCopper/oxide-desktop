@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SCALED_BUFFER_H
-#define LABWC_SCALED_BUFFER_H
+#ifndef OXIDE_DESKTOP_SCALED_BUFFER_H
+#define OXIDE_DESKTOP_SCALED_BUFFER_H
 
 #include <wayland-server-core.h>
 
@@ -143,4 +143,4 @@ struct scaled_buffer_cache_entry {
 	double scale;
 };
 
-#endif /* LABWC_SCALED_BUFFER_H */
+#endif /* OXIDE_DESKTOP_SCALED_BUFFER_H */

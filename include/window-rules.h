@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_WINDOW_RULES_H
-#define LABWC_WINDOW_RULES_H
+#ifndef OXIDE_DESKTOP_WINDOW_RULES_H
+#define OXIDE_DESKTOP_WINDOW_RULES_H
 
 #include <stdbool.h>
 #include <wayland-util.h>
@@ -50,4 +50,4 @@ struct view;
 void window_rules_apply(struct view *view, enum window_rule_event event);
 enum property window_rules_get_property(struct view *view, const char *property);
 
-#endif /* LABWC_WINDOW_RULES_H */
+#endif /* OXIDE_DESKTOP_WINDOW_RULES_H */

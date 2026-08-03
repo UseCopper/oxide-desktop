@@ -17,7 +17,7 @@
 #include "config/rcxml.h"
 #include "config/session.h"
 #include "foreign-toplevel/foreign.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "view.h"

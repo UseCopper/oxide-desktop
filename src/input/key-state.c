@@ -11,7 +11,7 @@
 #include "common/buf.h"
 #include "common/set.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "scaled-buffer/scaled-font-buffer.h"
 
 static struct lab_set pressed, bound, pressed_sent;
@@ -176,7 +176,7 @@ report(struct lab_set *key_set, const char *msg)
 	static bool has_run;
 
 	if (!has_run) {
-		should_print = getenv("LABWC_DEBUG_KEY_STATE");
+		should_print = getenv("OXIDE_DESKTOP_DEBUG_KEY_STATE");
 		has_run = true;
 	}
 	if (!should_print) {

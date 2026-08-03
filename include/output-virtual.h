@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_OUTPUT_VIRTUAL_H
-#define LABWC_OUTPUT_VIRTUAL_H
+#ifndef OXIDE_DESKTOP_OUTPUT_VIRTUAL_H
+#define OXIDE_DESKTOP_OUTPUT_VIRTUAL_H
 
 struct server;
 struct wlr_output;

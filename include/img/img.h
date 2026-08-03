@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_IMG_H
-#define LABWC_IMG_H
+#ifndef OXIDE_DESKTOP_IMG_H
+#define OXIDE_DESKTOP_IMG_H
 
 #include <cairo.h>
 #include <stdbool.h>
@@ -74,4 +74,4 @@ void lab_img_destroy(struct lab_img *img);
  */
 bool lab_img_equal(struct lab_img *img_a, struct lab_img *img_b);
 
-#endif /* LABWC_IMG_H */
+#endif /* OXIDE_DESKTOP_IMG_H */

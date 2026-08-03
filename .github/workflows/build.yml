@@ -95,8 +95,8 @@ jobs:
           apt-get upgrade -y
           apt-get install -y git gcc clang gdb xwayland meson pkgconf
           apt-get build-dep -y libwlroots-0.20-dev
-          # Debian Testing temporarily removed labwc due to wlroots 0.20 transition
-          #apt-get build-dep -y labwc
+          # Debian Testing temporarily removed oxide-desktop due to wlroots 0.20 transition
+          #apt-get build-dep -y oxide-desktop
           # Install the deps manually
           apt-get install -y libxml2-dev liblzma-dev libglib2.0-dev \
             libcairo2-dev libpango1.0-dev libinput-dev libpng-dev \
@@ -273,7 +273,7 @@ jobs:
             meson setup build-gcc-leak -Dxwayland=enabled -Db_sanitize=address,undefined \
               --werror --force-fallback-for=wlroots -Dwlroots:c_std=c11
             meson compile -C build-gcc-leak
-            LABWC_LEAK_TEST=1 scripts/ci/smoke-test.sh build-gcc-leak
+            OXIDE_DESKTOP_LEAK_TEST=1 scripts/ci/smoke-test.sh build-gcc-leak
           ' | $TARGET
 
       - name: Build with clang - runtime leak test
@@ -285,7 +285,7 @@ jobs:
             meson setup build-clang-leak -Dxwayland=enabled -Db_sanitize=address,undefined \
               --werror --force-fallback-for=wlroots -Dwlroots:c_std=c11
             meson compile -C build-clang-leak
-            LABWC_LEAK_TEST=1 scripts/ci/smoke-test.sh build-clang-leak
+            OXIDE_DESKTOP_LEAK_TEST=1 scripts/ci/smoke-test.sh build-clang-leak
           ' | $TARGET
 
       # Void-musl doesn't support sanitizer
@@ -297,7 +297,7 @@ jobs:
             export CC=gcc
             meson setup build-gcc-gdb -Dxwayland=enabled --werror
             meson compile -C build-gcc-gdb
-            LABWC_RUNS=2 scripts/ci/smoke-test.sh build-gcc-gdb
+            OXIDE_DESKTOP_RUNS=2 scripts/ci/smoke-test.sh build-gcc-gdb
           ' | $TARGET
 
       # Void made the foot package depend on the font.
@@ -313,5 +313,5 @@ jobs:
       #      export CC=gcc
       #      meson setup build-gcc-nofont -Dxwayland=enabled --werror
       #      meson compile -C build-gcc-nofont
-      #      LABWC_EXPECT_RETURNCODE=1 scripts/ci/smoke-test.sh build-gcc-nofont
+      #      OXIDE_DESKTOP_EXPECT_RETURNCODE=1 scripts/ci/smoke-test.sh build-gcc-nofont
       #    ' | $TARGET

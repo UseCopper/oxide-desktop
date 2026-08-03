@@ -2,12 +2,12 @@ scdoc = find_program('scdoc', required: get_option('man-pages'))
 
 if scdoc.found()
   manpages = [
-    'labwc.1',
-    'labwc-actions.5',
-    'labwc-config.5',
-    'labwc-menu.5',
-    'labwc-theme.5',
-    'labnag.1',
+    'oxide-desktop.1',
+    'oxide-desktop-actions.5',
+    'oxide-desktop-config.5',
+    'oxide-desktop-menu.5',
+    'oxide-desktop-theme.5',
+    'oxide-nag.1',
   ]
   foreach manpage : manpages
     markdown = manpage + '.scd'

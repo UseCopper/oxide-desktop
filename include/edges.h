@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_EDGES_H
-#define LABWC_EDGES_H
+#ifndef OXIDE_DESKTOP_EDGES_H
+#define OXIDE_DESKTOP_EDGES_H
 
 #include <limits.h>
 #include <stdbool.h>
@@ -119,4 +119,4 @@ bool edges_traverse_edge(struct edge current, struct edge target, struct edge ed
 
 void edges_calculate_visibility(struct view *ignored_view);
 
-#endif /* LABWC_EDGES_H */
+#endif /* OXIDE_DESKTOP_EDGES_H */

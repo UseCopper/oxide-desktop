@@ -23,35 +23,35 @@ body:
       label: Steps to reproduce
       description: Clear steps to reproduce the bug
       placeholder: |
-        1. Launch labwc with a default configuration on multiple displays.
+        1. Launch oxide-desktop with a default configuration on multiple displays.
         2. Launch a terminal on each output, etc, etc.
         Expected behavior: Foo.
         Actual behavior: Bar.
     validations:
       required: true
-  - id: labwc_source
+  - id: oxide_desktop_source
     type: dropdown
     attributes:
-      label: labwc build source
-      description: labwc build source (binary, local, etc)
+      label: oxide-desktop build source
+      description: oxide-desktop build source (binary, local, etc)
       options:
         - Release
         - Local build
     validations:
       required: true
-  - id: labwc_version
+  - id: oxide_desktop_version
     type: input
     attributes:
-      label: labwc version
-      description: labwc version or commit sha (run `labwc -v` to find out)
+      label: oxide-desktop version
+      description: oxide-desktop version or commit sha (run `oxide-desktop -v` to find out)
       placeholder: 0.8.1
     validations:
       required: true
-  - id: labwc_environment
+  - id: oxide_desktop_environment
     type: dropdown
     attributes:
-      label: labwc environment
-      description: How is labwc being run
+      label: oxide-desktop environment
+      description: How is oxide-desktop being run
       options:
         - From a TTY or some display manager like lightdm
         - Nested on Wayland

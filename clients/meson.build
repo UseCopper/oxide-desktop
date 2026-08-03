@@ -1,9 +1,9 @@
-if get_option('labnag').allowed()
+if get_option('oxide-nag').allowed()
   wayland_client = dependency('wayland-client')
   wayland_cursor = dependency('wayland-cursor')
 
   nag_sources = files(
-    'labnag.c',
+    'oxide-nag.c',
     'pool-buffer.c',
   )
 
@@ -39,7 +39,7 @@ if get_option('labnag').allowed()
   endif
 
   executable(
-    'labnag',
+    'oxide-nag',
     nag_sources,
     dependencies: [
       cairo,
@@ -52,7 +52,7 @@ if get_option('labnag').allowed()
       epoll_dep,
       xkbcommon,
     ],
-    include_directories: [labwc_inc],
+    include_directories: [oxide_desktop_inc],
     install: true,
   )
 endif

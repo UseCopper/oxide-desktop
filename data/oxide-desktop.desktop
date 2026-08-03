@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=oxide-desktop
+Comment=A wayland stacking compositor
+Exec=oxide-desktop
+Icon=oxide-desktop
+Type=Application
+DesktopNames=oxide-desktop;wlroots

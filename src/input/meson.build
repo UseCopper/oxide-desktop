@@ -1,4 +1,4 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'cursor.c',
   'tablet.c',
   'tablet-pad.c',

@@ -12,7 +12,7 @@
 #include "common/string-helpers.h"
 #include "config/rcxml.h"
 #include "config/session.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "theme.h"
 #include "translate.h"
 #include "menu/menu.h"
@@ -44,8 +44,8 @@ static const struct option long_options[] = {
 	{0, 0, 0, 0}
 };
 
-static const char labwc_usage[] =
-"Usage: labwc [options...]\n"
+static const char oxide_desktop_usage[] =
+"Usage: oxide-desktop [options...]\n"
 "  -c, --config <file>      Specify config file (with path)\n"
 "  -C, --config-dir <dir>   Specify config directory\n"
 "  -d, --debug              Enable full logging, including debug information\n"
@@ -62,7 +62,7 @@ static const char labwc_usage[] =
 static void
 usage(void)
 {
-	printf("%s", labwc_usage);
+	printf("%s", oxide_desktop_usage);
 	exit(0);
 }
 
@@ -70,8 +70,8 @@ static void
 print_version(void)
 {
 	#define FEATURE_ENABLED(feature) (HAVE_##feature ? "+" : "-")
-	printf("labwc %s (%sxwayland %snls %srsvg %slibsfdo) wlroots-%d.%d.%d\n",
-		LABWC_VERSION,
+	printf("oxide-desktop %s (%sxwayland %snls %srsvg %slibsfdo) wlroots-%d.%d.%d\n",
+		OXIDE_DESKTOP_VERSION,
 		FEATURE_ENABLED(XWAYLAND),
 		FEATURE_ENABLED(NLS),
 		FEATURE_ENABLED(RSVG),
@@ -122,14 +122,14 @@ die_on_no_fonts(void)
 }
 
 static void
-send_signal_to_labwc_pid(int signal)
+send_signal_to_oxide_desktop_pid(int signal)
 {
-	char *labwc_pid = getenv("LABWC_PID");
-	if (!labwc_pid) {
-		wlr_log(WLR_ERROR, "LABWC_PID not set");
+	char *oxide_desktop_pid = getenv("OXIDE_DESKTOP_PID");
+	if (!oxide_desktop_pid) {
+		wlr_log(WLR_ERROR, "OXIDE_DESKTOP_PID not set");
 		exit(EXIT_FAILURE);
 	}
-	int pid = atoi(labwc_pid);
+	int pid = atoi(oxide_desktop_pid);
 	if (!pid) {
 		wlr_log(WLR_ERROR, "should not send signal to pid 0");
 		exit(EXIT_FAILURE);
@@ -196,13 +196,13 @@ main(int argc, char *argv[])
 			verbosity = WLR_DEBUG;
 			break;
 		case 'e':
-			send_signal_to_labwc_pid(SIGTERM);
+			send_signal_to_oxide_desktop_pid(SIGTERM);
 			exit(0);
 		case 'm':
 			rc.merge_config = true;
 			break;
 		case 'r':
-			send_signal_to_labwc_pid(SIGHUP);
+			send_signal_to_oxide_desktop_pid(SIGHUP);
 			exit(0);
 		case 's':
 			startup_cmd = optarg;
@@ -245,23 +245,23 @@ main(int argc, char *argv[])
 	rcxml_read(rc.config_file);
 
 	/*
-	 * Set environment variable LABWC_PID to the pid of the compositor
+	 * Set environment variable OXIDE_DESKTOP_PID to the pid of the compositor
 	 * so that SIGHUP and SIGTERM can be sent to specific instances using
-	 * `kill -s <signal> <pid>` rather than `killall -s <signal> labwc`
+	 * `kill -s <signal> <pid>` rather than `killall -s <signal> oxide-desktop`
 	 */
 	char pid[32];
 	snprintf(pid, sizeof(pid), "%d", getpid());
-	if (setenv("LABWC_PID", pid, true) < 0) {
-		wlr_log_errno(WLR_ERROR, "unable to set LABWC_PID");
+	if (setenv("OXIDE_DESKTOP_PID", pid, true) < 0) {
+		wlr_log_errno(WLR_ERROR, "unable to set OXIDE_DESKTOP_PID");
 	} else {
-		wlr_log(WLR_DEBUG, "LABWC_PID=%s", pid);
+		wlr_log(WLR_DEBUG, "OXIDE_DESKTOP_PID=%s", pid);
 	}
 
 	/* useful for helper programs */
-	if (setenv("LABWC_VER", LABWC_VERSION, true) < 0) {
-		wlr_log_errno(WLR_ERROR, "unable to set LABWC_VER");
+	if (setenv("OXIDE_DESKTOP_VER", OXIDE_DESKTOP_VERSION, true) < 0) {
+		wlr_log_errno(WLR_ERROR, "unable to set OXIDE_DESKTOP_VER");
 	} else {
-		wlr_log(WLR_DEBUG, "LABWC_VER=%s", LABWC_VERSION);
+		wlr_log(WLR_DEBUG, "OXIDE_DESKTOP_VER=%s", OXIDE_DESKTOP_VERSION);
 	}
 
 	if (!getenv("XDG_RUNTIME_DIR")) {
@@ -272,7 +272,7 @@ main(int argc, char *argv[])
 	increase_nofile_limit();
 
 	if (string_null_or_empty(server.title_fmt)) {
-		server.title_fmt = "labwc - %o";
+		server.title_fmt = "oxide-desktop - %o";
 	}
 
 	server_init();

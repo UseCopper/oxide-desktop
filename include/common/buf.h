@@ -5,8 +5,8 @@
  * Copyright Johan Malm 2020
  */
 
-#ifndef LABWC_BUF_H
-#define LABWC_BUF_H
+#ifndef OXIDE_DESKTOP_BUF_H
+#define OXIDE_DESKTOP_BUF_H
 
 struct buf {
 	/**
@@ -116,4 +116,4 @@ void buf_move(struct buf *dst, struct buf *src);
  */
 struct buf buf_from_file(const char *filename);
 
-#endif /* LABWC_BUF_H */
+#endif /* OXIDE_DESKTOP_BUF_H */

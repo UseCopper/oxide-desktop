@@ -23,8 +23,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-#ifndef LABWC_BUFFER_H
-#define LABWC_BUFFER_H
+#ifndef OXIDE_DESKTOP_BUFFER_H
+#define OXIDE_DESKTOP_BUFFER_H
 
 #include <cairo.h>
 #include <wlr/types/wlr_buffer.h>
@@ -84,4 +84,4 @@ struct lab_data_buffer *buffer_create_from_wlr_buffer(
 struct lab_data_buffer *buffer_resize(struct lab_data_buffer *src_buffer,
 	int width, int height, double scale);
 
-#endif /* LABWC_BUFFER_H */
+#endif /* OXIDE_DESKTOP_BUFFER_H */

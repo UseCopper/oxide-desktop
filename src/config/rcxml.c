@@ -30,7 +30,7 @@
 #include "config/tablet-tool.h"
 #include "config/touch.h"
 #include "cycle.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "regions.h"
 #include "ssd.h"
 #include "translate.h"
@@ -132,7 +132,7 @@ parse_privileged_interface(const char *name)
 }
 
 /*
- * Openbox/labwc comparison
+ * Openbox/oxide-desktop comparison
  *
  * Instead of openbox's <titleLayout>WLIMC</title> we use
  *
@@ -144,7 +144,7 @@ parse_privileged_interface(const char *name)
  * ...using the icon names (like iconify.xbm) without the file extension for the
  * identifier.
  *
- * labwc        openbox     description
+ * oxide-desktop        openbox     description
  * -----        -------     -----------
  * menu         W           Open window menu (client-menu)
  * iconfiy      I           Iconify (aka minimize)
@@ -1095,9 +1095,9 @@ static bool
 entry(xmlNode *node, char *nodename, char *content)
 {
 	string_truncate_at_pattern(nodename, ".openbox_config");
-	string_truncate_at_pattern(nodename, ".labwc_config");
+	string_truncate_at_pattern(nodename, ".oxide_desktop_config");
 
-	if (getenv("LABWC_DEBUG_CONFIG_NODENAMES")) {
+	if (getenv("OXIDE_DESKTOP_DEBUG_CONFIG_NODENAMES")) {
 		printf("%s: %s\n", nodename, content);
 	}
 
@@ -1786,7 +1786,7 @@ post_processing(void)
 
 	if (!rc.prompt_command) {
 		rc.prompt_command =
-			xstrdup("labnag "
+			xstrdup("oxide-nag "
 				"--message '%m' "
 				"--button-dismiss '%n' "
 				"--button-dismiss '%y' "
@@ -1803,7 +1803,7 @@ post_processing(void)
 				"--timeout 0");
 	}
 	if (!rc.fallback_app_icon_name) {
-		rc.fallback_app_icon_name = xstrdup("labwc");
+		rc.fallback_app_icon_name = xstrdup("oxide-desktop");
 	}
 
 	if (!rc.icon_theme_name && rc.theme_name) {

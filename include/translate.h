@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_TRANSLATE_H
-#define LABWC_TRANSLATE_H
+#ifndef OXIDE_DESKTOP_TRANSLATE_H
+#define OXIDE_DESKTOP_TRANSLATE_H
 #include "config.h"
 
 #if HAVE_NLS
@@ -11,4 +11,4 @@
 #define _(s) (s)
 #endif
 
-#endif /* LABWC_TRANSLATE_H */
+#endif /* OXIDE_DESKTOP_TRANSLATE_H */

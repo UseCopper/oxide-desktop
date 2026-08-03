@@ -18,7 +18,7 @@
 #include "common/spawn.h"
 #include "common/string-helpers.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 
 #if WLR_HAS_DRM_BACKEND
 	#include <wlr/backend/drm.h>
@@ -32,8 +32,8 @@ static const char *const env_vars[] = {
 	"XCURSOR_SIZE",
 	"XCURSOR_THEME",
 	"XDG_SESSION_TYPE",
-	"LABWC_PID",
-	"LABWC_VER",
+	"OXIDE_DESKTOP_PID",
+	"OXIDE_DESKTOP_VER",
 	NULL
 };
 
@@ -192,7 +192,7 @@ backend_check_drm(struct wlr_backend *backend, void *is_drm)
 static bool
 should_update_activation(void)
 {
-	static const char *act_env = "LABWC_UPDATE_ACTIVATION_ENV";
+	static const char *act_env = "OXIDE_DESKTOP_UPDATE_ACTIVATION_ENV";
 	char *env = getenv(act_env);
 	if (env) {
 		/* Respect any valid preference from the environment */
@@ -269,7 +269,7 @@ session_environment_init(void)
 	 * May be overridden either by already having a value set or by the user
 	 * supplied environment file.
 	 */
-	setenv("XDG_CURRENT_DESKTOP", "labwc:wlroots", 0);
+	setenv("XDG_CURRENT_DESKTOP", "oxide-desktop:wlroots", 0);
 
 	/*
 	 * Set default for _JAVA_AWT_WM_NONREPARENTING so that Java applications

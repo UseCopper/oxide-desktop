@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_H
-#define LABWC_H
+#ifndef OXIDE_DESKTOP_H
+#define OXIDE_DESKTOP_H
 #include "config.h"
 #include <wlr/util/box.h>
 #include <wlr/util/log.h>
@@ -460,4 +460,4 @@ void create_constraint(struct wl_listener *listener, void *data);
 void constrain_cursor(struct wlr_pointer_constraint_v1
 	*constraint);
 
-#endif /* LABWC_H */
+#endif /* OXIDE_DESKTOP_H */

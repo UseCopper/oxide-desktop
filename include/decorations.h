@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_DECORATIONS_H
-#define LABWC_DECORATIONS_H
+#ifndef OXIDE_DESKTOP_DECORATIONS_H
+#define OXIDE_DESKTOP_DECORATIONS_H
 
 struct server;
 struct view;
@@ -15,4 +15,4 @@ void kde_server_decoration_set_view(struct view *view, struct wlr_surface *surfa
 void kde_server_decoration_finish(void);
 void xdg_server_decoration_finish(void);
 
-#endif /* LABWC_DECORATIONS_H */
+#endif /* OXIDE_DESKTOP_DECORATIONS_H */

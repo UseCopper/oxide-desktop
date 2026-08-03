@@ -1,4 +1,4 @@
-# Note: this is an VERY rough approximation of labwc's coding style (see
+# Note: this is an VERY rough approximation of oxide-desktop's coding style (see
 # CONTRIBUTING.md) and is intended only as a hint for IDE formatting
 # aids. DO NOT rely on clang-format or your IDE for correct formatting;
 # always check the result manually (and run ./scripts/check)!

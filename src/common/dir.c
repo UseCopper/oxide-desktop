@@ -25,11 +25,11 @@ static struct dir config_dirs[] = {
 	{
 		.prefix = "XDG_CONFIG_HOME",
 		.default_prefix = "$HOME/.config",
-		.path = "labwc"
+		.path = "oxide-desktop"
 	}, {
 		.prefix = "XDG_CONFIG_DIRS",
 		.default_prefix = "/etc/xdg",
-		.path = "labwc",
+		.path = "oxide-desktop",
 	}, {
 		.path = NULL,
 	}
@@ -73,10 +73,10 @@ build_config_path(struct ctx *ctx, char *prefix, const char *path)
 }
 
 static void
-build_theme_path_labwc(struct ctx *ctx, char *prefix, const char *path)
+build_theme_path_oxide_desktop(struct ctx *ctx, char *prefix, const char *path)
 {
 	assert(prefix);
-	snprintf(ctx->buf, ctx->len, "%s/%s/%s/labwc/%s", prefix, path,
+	snprintf(ctx->buf, ctx->len, "%s/%s/%s/oxide-desktop/%s", prefix, path,
 		ctx->theme_name, ctx->filename);
 }
 
@@ -91,7 +91,7 @@ build_theme_path_openbox(struct ctx *ctx, char *prefix, const char *path)
 static void
 find_dir(struct ctx *ctx)
 {
-	char *debug = getenv("LABWC_DEBUG_DIR_CONFIG_AND_THEME");
+	char *debug = getenv("OXIDE_DESKTOP_DEBUG_DIR_CONFIG_AND_THEME");
 
 	struct buf prefix = BUF_INIT;
 	for (int i = 0; ctx->dirs[i].path; i++) {
@@ -175,7 +175,7 @@ paths_theme_create(struct wl_list *paths, const char *theme_name,
 	static char buf[4096] = { 0 };
 	wl_list_init(paths);
 	struct ctx ctx = {
-		.build_path_fn = build_theme_path_labwc,
+		.build_path_fn = build_theme_path_oxide_desktop,
 		.filename = filename,
 		.buf = buf,
 		.len = sizeof(buf),

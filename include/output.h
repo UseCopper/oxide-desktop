@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_OUTPUT_H
-#define LABWC_OUTPUT_H
+#ifndef OXIDE_DESKTOP_OUTPUT_H
+#define OXIDE_DESKTOP_OUTPUT_H
 
 #include <wlr/types/wlr_output.h>
 #include "common/edge.h"
@@ -84,4 +84,4 @@ void output_state_setup_hdr(struct output *output, bool silent);
 void output_set_has_fullscreen_view(struct output *output,
 	bool has_fullscreen_view);
 
-#endif // LABWC_OUTPUT_H
+#endif // OXIDE_DESKTOP_OUTPUT_H

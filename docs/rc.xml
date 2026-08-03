@@ -3,7 +3,7 @@
   set of options with comments, see docs/rc.xml.all
 -->
 
-<labwc_config>
+<oxide_desktop_config>
 
   <theme>
     <name>Clearlooks-3.4</name>
@@ -36,4 +36,4 @@
     </context>
   </mouse>
 
-</labwc_config>
+</oxide_desktop_config>

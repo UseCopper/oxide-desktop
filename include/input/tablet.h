@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_TABLET_H
-#define LABWC_TABLET_H
+#ifndef OXIDE_DESKTOP_TABLET_H
+#define OXIDE_DESKTOP_TABLET_H
 
 #include <wayland-server-core.h>
 #include "config/types.h"
@@ -51,4 +51,4 @@ void tablet_finish(struct seat *seat);
 void tablet_create(struct seat *seat, struct wlr_input_device *wlr_input_device);
 bool tablet_tool_has_focused_surface(struct seat *seat);
 
-#endif /* LABWC_TABLET_H */
+#endif /* OXIDE_DESKTOP_TABLET_H */

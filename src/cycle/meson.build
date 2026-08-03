@@ -1,4 +1,4 @@
-labwc_sources += files(
+oxide_desktop_sources += files(
   'cycle.c',
   'osd-classic.c',
   'osd-field.c',

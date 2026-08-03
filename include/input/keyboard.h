@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_KEYBOARD_H
-#define LABWC_KEYBOARD_H
+#ifndef OXIDE_DESKTOP_KEYBOARD_H
+#define OXIDE_DESKTOP_KEYBOARD_H
 
 #include <stdbool.h>
 #include <xkbcommon/xkbcommon.h>
@@ -39,4 +39,4 @@ void keyboard_cancel_all_keybind_repeats(struct seat *seat);
 
 uint32_t keyboard_get_all_modifiers(struct seat *seat);
 
-#endif /* LABWC_KEYBOARD_H */
+#endif /* OXIDE_DESKTOP_KEYBOARD_H */

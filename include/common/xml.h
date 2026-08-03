@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_XML_H
-#define LABWC_XML_H
+#ifndef OXIDE_DESKTOP_XML_H
+#define OXIDE_DESKTOP_XML_H
 
 #include <libxml/tree.h>
 #include <stdbool.h>
@@ -63,4 +63,4 @@ lab_xml_get_key_and_content(xmlNode *node, char **name, char **content)
 		(child) = lab_xml_skip_text((child)->next), \
 		lab_xml_get_key_and_content((child), &(key), &(content)))
 
-#endif /* LABWC_XML_H */
+#endif /* OXIDE_DESKTOP_XML_H */

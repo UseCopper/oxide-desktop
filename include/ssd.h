@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SSD_H
-#define LABWC_SSD_H
+#ifndef OXIDE_DESKTOP_SSD_H
+#define OXIDE_DESKTOP_SSD_H
 
 #include "common/node-type.h"
 #include "config/types.h"
@@ -74,4 +74,4 @@ bool ssd_debug_is_root_node(const struct ssd *ssd, struct wlr_scene_node *node);
 const char *ssd_debug_get_node_name(const struct ssd *ssd,
 	struct wlr_scene_node *node);
 
-#endif /* LABWC_SSD_H */
+#endif /* OXIDE_DESKTOP_SSD_H */

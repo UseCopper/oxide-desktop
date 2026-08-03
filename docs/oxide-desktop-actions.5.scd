@@ -1,8 +1,8 @@
-labwc-actions(5)
+oxide-desktop-actions(5)
 
 # NAME
 
-labwc - actions
+oxide-desktop - actions
 
 # ACTIONS
 
@@ -17,12 +17,12 @@ Actions are used in menus and keyboard/mouse bindings.
 
 *<action name="Execute" command="value" />*
 	Execute command. Note that in the interest of backward compatibility,
-	labwc supports <execute> as an alternative to <command> even though
+	oxide-desktop supports <execute> as an alternative to <command> even though
 	openbox documentation states that it is deprecated.
 	Note: Tilde (~) is expanded in the command before passing to execvp().
 
 *<action name="Exit" />*
-	Exit labwc.
+	Exit oxide-desktop.
 
 *<action name="Focus" />*
 	Give focus to window under cursor.
@@ -88,7 +88,7 @@ Actions are used in menus and keyboard/mouse bindings.
 	Move to be centered on cursor.
 	Tries to prevent any part of the window from going off-screen.
 	This action is deprecated from v0.7.3. To ensure your config works in
-	future labwc releases, please use:
+	future oxide-desktop releases, please use:
 
 	*<action name="AutoPlace" policy="cursor">*
 
@@ -119,7 +119,7 @@ Actions are used in menus and keyboard/mouse bindings.
 	ToggleSnapToRegion additionally toggles the active window between
 	tiled to the given region and its untiled position.
 
-	See labwc-config(5) for further information on how to define regions.
+	See oxide-desktop-config(5) for further information on how to define regions.
 
 *<action name="UnSnap" />*
 	Resize and move the active window back to its untiled or unmaximized
@@ -169,7 +169,7 @@ Actions are used in menus and keyboard/mouse bindings.
 	*menu* The name of the menu to show. The menus "root-menu",
 	"client-menu", "client-send-to-menu" and "client-list-combined-menu"
 	are guaranteed to exist, but others may be defined explicitly.
-	See labwc-menu(5) for more information.
+	See oxide-desktop-menu(5) for more information.
 
 	*atCursor* [yes|no] When opening a menu, open the menu at the location
 	of the mouse cursor. When set to no, the menu will appear at the
@@ -416,7 +416,7 @@ Actions are used in menus and keyboard/mouse bindings.
 	rotating ball not just for moving the cursor, but also for (mouse wheel)
 	scrolling.
 
-	See also *<libinput><scrollFactor>* in labwc-config(5) for fine tuning
+	See also *<libinput><scrollFactor>* in oxide-desktop-config(5) for fine tuning
 	the scroll speed.
 
 *<action name="EnableTabletMouseEmulation" />*++
@@ -538,7 +538,7 @@ Actions that execute other actions. Used in keyboard/mouse bindings.
 		This argument is optional.
 
 	*prompt*
-		Display a yes/no prompt dialog (labnag by default). If 'yes' is
+		Display a yes/no prompt dialog (oxide-nag by default). If 'yes' is
 		selected, the *then* branch will be taken; and similarly with
 		'no' and *else*. This argument is optional. Note that the syntax
 		is different to that of Openbox where a prompt element is not
@@ -575,4 +575,4 @@ Actions that execute other actions. Used in keyboard/mouse bindings.
 
 # SEE ALSO
 
-labwc(1), labwc-config(5), labwc-theme(5), glob(7)
+oxide-desktop(1), oxide-desktop-config(5), oxide-desktop-theme(5), glob(7)

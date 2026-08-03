@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_LIBINPUT_H
-#define LABWC_LIBINPUT_H
+#ifndef OXIDE_DESKTOP_LIBINPUT_H
+#define OXIDE_DESKTOP_LIBINPUT_H
 
 #include <libinput.h>
 #include <string.h>
@@ -43,4 +43,4 @@ const char *libinput_device_type_name(enum lab_libinput_device_type type);
 struct libinput_category *libinput_category_create(void);
 struct libinput_category *libinput_category_get_default(void);
 
-#endif /* LABWC_LIBINPUT_H */
+#endif /* OXIDE_DESKTOP_LIBINPUT_H */

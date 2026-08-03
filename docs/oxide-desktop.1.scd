@@ -1,16 +1,16 @@
-labwc(1)
+oxide-desktop(1)
 
 # NAME
 
-labwc - a Wayland stacking compositor
+oxide-desktop - a Wayland stacking compositor
 
 # SYNOPSIS
 
-*labwc* [options...]
+*oxide-desktop* [options...]
 
 # DESCRIPTION
 
-Labwc is a wlroots-based stacking compositor for wayland.
+Oxide-desktop is a wlroots-based stacking compositor for wayland.
 
 It is light-weight and independent with a focus on simply stacking windows
 well and rendering some window decorations. Where practicable it uses clients
@@ -22,11 +22,11 @@ The compositor will exit or reload its configuration upon receiving SIGTERM
 and SIGHUP respectively. For example:
 
 ```
-kill -s <signal> $LABWC_PID
-killall -s <signal> labwc
+kill -s <signal> $OXIDE_DESKTOP_PID
+killall -s <signal> oxide-desktop
 ```
 
-Each running instance of labwc sets the environment variable `LABWC_PID` to
+Each running instance of oxide-desktop sets the environment variable `OXIDE_DESKTOP_PID` to
 its PID. This is useful for sending signals to a specific instance and is what
 the `--exit` and `--reconfigure` options use.
 
@@ -43,7 +43,7 @@ the `--exit` and `--reconfigure` options use.
 	VARIABLES* section below for further options.
 
 *-e, --exit*
-	Exit the compositor by sending SIGTERM to `$LABWC_PID`
+	Exit the compositor by sending SIGTERM to `$OXIDE_DESKTOP_PID`
 
 *-h, --help*
 	Show help message and quit
@@ -52,7 +52,7 @@ the `--exit` and `--reconfigure` options use.
 	Merge user config/theme files in all XDG Base Directories
 
 *-r, --reconfigure*
-	Reload the compositor configuration by sending SIGHUP to `$LABWC_PID`
+	Reload the compositor configuration by sending SIGHUP to `$OXIDE_DESKTOP_PID`
 
 *-s, --startup* <command>
 	Run command on startup
@@ -60,7 +60,7 @@ the `--exit` and `--reconfigure` options use.
 *-S, --session* <command>
 	Run command on startup and terminate compositor on exit. This is useful
 	for session management as it allows the session client to terminate
-	labwc by exiting itself. This is a Wayland specific use-case because
+	oxide-desktop by exiting itself. This is a Wayland specific use-case because
 	under X, xinit starts the server and keeps it alive for as long as the
 	session client. Thus either the session client starts the Window
 	Manager, or the Window Manager can be launched independently first. On
@@ -71,11 +71,11 @@ the `--exit` and `--reconfigure` options use.
 	avoids re-writes and fragmentation.
 
 *-t, --title* <fmtstr>
-	Set the window title for labwc to use when it is running in a window
+	Set the window title for oxide-desktop to use when it is running in a window
 	(i.e. nested in a compositor). <fmtstr> is a format string to be used as
 	the window title, replacing `%o` with the name of the output
 	region. This is useful when simulating multiple screens, such as with
-	running labwc with the environment variable `WLR_WL_OUTPUTS=2`. In this
+	running oxide-desktop with the environment variable `WLR_WL_OUTPUTS=2`. In this
 	case, `%o` will be unique per simulated screen.
 
 *-v, --version*
@@ -87,8 +87,8 @@ the `--exit` and `--reconfigure` options use.
 # SESSION MANAGEMENT
 
 To enable the use of graphical clients launched via D-Bus or systemd service
-activation, labwc can update both activation environments on launch. Provided
-that labwc is aware of an active D-Bus user session (*i.e.*, the environment
+activation, oxide-desktop can update both activation environments on launch. Provided
+that oxide-desktop is aware of an active D-Bus user session (*i.e.*, the environment
 variable `DBUS_SESSION_BUS_ADDRESS` is defined), the compositor will invoke the
 commands
 
@@ -107,39 +107,39 @@ XDG_CURRENT_DESKTOP
 XDG_SESSION_TYPE
 XCURSOR_SIZE
 XCURSOR_THEME
-LABWC_PID
+OXIDE_DESKTOP_PID
 ```
 
-This behavior is enabled by default whenever labwc uses the "DRM" wlroots
-backend (which implies that labwc is the primary compositor on the console).
-When other backends are employed (for example, when labwc runs nested in another
+This behavior is enabled by default whenever oxide-desktop uses the "DRM" wlroots
+backend (which implies that oxide-desktop is the primary compositor on the console).
+When other backends are employed (for example, when oxide-desktop runs nested in another
 Wayland compositor or an X11 server), updates to the activation environment are
 disabled by default. Updates to the activation environment can be forced by
-setting the environment variable `LABWC_UPDATE_ACTIVATION_ENV` to one of the
+setting the environment variable `OXIDE_DESKTOP_UPDATE_ACTIVATION_ENV` to one of the
 truthy values `1`, `true`, `yes` or `on`; or suppressed by setting the variable
 to one of the falsy values `0`, `false`, `no` or `off`.
 
-Whenever labwc updates the activation environment on launch, it will also
+Whenever oxide-desktop updates the activation environment on launch, it will also
 attempt to clear the activation environment on exit. For D-Bus, which does not
 provide a means for properly un-setting variables in the activation environment,
 this is accomplished by setting the session variables to empty strings. For
 systemd, the command `systemctl --user unset-environment` will be invoked to
 actually remove the variables from the activation environment.
 
-A systemd user unit named `labwc-session.target` is also shipped alongside
-the compositor for users who want to integrate labwc with systemd. It binds
+A systemd user unit named `oxide-desktop-session.target` is also shipped alongside
+the compositor for users who want to integrate oxide-desktop with systemd. It binds
 to the standard `graphical-session.target`, so systemd user services can
-start and stop in sync with the labwc session when they declare a WantedBy
-or PartOf relationship to that target. Labwc does not activate the target
+start and stop in sync with the oxide-desktop session when they declare a WantedBy
+or PartOf relationship to that target. Oxide-desktop does not activate the target
 itself; users opt in by adding lines like the following to their
 *autostart* and *shutdown* files:
 
 ```
-systemctl --user --no-block start labwc-session.target
+systemctl --user --no-block start oxide-desktop-session.target
 systemctl --user stop graphical-session.target
 ```
 
-The example *autostart* and *shutdown* files shipped with labwc include
+The example *autostart* and *shutdown* files shipped with oxide-desktop include
 these commented out. To have a user service automatically started with
 the session, enable it so the corresponding symlink under the
 graphical-session.target.wants directory exists, for example by running
@@ -149,27 +149,27 @@ graphical-session.target.wants directory exists, for example by running
 
 Set the environment variables listed below to enable specific debug options.
 This can be done in either the *environment* file or on the command line, for
-example: *LABWC_DEBUG_FOO=1 labwc*.
+example: *OXIDE_DESKTOP_DEBUG_FOO=1 oxide-desktop*.
 
-*LABWC_DEBUG_LIBSFDO*
+*OXIDE_DESKTOP_DEBUG_LIBSFDO*
 	Enable debug and info logging for libsfdo, for example for parsing of
 	.desktop files and searching for icons. Note that libsfdo error logging
 	is always enabled regardless of this environment variable but will only
 	be shown with the *-V|--version* option.
 
-*LABWC_DEBUG_DIR_CONFIG_AND_THEME*
+*OXIDE_DESKTOP_DEBUG_DIR_CONFIG_AND_THEME*
 	Increase logging of paths for config files (for example rc.xml,
 	autostart, environment and menu.xml) as well as titlebar buttons.
 
-*LABWC_DEBUG_CONFIG_NODENAMES*
+*OXIDE_DESKTOP_DEBUG_CONFIG_NODENAMES*
 	Enable logging of all nodenames (for example *policy.placement: Cascade*
 	for *<placement><policy>Cascade</policy></placement>*) for config and
 	menu files respectively.
 
-*LABWC_DEBUG_KEY_STATE*
+*OXIDE_DESKTOP_DEBUG_KEY_STATE*
 	Enable logging of press and release events for bound keys (generally
 	key-combinations like *Ctrl-Alt-t*).
 
 # SEE ALSO
 
-labwc-actions(5), labwc-config(5), labwc-menu(5), labwc-theme(5)
+oxide-desktop-actions(5), oxide-desktop-config(5), oxide-desktop-menu(5), oxide-desktop-theme(5)

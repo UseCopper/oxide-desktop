@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_TABLET_PAD_H
-#define LABWC_TABLET_PAD_H
+#ifndef OXIDE_DESKTOP_TABLET_PAD_H
+#define OXIDE_DESKTOP_TABLET_PAD_H
 
 #include <wayland-server-core.h>
 
@@ -39,4 +39,4 @@ void tablet_pad_create(struct seat *seat, struct wlr_input_device *wlr_input_dev
 void tablet_pad_attach_tablet(struct seat *seat);
 void tablet_pad_enter_surface(struct seat *seat, struct wlr_surface *wlr_surface);
 
-#endif /* LABWC_TABLET_PAD_H */
+#endif /* OXIDE_DESKTOP_TABLET_PAD_H */

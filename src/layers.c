@@ -20,7 +20,7 @@
 #include "common/macros.h"
 #include "common/mem.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 
@@ -411,7 +411,7 @@ handle_map(struct wl_listener *listener, void *data)
 	 * top or overlay layers). We could make this configurable, but for the
 	 * time being this default behaviour strikes a balance between:
 	 *
-	 *   1. Giving top/overlay, on-demand clients (like labnag and
+	 *   1. Giving top/overlay, on-demand clients (like oxide-nag and
 	 *      lxqt-runner) keyboard focus.
 	 *   2. Preventing desktop components like desktops from stealing
 	 *      keyboard focus on re-start. On compositor start, this is not
@@ -486,7 +486,7 @@ handle_popup_destroy(struct wl_listener *listener, void *data)
  *     1. The xdg_popup.grab event is not emitted from wlroots in such a way
  *        that it can be differentiated from dnd grabs (see #3375).
  *     2. There is a sequencing issue with some clients (notably layer-shell-qt
- *        ones) that means this cannot be managed from the labwc side.
+ *        ones) that means this cannot be managed from the oxide-desktop side.
  *        Specifically, the grab event takes place before the get_popup one
  *        which means that the lab_layer_popup object has not yet been created
  *        when the grab is requested.

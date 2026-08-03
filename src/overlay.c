@@ -6,7 +6,7 @@
 #include <wlr/types/wlr_scene.h>
 #include "common/lab-scene-rect.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "regions.h"
 #include "theme.h"

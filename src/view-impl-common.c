@@ -2,7 +2,7 @@
 /* view-impl-common.c: common code for shell view->impl functions */
 #include "view-impl-common.h"
 #include "foreign-toplevel/foreign.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 #include "window-rules.h"
 

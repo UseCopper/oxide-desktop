@@ -61,7 +61,7 @@
 #include "desktop-entry.h"
 #include "idle.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "layers.h"
 #include "magnifier.h"
 #include "menu/menu.h"
@@ -323,7 +323,7 @@ server_global_filter(const struct wl_client *client, const struct wl_global *glo
 		 *       and should be replaced with
 		 *       assert(allow || iface_id);
 		 *       This ensures that our lists are in sync with what
-		 *       protocols labwc supports.
+		 *       protocols oxide-desktop supports.
 		 */
 		if (!allow && !iface_id) {
 			wlr_log(WLR_ERROR, "Blocking unknown protocol %s", iface->name);
@@ -339,10 +339,10 @@ server_global_filter(const struct wl_client *client, const struct wl_global *glo
 }
 
 /*
- * This message is intended to help users who are trying labwc on
+ * This message is intended to help users who are trying oxide-desktop on
  * clean/minimalist systems without existing Desktop Environments (possibly
  * through Virtual Managers) where polkit is missing or GPU drivers do not
- * exist, in the hope that it will reduce the time required to get labwc running
+ * exist, in the hope that it will reduce the time required to get oxide-desktop running
  * and prevent some troubleshooting steps.
  */
 static const char helpful_seat_error_message[] =
@@ -356,7 +356,7 @@ static const char helpful_seat_error_message[] =
 "documentation on how to use seatd, elogind or similar. This is likely to involve\n"
 "manually adding users to groups.\n"
 "\n"
-"If the above does not work, try running with `WLR_RENDERER=pixman labwc` in\n"
+"If the above does not work, try running with `WLR_RENDERER=pixman oxide-desktop` in\n"
 "order to use the software rendering fallback\n";
 
 static void
@@ -473,7 +473,7 @@ server_init(void)
 
 	/*
 	 * Prevent wayland clients that request the X11 clipboard but closing
-	 * their read fd prematurely to crash labwc because of the unhandled
+	 * their read fd prematurely to crash oxide-desktop because of the unhandled
 	 * SIGPIPE signal. It is caused by wlroots trying to write the X11
 	 * clipboard data to the closed fd of the wayland client.
 	 * See https://github.com/labwc/labwc/issues/890#issuecomment-1524962995
@@ -593,7 +593,7 @@ server_init(void)
 	 * | output->session_lock_tree          | session lock surfaces (e.g. swaylock)
 	 * | output->cycle_osd_tree             | window switcher's on-screen display
 	 * | server.cycle_preview_tree         | window switcher's previewed window
-	 * | server.menu_tree                  | labwc's server-side menus
+	 * | server.menu_tree                  | oxide-desktop's server-side menus
 	 * | output->layer_popup_tree           | xdg popups on layer surfaces
 	 * | output->layer_tree[3]              | overlay layer surfaces (e.g. rofi)
 	 * | output->layer_tree[2]              | top layer surfaces (e.g. waybar)

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_ARRAY_H
-#define LABWC_ARRAY_H
+#ifndef OXIDE_DESKTOP_ARRAY_H
+#define OXIDE_DESKTOP_ARRAY_H
 
 #include <wayland-server-core.h>
 #include "common/mem.h"
@@ -70,4 +70,4 @@ wl_array_len(struct wl_array *array)
 		*_entry = (_val);                            \
 	} while (0)
 
-#endif /* LABWC_ARRAY_H */
+#endif /* OXIDE_DESKTOP_ARRAY_H */

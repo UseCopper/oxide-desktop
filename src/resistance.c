@@ -4,7 +4,7 @@
 #include "common/border.h"
 #include "config/rcxml.h"
 #include "edges.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "snap-constraints.h"
 #include "view.h"
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_DND_H
-#define LABWC_DND_H
+#ifndef OXIDE_DESKTOP_DND_H
+#define OXIDE_DESKTOP_DND_H
 
 #include <wayland-server-core.h>
 
@@ -11,4 +11,4 @@ void dnd_icons_show(struct seat *seat, bool show);
 void dnd_icons_move(struct seat *seat, double x, double y);
 void dnd_finish(struct seat *seat);
 
-#endif /* LABWC_DND_H */
+#endif /* OXIDE_DESKTOP_DND_H */

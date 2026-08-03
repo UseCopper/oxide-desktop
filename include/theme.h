@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Theme engine for labwc
+ * Theme engine for oxide-desktop
  *
  * Copyright Johan Malm 2020-2021
  */
 
-#ifndef LABWC_THEME_H
-#define LABWC_THEME_H
+#ifndef OXIDE_DESKTOP_THEME_H
+#define OXIDE_DESKTOP_THEME_H
 
 #include <cairo.h>
 #include <stdbool.h>
@@ -16,7 +16,7 @@ struct lab_img;
 
 /*
  * Openbox defines 7 types of Gradient background in addition to Solid.
- * Currently, labwc supports only Vertical and SplitVertical.
+ * Currently, oxide-desktop supports only Vertical and SplitVertical.
  */
 enum lab_gradient {
 	LAB_GRADIENT_NONE, /* i.e. Solid */
@@ -216,7 +216,7 @@ struct theme {
 /**
  * theme_init - read openbox theme and generate button textures
  * @theme: theme data
- * @theme_name: theme-name in <theme-dir>/<theme-name>/labwc/themerc
+ * @theme_name: theme-name in <theme-dir>/<theme-name>/oxide-desktop/themerc
  * Note <theme-dir> is obtained in theme-dir.c
  */
 void theme_init(struct theme *theme, const char *theme_name);
@@ -227,4 +227,4 @@ void theme_init(struct theme *theme, const char *theme_name);
  */
 void theme_finish(struct theme *theme);
 
-#endif /* LABWC_THEME_H */
+#endif /* OXIDE_DESKTOP_THEME_H */

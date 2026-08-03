@@ -8,7 +8,7 @@
 #include "cycle.h"
 #include "view.h"
 #include "workspaces.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "desktop-entry.h"
 #include "output.h"
 

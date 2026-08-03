@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SSD_INTERNAL_H
-#define LABWC_SSD_INTERNAL_H
+#ifndef OXIDE_DESKTOP_SSD_INTERNAL_H
+#define OXIDE_DESKTOP_SSD_INTERNAL_H
 
 #include <wlr/util/box.h>
 #include "common/border.h"
@@ -186,4 +186,4 @@ void ssd_shadow_create(struct ssd *ssd);
 void ssd_shadow_update(struct ssd *ssd);
 void ssd_shadow_destroy(struct ssd *ssd);
 
-#endif /* LABWC_SSD_INTERNAL_H */
+#endif /* OXIDE_DESKTOP_SSD_INTERNAL_H */

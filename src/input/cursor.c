@@ -28,7 +28,7 @@
 #include "input/keyboard.h"
 #include "input/tablet.h"
 #include "input/touch.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "layers.h"
 #include "menu/menu.h"
 #include "output.h"
@@ -590,7 +590,7 @@ cursor_update_common(const struct cursor_context *ctx,
 		seat->server_cursor = LAB_CURSOR_CLIENT;
 	} else {
 		/*
-		 * Cursor is over a server (labwc) surface.  Clear focus
+		 * Cursor is over a server (oxide-desktop) surface.  Clear focus
 		 * from the focused client (if any, no-op otherwise) and
 		 * set the cursor image ourselves when not currently in
 		 * a drag operation.
@@ -1579,7 +1579,7 @@ cursor_load(struct seat *seat)
 	 * (cursors_xdg).
 	 *
 	 * However, the aliasing does not include the "grab" cursor
-	 * icon which labwc uses when dragging a window. To fix that,
+	 * icon which oxide-desktop uses when dragging a window. To fix that,
 	 * try to get the grab cursor icon from wlroots. If the user
 	 * supplied an appropriate cursor theme which includes the
 	 * "grab" cursor icon, we will keep using it.

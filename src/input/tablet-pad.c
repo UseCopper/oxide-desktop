@@ -12,7 +12,7 @@
 #include "config/tablet.h"
 #include "input/cursor.h"
 #include "input/tablet.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 
 #if WLR_HAS_LIBINPUT_BACKEND
 	#include <wlr/backend/libinput.h>
@@ -36,7 +36,7 @@ tablet_pad_attach_tablet(struct seat *seat)
 			/*
 			 * Prevent iterating over non-libinput devices. This might
 			 * be the case when a tablet is exposed by the Wayland
-			 * protocol backend when running labwc as a nested compositor.
+			 * protocol backend when running oxide-desktop as a nested compositor.
 			 */
 			continue;
 		}

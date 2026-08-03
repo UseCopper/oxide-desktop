@@ -11,7 +11,7 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include "common/macros.h"
 #include "common/mem.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "view.h"

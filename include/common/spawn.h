@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SPAWN_H
-#define LABWC_SPAWN_H
+#ifndef OXIDE_DESKTOP_SPAWN_H
+#define OXIDE_DESKTOP_SPAWN_H
 
 #include <sys/types.h>
 
@@ -44,4 +44,4 @@ pid_t spawn_piped(const char *command, int *pipe_fd);
  */
 void spawn_piped_close(pid_t pid, int pipe_fd);
 
-#endif /* LABWC_SPAWN_H */
+#endif /* OXIDE_DESKTOP_SPAWN_H */

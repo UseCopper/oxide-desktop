@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SCALED_IMG_BUFFER_H
-#define LABWC_SCALED_IMG_BUFFER_H
+#ifndef OXIDE_DESKTOP_SCALED_IMG_BUFFER_H
+#define OXIDE_DESKTOP_SCALED_IMG_BUFFER_H
 
 struct wlr_scene_tree;
 struct wlr_scene_node;
@@ -64,4 +64,4 @@ struct scaled_img_buffer {
 struct scaled_img_buffer *scaled_img_buffer_create(struct wlr_scene_tree *parent,
 	struct lab_img *img, int width, int height);
 
-#endif /* LABWC_SCALED_IMG_BUFFER_H */
+#endif /* OXIDE_DESKTOP_SCALED_IMG_BUFFER_H */

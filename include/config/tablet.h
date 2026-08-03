@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_TABLET_CONFIG_H
-#define LABWC_TABLET_CONFIG_H
+#ifndef OXIDE_DESKTOP_TABLET_CONFIG_H
+#define OXIDE_DESKTOP_TABLET_CONFIG_H
 
 #include <stdint.h>
 #include "config/types.h"
@@ -12,4 +12,4 @@ void tablet_button_mapping_add(uint32_t from, uint32_t to);
 void tablet_load_default_button_mappings(void);
 uint32_t tablet_get_mapped_button(uint32_t src_button);
 
-#endif /* LABWC_TABLET_CONFIG_H */
+#endif /* OXIDE_DESKTOP_TABLET_CONFIG_H */

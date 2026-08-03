@@ -14,7 +14,7 @@
 #include "common/mem.h"
 #include "common/scene-helpers.h"
 #include "input/keyboard.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 

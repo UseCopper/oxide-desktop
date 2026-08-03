@@ -5509,7 +5509,7 @@ sub process {
 			}
 
 
-			# We need this for the labwc-custom check below. It
+			# We need this for the oxide-desktop-custom check below. It
 			# avoids false positives with do { } while (); etc.
 			my $starts_with_if_while_etc = 0;
 			if ($s =~ /^\+\s*(if|while|for|switch).*/) {
@@ -5534,7 +5534,7 @@ sub process {
 					&& $filename ne "include/common/array.h"
 					&& $filename ne "include/common/xml.h"
 					&& $filename ne "include/ssd-internal.h") {
-				CHK("BRACES", "[labwc-custom] open brace { expected after if/while/for/switch - even with single statement blocks");
+				CHK("BRACES", "[oxide-desktop-custom] open brace { expected after if/while/for/switch - even with single statement blocks");
 			}
 
 			if (length($c) && $s !~ /^\s*{?\s*\\*\s*$/ &&
@@ -5655,7 +5655,7 @@ sub process {
 #Ignore Page<foo> variants
 			    $var !~ /^(?:Clear|Set|TestClear|TestSet|)Page[A-Z]/ &&
 
-#labwc-custom check to ignore some pango/libxml2/etc CamelCase variants
+#oxide-desktop-custom check to ignore some pango/libxml2/etc CamelCase variants
 			    $var !~ /^(?:_?Pango\w+)/ &&
 			    $var !~ /^(?:xml\w+)/ &&
 			    $var !~ /^(?:GString|GError|GHashTable)/ &&

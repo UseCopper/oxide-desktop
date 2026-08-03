@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_MENU_H
-#define LABWC_MENU_H
+#ifndef OXIDE_DESKTOP_MENU_H
+#define OXIDE_DESKTOP_MENU_H
 
 #include <wayland-server.h>
 
@@ -127,4 +127,4 @@ void menu_close_root(void);
 /* menu_reconfigure - reload theme and content */
 void menu_reconfigure(void);
 
-#endif /* LABWC_MENU_H */
+#endif /* OXIDE_DESKTOP_MENU_H */

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_CYCLE_H
-#define LABWC_CYCLE_H
+#ifndef OXIDE_DESKTOP_CYCLE_H
+#define OXIDE_DESKTOP_CYCLE_H
 
 #include <stdbool.h>
 #include <wayland-server-core.h>
@@ -167,4 +167,4 @@ void cycle_osd_scroll_update(struct cycle_osd_output *osd_output);
 extern struct cycle_osd_impl cycle_osd_classic_impl;
 extern struct cycle_osd_impl cycle_osd_thumbnail_impl;
 
-#endif // LABWC_CYCLE_H
+#endif // OXIDE_DESKTOP_CYCLE_H

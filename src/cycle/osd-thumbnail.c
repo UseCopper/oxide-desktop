@@ -13,7 +13,7 @@
 #include "common/mem.h"
 #include "common/scene-helpers.h"
 #include "cycle.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "scaled-buffer/scaled-font-buffer.h"

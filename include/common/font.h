@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_FONT_H
-#define LABWC_FONT_H
+#ifndef OXIDE_DESKTOP_FONT_H
+#define OXIDE_DESKTOP_FONT_H
 
 #include <cairo.h>
 #include <pango/pango-font.h>
@@ -56,4 +56,4 @@ void font_buffer_create(struct lab_data_buffer **buffer, int max_width,
  */
 void font_finish(void);
 
-#endif /* LABWC_FONT_H */
+#endif /* OXIDE_DESKTOP_FONT_H */

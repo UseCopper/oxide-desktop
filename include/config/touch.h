@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_TOUCH_CONFIG_H
-#define LABWC_TOUCH_CONFIG_H
+#ifndef OXIDE_DESKTOP_TOUCH_CONFIG_H
+#define OXIDE_DESKTOP_TOUCH_CONFIG_H
 
 #include <stdbool.h>
 #include <wayland-util.h>
@@ -15,4 +15,4 @@ struct touch_config_entry {
 
 struct touch_config_entry *touch_find_config_for_device(char *device_name);
 
-#endif /* LABWC_TOUCH_CONFIG_H */
+#endif /* OXIDE_DESKTOP_TOUCH_CONFIG_H */

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * output.c: labwc output and rendering
+ * output.c: oxide-desktop output and rendering
  *
  * Copyright (C) 2019-2021 Johan Malm
  * Copyright (C) 2020 The Sway authors
@@ -29,7 +29,7 @@
 #include "common/scene-helpers.h"
 #include "common/string-helpers.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "layers.h"
 #include "node.h"
 #include "output-state.h"
@@ -635,7 +635,7 @@ handle_new_output(struct wl_listener *listener, void *data)
 		g_string_replace(title, "%o", wlr_output->name, 0);
 		wlr_wl_output_set_title(wlr_output, title->str);
 		g_string_free(title, TRUE);
-		wlr_wl_output_set_app_id(wlr_output, "labwc");
+		wlr_wl_output_set_app_id(wlr_output, "oxide-desktop");
 	}
 
 	/*

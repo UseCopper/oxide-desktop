@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_BOX_H
-#define LABWC_BOX_H
+#ifndef OXIDE_DESKTOP_BOX_H
+#define OXIDE_DESKTOP_BOX_H
 
 #include <wlr/util/box.h>
 
@@ -33,4 +33,4 @@ struct wlr_box box_fit_within(int width, int height, struct wlr_box *bound);
 
 struct wlr_fbox box_to_fbox(struct wlr_box *box);
 
-#endif /* LABWC_BOX_H */
+#endif /* OXIDE_DESKTOP_BOX_H */

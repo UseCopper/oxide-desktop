@@ -15,7 +15,7 @@
 #endif
 #include "img/img-xbm.h"
 #include "img/img-xpm.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "theme.h"
 
 struct lab_img_data {

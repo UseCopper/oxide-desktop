@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_EXT_FOREIGN_TOPLEVEL_H
-#define LABWC_EXT_FOREIGN_TOPLEVEL_H
+#ifndef OXIDE_DESKTOP_EXT_FOREIGN_TOPLEVEL_H
+#define OXIDE_DESKTOP_EXT_FOREIGN_TOPLEVEL_H
 
 #include <wayland-server-core.h>
 
@@ -24,4 +24,4 @@ void ext_foreign_toplevel_init(struct ext_foreign_toplevel *ext_toplevel,
 	struct view *view);
 void ext_foreign_toplevel_finish(struct ext_foreign_toplevel *ext_toplevel);
 
-#endif /* LABWC_EXT_FOREIGN_TOPLEVEL_H */
+#endif /* OXIDE_DESKTOP_EXT_FOREIGN_TOPLEVEL_H */

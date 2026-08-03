@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_IMG_PNG_H
-#define LABWC_IMG_PNG_H
+#ifndef OXIDE_DESKTOP_IMG_PNG_H
+#define OXIDE_DESKTOP_IMG_PNG_H
 
 struct lab_data_buffer *img_png_load(const char *filename);
 
-#endif /* LABWC_IMG_PNG_H */
+#endif /* OXIDE_DESKTOP_IMG_PNG_H */

@@ -17,7 +17,7 @@
 #include "config/rcxml.h"
 #include "decorations.h"
 #include "foreign-toplevel/foreign.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "menu/menu.h"
 #include "node.h"
 #include "output.h"
@@ -624,7 +624,7 @@ xdg_toplevel_view_configure(struct view *view, struct wlr_box geo)
 			/*
 			 * geo.{width,height} are checked here to guard against
 			 * an odd edge-case reported in #3608 which involves TTY
-			 * switching between labwc and Xfce running on X.Org on
+			 * switching between oxide-desktop and Xfce running on X.Org on
 			 * another TTY. It is not yet clear what causes this,
 			 * but hitting wlroots assert() is not great, so let's
 			 * protect against it.

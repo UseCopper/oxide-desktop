@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
-: ${LABWC_RUNS:=1}
-: ${LABWC_LEAK_TEST:=0}
-: ${LABWC_EXPECT_RETURNCODE:=0}
-: ${LABWC_VERBOSE:=0}
+: ${OXIDE_DESKTOP_RUNS:=1}
+: ${OXIDE_DESKTOP_LEAK_TEST:=0}
+: ${OXIDE_DESKTOP_EXPECT_RETURNCODE:=0}
+: ${OXIDE_DESKTOP_VERBOSE:=0}
 
-if ! test -x "$1/labwc"; then
-	echo "$1/labwc not found"
+if ! test -x "$1/oxide-desktop"; then
+	echo "$1/oxide-desktop not found"
 	exit 1
 fi
 
 args=(
-	"$1/labwc"
+	"$1/oxide-desktop"
 	-C scripts/ci
 	-d
 )
@@ -28,7 +28,7 @@ gdb_run() {
 	#
 	# Not using coredumps either because they
 	# are a pain to setup on GH actions and
-	# just running labwc again is a lot faster
+	# just running oxide-desktop again is a lot faster
 	# anyway.
 
 	gdb --batch                       \
@@ -45,31 +45,31 @@ gdb_run() {
 	return $?
 }
 
-echo "Running with LABWC_RUNS=$LABWC_RUNS"
+echo "Running with OXIDE_DESKTOP_RUNS=$OXIDE_DESKTOP_RUNS"
 
-if test "$LABWC_LEAK_TEST" != "0"; then
+if test "$OXIDE_DESKTOP_LEAK_TEST" != "0"; then
 	LSAN_OPTIONS=suppressions=scripts/asan_leak_suppressions "${args[@]}"
 	exit $?
 fi
 
 ret=0
-for((i=1; i<=LABWC_RUNS; i++)); do
+for((i=1; i<=OXIDE_DESKTOP_RUNS; i++)); do
 	printf "Starting run %2s\n" $i
 	output=$(gdb_run 2>&1)
 	ret=$?
-	if test $ret -ne $LABWC_EXPECT_RETURNCODE; then
+	if test $ret -ne $OXIDE_DESKTOP_EXPECT_RETURNCODE; then
 		echo "Crash encountered:"
 		echo "------------------"
 		echo "$output"
 		break
-	elif test $LABWC_VERBOSE -eq 1; then
+	elif test $OXIDE_DESKTOP_VERBOSE -eq 1; then
 		echo "------------------"
 		echo "$output"
 	fi
 done
 
-echo "labwc terminated with return code $ret"
-if test $ret -eq $LABWC_EXPECT_RETURNCODE; then
+echo "oxide-desktop terminated with return code $ret"
+if test $ret -eq $OXIDE_DESKTOP_EXPECT_RETURNCODE; then
 	exit 0;
 else
 	exit 1;

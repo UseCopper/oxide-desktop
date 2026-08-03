@@ -1512,7 +1512,7 @@ parse_color(const char *color, uint32_t *result)
 }
 
 /*
- * As labnag is slow for large "detailed messages" we curtail stdin at an
+ * As oxide-nag is slow for large "detailed messages" we curtail stdin at an
  * arbitrary size to avoid hogging the CPU.
  */
 #define MAX_STDIN_LINES 200
@@ -1617,7 +1617,7 @@ nag_parse_options(int argc, char **argv, struct nag *nag,
 	};
 
 	const char *usage =
-		"Usage: labnag [options...]\n"
+		"Usage: oxide-nag [options...]\n"
 		"\n"
 		"  -B, --button <text> [<action>]  Create a button with text\n"
 		"  -Z, --button-dismiss <text> [<action>]\n"
@@ -1763,7 +1763,7 @@ nag_parse_options(int argc, char **argv, struct nag *nag,
 			nag->details.use_exclusive_zone = true;
 			break;
 		case 'v': /* Version */
-			printf("labnag " LABWC_VERSION "\n");
+			printf("oxide-nag " OXIDE_DESKTOP_VERSION "\n");
 			return LAB_EXIT_FAILURE;
 		case TO_COLOR_BACKGROUND: /* Background color */
 			if (!parse_color(optarg, &conf->background)) {

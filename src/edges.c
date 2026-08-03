@@ -10,7 +10,7 @@
 #include "common/box.h"
 #include "common/macros.h"
 #include "config/rcxml.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "node.h"
 #include "output.h"
 #include "ssd.h"

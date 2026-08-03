@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_VIEW_IMPL_COMMON_H
-#define LABWC_VIEW_IMPL_COMMON_H
+#ifndef OXIDE_DESKTOP_VIEW_IMPL_COMMON_H
+#define OXIDE_DESKTOP_VIEW_IMPL_COMMON_H
 /*
  * Common code for view->impl functions
  *
@@ -20,4 +20,4 @@ void view_impl_unmap(struct view *view);
  */
 void view_impl_apply_geometry(struct view *view, int w, int h);
 
-#endif /* LABWC_VIEW_IMPL_COMMON_H */
+#endif /* OXIDE_DESKTOP_VIEW_IMPL_COMMON_H */

@@ -26,7 +26,7 @@
 #include "input/input.h"
 #include "input/keyboard.h"
 #include "input/key-state.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "output.h"
 #include "session-lock.h"
 #include "view.h"
@@ -744,7 +744,7 @@ seat_pointer_end_grab(struct seat *seat, struct wlr_surface *surface)
 	}
 }
 
-/* This is called on SIGHUP (generally in response to labwc --reconfigure */
+/* This is called on SIGHUP (generally in response to oxide-desktop --reconfigure */
 void
 seat_reconfigure(void)
 {

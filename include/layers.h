@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_LAYERS_H
-#define LABWC_LAYERS_H
+#ifndef OXIDE_DESKTOP_LAYERS_H
+#define OXIDE_DESKTOP_LAYERS_H
 
 #include <wayland-server-core.h>
 #include <wlr/util/box.h>
@@ -46,4 +46,4 @@ void layers_arrange(struct output *output);
 void layer_try_set_focus(struct seat *seat,
 	struct wlr_layer_surface_v1 *layer_surface);
 
-#endif /* LABWC_LAYERS_H */
+#endif /* OXIDE_DESKTOP_LAYERS_H */

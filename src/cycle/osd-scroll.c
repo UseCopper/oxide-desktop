@@ -3,7 +3,7 @@
 #include <wlr/types/wlr_scene.h>
 #include "common/lab-scene-rect.h"
 #include "common/scene-helpers.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "cycle.h"
 #include "output.h"
 

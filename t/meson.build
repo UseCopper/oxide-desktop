@@ -14,7 +14,7 @@ test_lib = static_library(
     '../src/common/xml.c',
     '../src/common/parse-bool.c',
   ),
-  include_directories: [labwc_inc],
+  include_directories: [oxide_desktop_inc],
   dependencies: test_deps,
 )
 
@@ -30,7 +30,7 @@ foreach t : tests
     executable(
       'test_@0@'.format(t),
       sources: '@0@.c'.format(t),
-      include_directories: [labwc_inc],
+      include_directories: [oxide_desktop_inc],
       link_with: [test_lib],
       dependencies: test_deps,
     ),

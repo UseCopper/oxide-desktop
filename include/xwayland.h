@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_XWAYLAND_H
-#define LABWC_XWAYLAND_H
+#ifndef OXIDE_DESKTOP_XWAYLAND_H
+#define OXIDE_DESKTOP_XWAYLAND_H
 #include "config.h"
 
 #if HAVE_XWAYLAND
@@ -28,7 +28,7 @@ struct xwayland_unmanaged {
 	struct wl_listener set_override_redirect;
 
 	/*
-	 * True if the surface has performed a keyboard grab. labwc
+	 * True if the surface has performed a keyboard grab. oxide-desktop
 	 * honors keyboard grabs and will give the surface focus when
 	 * it's mapped (which may occur slightly later) and on top.
 	 */
@@ -83,4 +83,4 @@ void xwayland_update_workarea(void);
 void xwayland_flush(void);
 
 #endif /* HAVE_XWAYLAND */
-#endif /* LABWC_XWAYLAND_H */
+#endif /* OXIDE_DESKTOP_XWAYLAND_H */

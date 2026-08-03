@@ -1,22 +1,22 @@
-labwc-config(5)
+oxide-desktop-config(5)
 
 # NAME
 
-labwc - configuration files
+oxide-desktop - configuration files
 
 # DESCRIPTION
 
-Labwc uses openbox-3.6 specification for configuration and theming, but does not
-support all options. The following files form the basis of the labwc
+Oxide-desktop uses openbox-3.6 specification for configuration and theming, but does not
+support all options. The following files form the basis of the oxide-desktop
 configuration: rc.xml, menu.xml, autostart, shutdown, environment and xinitrc.
 
-No configuration files are needed to start and run labwc.
+No configuration files are needed to start and run oxide-desktop.
 
 In accordance with XDG Base Directory Specification, configuration files are
 searched for in the following order:
 
-- ${XDG_CONFIG_HOME:-$HOME/.config}/labwc
-- ${XDG_CONFIG_DIRS:-/etc/xdg}/labwc
+- ${XDG_CONFIG_HOME:-$HOME/.config}/oxide-desktop
+- ${XDG_CONFIG_DIRS:-/etc/xdg}/oxide-desktop
 
 When $XDG_CONFIG_HOME is defined, it replaces (rather than augments)
 $HOME/.config. The same is the case for $XDG_CONFIG_DIRS and /etc/xdg.
@@ -25,7 +25,7 @@ The XDG Base Directory Specification does not specify whether or not programs
 should (a) allow the first-identified configuration file to supersede any
 others, or (b) define rules for merging the information from more than one file.
 
-By default, labwc uses option (a), reading only the first file identified. With
+By default, oxide-desktop uses option (a), reading only the first file identified. With
 the --merge-config option, the search order is reversed, but every configuration
 file encountered is processed in turn. Thus, user-specific files will augment
 system-wide configurations, with conflicts favoring the user-specific
@@ -43,14 +43,14 @@ specify keyboard layout settings and cursor size/theme here; see environment
 variable section below for details. Within an XDG Base Directory, a file named
 "environment" will be parsed first, followed by any file matching the glob
 "environment.d/\*.env". Files within the environment.d directory are parsed in
-alphabetical order. Unless the --merge-config option is specified, labwc will
+alphabetical order. Unless the --merge-config option is specified, oxide-desktop will
 consider a particular XDG Base Directory to have provided an environment file if
 that directory contains either the "environment" file or at least one
 "environment.d/\*.env" file.
 
 Note: environment files are treated differently by Openbox, which will simply
 source the file as a valid shell script before running the window manager. Files
-are instead parsed directly by labwc so that environment variables can be
+are instead parsed directly by oxide-desktop so that environment variables can be
 re-loaded on --reconfigure.
 
 Any environment variables referenced as $VARIABLE or ${VARIABLE} will be
@@ -59,34 +59,34 @@ substituted and the tilde (~) will be expanded as the user's home directory.
 Any line beginning with the character '#' in an environment file will be treated
 as a comment. Trailing comments are not supported.
 
-Please note that as labwc reloads the environment file(s) on reconfigure,
+Please note that as oxide-desktop reloads the environment file(s) on reconfigure,
 recursive/circular assignments (for example FOO=$FOO:bar) should not be made.
 
-The *autostart* file is executed as a shell script after labwc has read its
+The *autostart* file is executed as a shell script after oxide-desktop has read its
 configuration and set variables defined in the environment file. Additionally,
-the environment variables WAYLAND_DISPLAY and (when labwc is built with Xwayland
+the environment variables WAYLAND_DISPLAY and (when oxide-desktop is built with Xwayland
 support) DISPLAY will be defined. This is the place for executing clients for
 handling background images, panels and other tasks that should run automatically
-when labwc launches.
+when oxide-desktop launches.
 
-The *shutdown* file is executed as a shell script when labwc is preparing to
+The *shutdown* file is executed as a shell script when oxide-desktop is preparing to
 terminate itself. All environment variables, including WAYLAND_DISPLAY and
 DISPLAY, will be available to the script. However, because the script runs
 asynchronously with other termination tasks, the shutdown file should not assume
 that the display will be usable. This file is useful to perform any custom
-operations necessary to finalize a labwc session.
+operations necessary to finalize a oxide-desktop session.
 
 The *menu.xml* file defines the context/root-menus and is described in
-labwc-menu(5).
+oxide-desktop-menu(5).
 
 There is a small <theme> section in rc.xml, for example to set rounded corners,
 but the remainder of the theme specification and associated files are described
-in labwc-theme(5).
+in oxide-desktop-theme(5).
 
 *rc.xml* is the main configuration file and all its options are described in
 detail below.
 
-The *xinitrc* file is executed as a shell script whenever labwc launches the
+The *xinitrc* file is executed as a shell script whenever oxide-desktop launches the
 Xwayland X11 server. This may happen multiple times throughout the session if
 Xwayland is not configured to persist when no X11 clients are connected.
 
@@ -96,18 +96,18 @@ This section describes *rc.xml* configuration options.
 
 ## SYNTAX
 
-Configuration must be wrapped in a <labwc_config> root-element like this:
+Configuration must be wrapped in a <oxide_desktop_config> root-element like this:
 
 ```
 <?xml version="1.0"?>
-<labwc_config>
+<oxide_desktop_config>
 
 <!-- settings -->
 
-</labwc_config>
+</oxide_desktop_config>
 ```
 
-*labwc* parses XML in an element/attribute agnostic way. This is a design
+*oxide-desktop* parses XML in an element/attribute agnostic way. This is a design
 decision to increase config file flexibility and keep code simple. In practical
 terms, this means that `<a><b>c</b></a>` is usually equivalent to `<a b="c" />`.
 However, there are some caveats:
@@ -214,20 +214,20 @@ this is for compatibility with Openbox.
 	Note: Enabling this option with atomic mode setting is experimental. If
 	you experience undesirable side effects when tearing is allowed,
 	consider setting the environment variable WLR_DRM_NO_ATOMIC=1 when
-	launching labwc.
+	launching oxide-desktop.
 
 *<core><autoEnableOutputs>* [yes|no]
 	Automatically enable outputs at startup and when new outputs are
 	connected. This option applies only to drm outputs. Default is yes.
 
-	Caution: Disabling this option will make the labwc session unusable
+	Caution: Disabling this option will make the oxide-desktop session unusable
 	unless an external tool such as `wlr-randr` or `kanshi` is used to
 	manage outputs.
 
 	The reason for the existence of this option is that after losing signal
 	from the PC (e.g. by `wlopm -off`), some monitors do an input detection
 	that makes it appear (from the PC side) to disconnect and reconnect a
-	few seconds later, causing the monitor to turn back on again (as labwc
+	few seconds later, causing the monitor to turn back on again (as oxide-desktop
 	auto-enables newly connected outputs by default).
 
 	An example usage pattern to avoid the above behavior looks as follows:
@@ -245,13 +245,13 @@ this is for compatibility with Openbox.
 	Automatically enable HDR support on outputs when configuring them,
 	where supported by the particular output device and display. Default
 	is no. Additionally requires the Vulkan backend. Can be set
-	via `WLR_RENDERER=vulkan` in `~/.config/labwc/environment`.
+	via `WLR_RENDERER=vulkan` in `~/.config/oxide-desktop/environment`.
 
 *<core><reuseOutputMode>* [yes|no]
 	Try to re-use the existing output mode (resolution / refresh rate).
-	This may prevent unnecessary screenblank delays when starting labwc
+	This may prevent unnecessary screenblank delays when starting oxide-desktop
 	(also known as flicker free boot). If the existing output mode can not
-	be used with labwc the preferred mode of the monitor is used instead.
+	be used with oxide-desktop the preferred mode of the monitor is used instead.
 	Default is no.
 
 *<core><xwaylandPersistence>* [yes|no]
@@ -259,7 +259,7 @@ this is for compatibility with Openbox.
 	using a "lazy" policy that allows the server to launch on demand and die
 	when it is no longer needed. Default is no.
 
-	Note: changing this setting requires a restart of labwc.
+	Note: changing this setting requires a restart of oxide-desktop.
 
 *<core><primarySelection>* [yes|no]
 	Enable or disable the primary selection clipboard. May only be
@@ -280,7 +280,7 @@ this is for compatibility with Openbox.
 	The default prompt command is:
 
 	```
-	labnag \\
+	oxide-nag \\
 		--message '%m' \\
 		--button-dismiss '%n' \\
 		--button-dismiss '%y' \\
@@ -491,7 +491,7 @@ this is for compatibility with Openbox.
 
 *<focus><followMouseRequiresMovement>* [yes|no]
 	Requires cursor movement if followMouse is enabled. It is the same
-	as the "underMouse" setting in Openbox. If set to "no", labwc will
+	as the "underMouse" setting in Openbox. If set to "no", oxide-desktop will
 	additionally focus the window under the cursor in all situations
 	which change the position of a window (e.g. switching workspaces,
 	opening/closing windows). Focusing a different window via A-Tab is
@@ -580,7 +580,7 @@ extending outward from the snapped edge.
 	Define workspaces. A workspace covers all outputs. Workspaces can be
 	switched to with GoToDesktop and windows can be moved with
 	SendToDesktop.
-	See labwc-actions(5) for more information about their arguments.
+	See oxide-desktop-actions(5) for more information about their arguments.
 
 	The number attribute defines the minimum number of workspaces. Default
 	is 1. The number attribute is optional. If the number attribute is
@@ -610,7 +610,7 @@ extending outward from the snapped edge.
 	The name of the icon to use as a fallback when the application icon
 	(e.g. window icon in the titlebar) is not available. The name follows
 	the ones specified in "Icon=" entries in desktop files.
-	Default is 'labwc'.
+	Default is 'oxide-desktop'.
 
 *<theme><titlebar><layout>*
 	Selection and order of buttons in a window's titlebar.
@@ -752,13 +752,13 @@ generate gesture events, like swipe and pinch. There are some related settings
 In the Wayland Compositor domain, events associated with touchscreens are
 sometimes simply referred to as *touch* events. Touchscreens can be configured
 in both the *<touch>* and *<libinput>* sections. Note that touchscreen gestures
-are not interpreted by libinput, nor labwc. Any touch point is passed to the
+are not interpreted by libinput, nor oxide-desktop. Any touch point is passed to the
 client (application) for any interpretation of gestures.
 
 Tablets are considered special by libinput although in the eyes of the Wayland
 protocol they are merely a *touch* capability. Tablets and associated tablet
 tools are configured in the *<tablet>*, *<tablettool>* and *<libinput>*
-sections. Note that the term *tablet* in libinput (and labwc) refers to graphics
+sections. Note that the term *tablet* in libinput (and oxide-desktop) refers to graphics
 tablets only (e.g. Wacom Intuos), not to tablet devices like the Apple iPad.
 
 References:
@@ -847,7 +847,7 @@ overrideInhibition="">*
 	```
 
 *<keyboard><keybind key=""><action name="">*
-	Keybind action. See labwc-actions(5).
+	Keybind action. See oxide-desktop-actions(5).
 
 *<keyboard><default />*
 	Load the default keybinds listed below. This is an addition to the
@@ -958,7 +958,7 @@ input-devices by the Wayland protocol.
 
 ```
 <?xml version="1.0"?>
-<labwc_config>
+<oxide_desktop_config>
 <mouse>
   <default />
   <context name="Frame">
@@ -970,7 +970,7 @@ input-devices by the Wayland protocol.
     </mousebind>
   </context>
 </mouse>
-</labwc_config>
+</oxide_desktop_config>
 ```
 
 	Example to un-bind the default Super + left-button-press to move window:
@@ -1410,9 +1410,9 @@ situation.
 	such as panels.
 
 *<windowRules><windowRule iconPriority="">* [client|server]
-	By default, labwc tries to find application icons based on their
+	By default, oxide-desktop tries to find application icons based on their
 	app-id, either via .desktop file or by finding an icon with the same
-	name. If that fails labwc will then try to use client supplied icons,
+	name. If that fails oxide-desktop will then try to use client supplied icons,
 	accomplished with the xdg-toplevel-icon protocol for wayland native
 	applications or the \_NET_WM_ICON property for X11 applications.
 
@@ -1440,7 +1440,7 @@ situation.
 
 *<menu><showIcons>*
 	Show menu icons based on the `icon` attribute of menu label elements.
-	Default is yes. Requires libsfdo. If labwc is built without it, no
+	Default is yes. Requires libsfdo. If oxide-desktop is built without it, no
 	icons will be shown.
 
 ## MAGNIFIER
@@ -1478,13 +1478,13 @@ situation.
 
 ## PRIVILEGED INTERFACES
 
-Labwc supports a small set of privileged wayland interfaces. All of these
+Oxide-desktop supports a small set of privileged wayland interfaces. All of these
 interfaces are enabled by default for applications unless they are running
 via a sandbox environment supporting the security-context-v1 protocol.
 
 Security conscious users are suggested to use a sandbox framework to run
 potentially untrusted applications as it additionally limits access to the
-filesystem (including labwc configuration) and other services like dbus.
+filesystem (including oxide-desktop configuration) and other services like dbus.
 
 In addition to that, privileged protocols can be restricted for non-sandboxed
 clients by defining a `<privilegedInterfaces>` block:
@@ -1556,4 +1556,4 @@ See xkeyboard-config(7) for details.
 
 # SEE ALSO
 
-labwc(1), labwc-actions(5), labwc-theme(5)
+oxide-desktop(1), oxide-desktop-actions(5), oxide-desktop-theme(5)

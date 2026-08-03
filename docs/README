@@ -1,4 +1,4 @@
-Config layout for ~/.config/labwc/
+Config layout for ~/.config/oxide-desktop/
 - autostart
 - environment
 - menu.xml
@@ -7,5 +7,5 @@ Config layout for ~/.config/labwc/
 - themerc-override
 - xinitrc
 
-See `man labwc-config and `man labwc-theme` for further details.
+See `man oxide-desktop-config and `man oxide-desktop-theme` for further details.
 

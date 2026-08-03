@@ -1,19 +1,19 @@
-labwc-theme(5)
+oxide-desktop-theme(5)
 
 # NAME
 
-labwc - theme files
+oxide-desktop - theme files
 
 # THEME
 
 The theme engine aims to be compatible with openbox and themes will be
 searched for in the following order:
 
-- ${XDG_DATA_HOME:-$HOME/.local/share}/themes/<theme-name>/labwc/
-- $HOME/.themes/<theme-name>/labwc/
-- /usr/share/themes/<theme-name>/labwc/
-- /usr/local/share/themes/<theme-name>/labwc/
-- /opt/share/themes/<theme-name>/labwc/
+- ${XDG_DATA_HOME:-$HOME/.local/share}/themes/<theme-name>/oxide-desktop/
+- $HOME/.themes/<theme-name>/oxide-desktop/
+- /usr/share/themes/<theme-name>/oxide-desktop/
+- /usr/local/share/themes/<theme-name>/oxide-desktop/
+- /opt/share/themes/<theme-name>/oxide-desktop/
 - ${XDG_DATA_HOME:-$HOME/.local/share}/themes/<theme-name>/openbox-3/
 - $HOME/.themes/<theme-name>/openbox-3/
 - /usr/share/themes/<theme-name>/openbox-3/
@@ -24,15 +24,15 @@ When $XDG_DATA_HOME is defined, it replaces (rather than augments)
 $HOME/.local/share. The same is the case for $XDG_DATA_DIRS and /usr/share/.
 
 Choosing a theme is done by editing the <name> key in the <theme> section of
-the rc.xml configuration file (labwc-config(5)).
+the rc.xml configuration file (oxide-desktop-config(5)).
 
 A theme consists of a themerc file and optionally some titlebar icons (referred
 to as buttons).
 
 Theme settings specified in themerc can be overridden by creating a
 'themerc-override' file in the configuration directory, which is normally
-$HOME/.config/labwc/ but can be a few other locations as described in
-labwc-config(5).
+$HOME/.config/oxide-desktop/ but can be a few other locations as described in
+oxide-desktop-config(5).
 
 # DATA TYPES
 
@@ -55,7 +55,7 @@ labwc-config(5).
 	  (since 0.9.0)
 
 	Note: the #rrggbb aaa notation is deprecated starting from
-	labwc 0.7.2 and may be removed in future releases.
+	oxide-desktop 0.7.2 and may be removed in future releases.
 
 *justification*
 	Justification determines the horizontal alignment of text.
@@ -182,7 +182,7 @@ hover icon, like *close_hover-active.svg*.
 Openbox only supports hover effects rendered behind buttons which makes sense
 for the xbm format, but not for others. For reference, these are defined by
 *window.active|inactive.button.STATE.bg* where *STATE* can be any of *pressed*,
-*hover* and *disabled*. These are not (yet) supported by labwc and are mentioned
+*hover* and *disabled*. These are not (yet) supported by oxide-desktop and are mentioned
 here for comparison only.
 
 *window.button.hover.bg.color*
@@ -565,4 +565,4 @@ The handle is the window edge decoration at the bottom of the window.
 
 # SEE ALSO
 
-labwc(1), labwc-config(5), labwc-actions(5)
+oxide-desktop(1), oxide-desktop-config(5), oxide-desktop-actions(5)

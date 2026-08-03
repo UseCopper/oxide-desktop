@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_NODENAME_H
-#define LABWC_NODENAME_H
+#ifndef OXIDE_DESKTOP_NODENAME_H
+#define OXIDE_DESKTOP_NODENAME_H
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -16,4 +16,4 @@
  */
 char *nodename(xmlNode * node, char *buf, int len);
 
-#endif /* LABWC_NODENAME_H */
+#endif /* OXIDE_DESKTOP_NODENAME_H */

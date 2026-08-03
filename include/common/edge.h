@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_EDGE_H
-#define LABWC_EDGE_H
+#ifndef OXIDE_DESKTOP_EDGE_H
+#define OXIDE_DESKTOP_EDGE_H
 
 #include <stdbool.h>
 
@@ -78,4 +78,4 @@ bool lab_edge_is_cardinal(enum lab_edge edge);
  */
 enum lab_edge lab_edge_invert(enum lab_edge edge);
 
-#endif /* LABWC_EDGE_H */
+#endif /* OXIDE_DESKTOP_EDGE_H */

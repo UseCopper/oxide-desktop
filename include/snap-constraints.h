@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef LABWC_SNAP_CONSTRAINTS_H
-#define LABWC_SNAP_CONSTRAINTS_H
+#ifndef OXIDE_DESKTOP_SNAP_CONSTRAINTS_H
+#define OXIDE_DESKTOP_SNAP_CONSTRAINTS_H
 
 #include "common/edge.h"
 
@@ -17,4 +17,4 @@ void snap_constraints_update(struct view *view);
 struct wlr_box snap_constraints_effective(struct view *view,
 	enum lab_edge direction, bool use_pending);
 
-#endif /* LABWC_SNAP_CONSTRAINTS_H */
+#endif /* OXIDE_DESKTOP_SNAP_CONSTRAINTS_H */

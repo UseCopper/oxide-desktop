@@ -2,7 +2,7 @@
 
 #include <wlr/types/wlr_tearing_control_v1.h>
 #include "common/mem.h"
-#include "labwc.h"
+#include "oxide-desktop.h"
 #include "view.h"
 
 struct tearing_controller {
