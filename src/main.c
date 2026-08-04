@@ -13,9 +13,14 @@
 #include "config/rcxml.h"
 #include "config/session.h"
 #include "oxide-desktop.h"
+#include "settings/settings.h"
 #include "theme.h"
 #include "translate.h"
 #include "menu/menu.h"
+
+#if HAVE_SHELL
+#include "shell/shell.h"
+#endif
 
 /*
  * Globals
@@ -278,6 +283,13 @@ main(int argc, char *argv[])
 	server_init();
 	server_start();
 
+	oxide_settings_init();
+	oxide_settings_reload();
+
+#if HAVE_SHELL
+	shell_init();
+#endif
+
 	struct theme theme = { 0 };
 	theme_init(&theme, rc.theme_name);
 	rc.theme = &theme;
@@ -291,7 +303,11 @@ main(int argc, char *argv[])
 	};
 	wl_event_loop_add_idle(server.wl_event_loop, idle_callback, &idle_ctx);
 
+#if HAVE_SHELL
+	shell_main_loop_run();
+#else
 	wl_display_run(server.wl_display);
+#endif
 
 	session_shutdown();
 
@@ -299,6 +315,11 @@ main(int argc, char *argv[])
 	theme_finish(&theme);
 	rcxml_finish();
 	font_finish();
+
+#if HAVE_SHELL
+	shell_finish();
+#endif
+	oxide_settings_finish();
 
 	server_finish();
 

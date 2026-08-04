@@ -5658,7 +5658,9 @@ sub process {
 #oxide-desktop-custom check to ignore some pango/libxml2/etc CamelCase variants
 			    $var !~ /^(?:_?Pango\w+)/ &&
 			    $var !~ /^(?:xml\w+)/ &&
-			    $var !~ /^(?:GString|GError|GHashTable)/ &&
+			    $var !~ /^(?:GString|GError|GHashTable|GKeyFile|GPollFD)/ &&
+			    $var !~ /^(?:Gtk\w+)/ &&
+			    $var !~ /^(?:GSource\w*)/ &&
 			    $var !~ /^(?:__FreeBSD__)/ &&
 			    $var !~ /^(?:RsvgRectangle|RsvgHandle)/ &&
 			    $var !~ /^(?:CMUnitTest)/ &&

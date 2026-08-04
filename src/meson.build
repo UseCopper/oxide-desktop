@@ -57,4 +57,9 @@ subdir('img')
 subdir('input')
 subdir('menu')
 subdir('scaled-buffer')
+subdir('settings')
 subdir('ssd')
+
+if have_shell
+  subdir('shell')
+endif
