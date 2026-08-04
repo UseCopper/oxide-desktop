@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* view-impl-common.c: common code for shell view->impl functions */
 #include "view-impl-common.h"
+#include "config.h"
 #include "foreign-toplevel/foreign.h"
 #include "oxide-desktop.h"
+#include "shell/shell.h"
 #include "view.h"
 #include "window-rules.h"
 
@@ -35,6 +37,10 @@ view_impl_map(struct view *view)
 			foreign_toplevel_set_parent(view->foreign_toplevel,
 				parent->foreign_toplevel);
 		}
+#if HAVE_SHELL
+		/* Keep the shell's taskbar in sync with the taskbar-visible views. */
+		shell_view_mapped(view);
+#endif
 	}
 
 	wlr_log(WLR_DEBUG, "[map] identifier=%s, title=%s",
@@ -66,6 +72,9 @@ view_impl_unmap(struct view *view)
 		foreign_toplevel_destroy(view->foreign_toplevel);
 		view->foreign_toplevel = NULL;
 	}
+#if HAVE_SHELL
+	shell_view_unmapped(view);
+#endif
 }
 
 static bool

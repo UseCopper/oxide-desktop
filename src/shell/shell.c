@@ -132,3 +132,19 @@ shell_reconfigure(void)
 		oxide_panel_reconfigure(g_panel);
 	}
 }
+
+void
+shell_view_mapped(struct view *view)
+{
+	if (g_panel) {
+		oxide_panel_add_view(g_panel, view);
+	}
+}
+
+void
+shell_view_unmapped(struct view *view)
+{
+	if (g_panel) {
+		oxide_panel_remove_view(g_panel, view);
+	}
+}

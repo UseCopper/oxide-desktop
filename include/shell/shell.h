@@ -2,6 +2,8 @@
 #ifndef OXIDE_SHELL_H
 #define OXIDE_SHELL_H
 
+struct view;
+
 /*
  * The Oxide Desktop shell: the in-process panel / tray / thumbnailer built
  * with GTK4 + gtk4-layer-shell. Only compiled in when the build found
@@ -39,5 +41,14 @@ void shell_main_loop_quit(void);
  * Called from the SIGHUP reload path after settings_reload().
  */
 void shell_reconfigure(void);
+
+/*
+ * The compositor calls these when a view is mapped / unmapped (see
+ * view-impl-common.c, mirroring the foreign-toplevel handle lifecycle).
+ * Only views that belong in a taskbar are reported: mapped, focusable,
+ * not skipTaskbar. The shell keeps the panel's taskbar in sync.
+ */
+void shell_view_mapped(struct view *view);
+void shell_view_unmapped(struct view *view);
 
 #endif /* OXIDE_SHELL_H */
