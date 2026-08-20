@@ -85,7 +85,8 @@ uint32_t output_formats_10bit[] = {
 };
 
 static bool
-output_set_render_format(struct output *output, uint32_t candidates[], size_t count)
+output_set_render_format(struct output *output, uint32_t candidates[],
+		size_t count, bool silent)
 {
 	for (size_t i = 0; i < count; i++) {
 		wlr_output_state_set_render_format(&output->pending, candidates[i]);
@@ -93,6 +94,16 @@ output_set_render_format(struct output *output, uint32_t candidates[], size_t co
 			return true;
 		}
 	}
+	if (!silent) {
+		wlr_log(WLR_DEBUG, "output %s supports none of the %zu candidate"
+			" render formats", output->wlr_output->name, count);
+	}
+	/*
+	 * Leaving the last candidate tried on the pending state means no
+	 * swapchain can be created for this output at all, so clear the flag
+	 * and leave the format alone instead.
+	 */
+	output->pending.committed &= ~WLR_OUTPUT_STATE_RENDER_FORMAT;
 	return false;
 }
 
@@ -174,14 +185,14 @@ output_state_setup_hdr(struct output *output, bool silent)
 		hdr_succeeded = true;
 	} else if (render_bit_depth == LAB_RENDER_BIT_DEPTH_10) {
 		hdr_succeeded = output_set_render_format(output, output_formats_10bit,
-			ARRAY_SIZE(output_formats_10bit));
+			ARRAY_SIZE(output_formats_10bit), silent);
 		if (!hdr_succeeded) {
 			if (!silent) {
 				wlr_log(WLR_INFO, "No 10 bit color formats"
 					" supported, HDR disabled.");
 			}
 			if (!output_set_render_format(output, output_formats_8bit,
-					ARRAY_SIZE(output_formats_8bit))) {
+					ARRAY_SIZE(output_formats_8bit), silent)) {
 				if (!silent) {
 					wlr_log(WLR_ERROR, "No 8 bit color formats"
 						" supported either!");
@@ -190,7 +201,7 @@ output_state_setup_hdr(struct output *output, bool silent)
 		}
 	} else {
 		if (!output_set_render_format(output, output_formats_8bit,
-				ARRAY_SIZE(output_formats_8bit)) && !silent) {
+				ARRAY_SIZE(output_formats_8bit), silent) && !silent) {
 			wlr_log(WLR_ERROR, "No 8 bit color formats supported!");
 		}
 	}
@@ -280,6 +291,21 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 	if (seat->overlay.active.output == output) {
 		overlay_finish(seat);
 	}
+
+	/*
+	 * Destroy the scene output before changing the scene graph below.
+	 * Otherwise those changes can send a surface-enter for this output while
+	 * its destroy signal is already being emitted. The new listener then
+	 * misses that signal and makes wlr_output_finish() abort because
+	 * output->events.bind is not empty.
+	 *
+	 * See https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/4096
+	 */
+	if (output->scene_output) {
+		wlr_scene_output_destroy(output->scene_output);
+		output->scene_output = NULL;
+	}
+
 	wl_list_remove(&output->link);
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->destroy.link);
@@ -327,10 +353,6 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 		wl_display_terminate(server.wl_display);
 	}
 
-	/*
-	 * output->scene_output (if still around at this point) is
-	 * destroyed automatically when the wlr_output is destroyed
-	 */
 	free(output);
 }
 
@@ -893,12 +915,9 @@ output_config_apply(struct wlr_output_configuration_v1 *config)
 				server.workspaces.ext_group, output->wlr_output);
 
 			/*
-			 * At time of writing, wlr_output_layout_remove()
-			 * indirectly destroys the wlr_scene_output, but
-			 * this behavior may change in future. To remove
-			 * doubt and avoid either a leak or double-free,
-			 * explicitly destroy the wlr_scene_output before
-			 * calling wlr_output_layout_remove().
+			 * wlr_output_layout_remove() only unbinds the
+			 * wlr_scene_output from the layout; it does not
+			 * destroy it. Destroy explicitly to avoid a leak.
 			 */
 			wlr_scene_output_destroy(output->scene_output);
 			wlr_output_layout_remove(server.output_layout, o);

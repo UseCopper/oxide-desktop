@@ -54,6 +54,7 @@
 #include "action.h"
 #include "common/macros.h"
 #include "common/mem.h"
+#include "common/nag.h"
 #include "common/scene-helpers.h"
 #include "config/rcxml.h"
 #include "config/session.h"
@@ -103,6 +104,7 @@ reload_config_and_theme(void)
 
 	scaled_buffer_invalidate_sharing();
 	rcxml_finish();
+	nag_reset();
 	rcxml_read(rc.config_file);
 	theme_finish(rc.theme);
 	theme_init(rc.theme, rc.theme_name);
@@ -124,6 +126,8 @@ reload_config_and_theme(void)
 	resize_indicator_reconfigure();
 	kde_server_decoration_update_default();
 	workspaces_reconfigure();
+
+	wl_event_loop_add_idle(server.wl_event_loop, nag_show_callback, NULL);
 }
 
 static int
@@ -163,62 +167,90 @@ handle_sigchld(int signal, void *data)
 	siginfo_t info;
 	info.si_pid = 0;
 
-	/* First call waitid() with NOWAIT which doesn't consume the zombie */
-	if (waitid(P_ALL, /*id*/ 0, &info, WEXITED | WNOHANG | WNOWAIT) == -1) {
-		return 0;
-	}
+	/*
+	 * We may get a single SIGCHILD event although there are
+	 * multiple childs terminating so we loop through them.
+	 *
+	 * A 'while true; labwc --reconfigure; done' loop along
+	 * with some config error which causes labnag to re-spawn
+	 * constantly is a good test for this handler.
+	 */
 
-	if (info.si_pid == 0) {
-		/* No children in waitable state */
-		return 0;
-	}
-
-#if HAVE_XWAYLAND
-	/* Ensure that we do not break xwayland lazy initialization */
-	if (server.xwayland && server.xwayland->server
-			&& info.si_pid == server.xwayland->server->pid) {
-		return 0;
-	}
-#endif
-
-	/* And then do the actual (consuming) lookup again */
-	int ret = waitid(P_PID, info.si_pid, &info, WEXITED);
-	if (ret == -1) {
-		wlr_log(WLR_ERROR, "blocking waitid() for %ld failed: %d",
-			(long)info.si_pid, ret);
-		return 0;
-	}
-
-	const char *signame;
-	switch (info.si_code) {
-	case CLD_EXITED:
-		if (!action_check_prompt_result(info.si_pid, info.si_status)) {
-			wlr_log(info.si_status == 0 ? WLR_DEBUG : WLR_ERROR,
-				"spawned child %ld exited with %d",
-				(long)info.si_pid, info.si_status);
+	/* First call waitid() with NOWAIT which doesn't consume the zombie. */
+	while (waitid(P_ALL, /*id*/ 0, &info, WEXITED | WNOHANG | WNOWAIT) != -1) {
+		if (info.si_pid == 0) {
+			/* No children in waitable state */
+			return 0;
 		}
-		break;
-	case CLD_KILLED:
-	case CLD_DUMPED:
-		signame = strsignal(info.si_status);
-		wlr_log(WLR_ERROR,
-			"spawned child %ld terminated with signal %d (%s)",
-				(long)info.si_pid, info.si_status,
-				signame ? signame : "unknown");
-		/* Allow cleanup of killed prompt */
-		action_check_prompt_result(info.si_pid, -info.si_status);
-		break;
-	default:
-		wlr_log(WLR_ERROR,
-			"spawned child %ld terminated unexpectedly: %d"
-			" please report", (long)info.si_pid, info.si_code);
-	}
 
-	if (info.si_pid == server.primary_client_pid) {
-		wlr_log(WLR_INFO, "primary client %ld exited", (long)info.si_pid);
-		wl_display_terminate(server.wl_display);
-	}
+	#if HAVE_XWAYLAND
+		/* Ensure that we do not break xwayland lazy initialization */
+		if (server.xwayland && server.xwayland->server
+				&& info.si_pid == server.xwayland->server->pid) {
+			/*
+			 * We need to completely return here to prevent running
+			 * into an endless loop without giving the wlroots internal
+			 * xwayland startup handler a chance to use its own waitid().
+			 *
+			 * Further queued up child process terminatations will be
+			 * dealt with on the next SIGCHLD handler invocation and
+			 * float around as zombies until that point.
+			 */
+			return 0;
+		}
+	#endif
 
+		/* And then do the actual (consuming) lookup again */
+		int ret = waitid(P_PID, info.si_pid, &info, WEXITED);
+		if (ret == -1) {
+			wlr_log(WLR_ERROR, "blocking waitid() for %ld failed: %d",
+				(long)info.si_pid, ret);
+			goto check_next;
+		}
+
+		const char *signame;
+		switch (info.si_code) {
+		case CLD_EXITED:
+			if (!action_check_prompt_result(info.si_pid, info.si_status)
+					&& !nag_check_pid(info.si_pid)) {
+				wlr_log(info.si_status == 0 ? WLR_DEBUG : WLR_ERROR,
+					"spawned child %ld exited with %d",
+					(long)info.si_pid, info.si_status);
+			}
+			break;
+		case CLD_KILLED:
+		case CLD_DUMPED:
+			signame = strsignal(info.si_status);
+			wlr_log(WLR_ERROR,
+				"spawned child %ld terminated with signal %d (%s)",
+					(long)info.si_pid, info.si_status,
+					signame ? signame : "unknown");
+			/* Allow cleanup of killed prompt */
+			action_check_prompt_result(info.si_pid, -info.si_status);
+			nag_check_pid(info.si_pid);
+			break;
+		default:
+			wlr_log(WLR_ERROR,
+				"spawned child %ld terminated unexpectedly: %d"
+				" please report", (long)info.si_pid, info.si_code);
+		}
+
+		if (info.si_pid == server.primary_client_pid) {
+			wlr_log(WLR_INFO, "primary client %ld exited", (long)info.si_pid);
+			wl_display_terminate(server.wl_display);
+		}
+check_next:
+		/*
+		 * We need each initial WNOHANG | WNOWAIT call to clearly identify
+		 * if there are no more children to wait for so we reset si_pid
+		 * as recommended for portability in the waitid man page.
+		 *
+		 * Note that at least on one of the devs linux system the call
+		 * actually returns with -1 in that case, contrary to what is
+		 * written in the man page. We do handle both cases.
+		 */
+		info.si_pid = 0;
+	}
 	return 0;
 }
 
@@ -826,6 +858,7 @@ server_init(void)
 #if HAVE_XWAYLAND
 	xwayland_server_init(server.compositor);
 #endif
+	wl_event_loop_add_idle(server.wl_event_loop, nag_show_callback, NULL);
 }
 
 void
@@ -873,6 +906,7 @@ server_finish(void)
 
 	wl_display_destroy_clients(server.wl_display);
 
+	nag_finish();
 	seat_finish();
 	output_finish();
 	xdg_shell_finish();
