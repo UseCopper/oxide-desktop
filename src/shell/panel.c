@@ -141,8 +141,9 @@ choose_best_icon_buffer(struct view *view)
 
 /*
  * Copy the buffer's pixels into a GdkTexture. lab_data_buffer data is
- * DRM_FORMAT_ARGB8888 (premultiplied) which is GDK_MEMORY_DEFAULT on
- * little-endian, so no repacking is needed.
+ * DRM_FORMAT_ARGB8888 (premultiplied), which matches the byte layout of
+ * GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, so no repacking is needed regardless
+ * of host endianness.
  */
 static GdkTexture *
 icon_buffer_to_texture(struct lab_data_buffer *buf)
@@ -152,7 +153,8 @@ icon_buffer_to_texture(struct lab_data_buffer *buf)
 	memcpy(copy, buf->data, size);
 	GBytes *bytes = g_bytes_new_take(copy, size);
 	GdkTexture *texture = gdk_memory_texture_new(
-		buf->logical_width, buf->logical_height, GDK_MEMORY_DEFAULT,
+		buf->logical_width, buf->logical_height,
+		GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
 		bytes, buf->stride);
 	g_bytes_unref(bytes);
 	return texture;
@@ -232,7 +234,7 @@ make_placeholder_texture(void)
 
 	GBytes *bytes = g_bytes_new_take(data, size);
 	GdkTexture *texture = gdk_memory_texture_new(
-		s, s, GDK_MEMORY_DEFAULT, bytes, stride);
+		s, s, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes, stride);
 	g_bytes_unref(bytes);
 	return texture;
 }
@@ -326,6 +328,7 @@ handle_view_new_app_id(struct wl_listener *listener, void *data)
 {
 	struct panel_view *pv = wl_container_of(listener, pv, on_new_app_id);
 	(void)data;
+	panel_view_update_icon(pv);
 	panel_view_update_tooltip(pv);
 }
 

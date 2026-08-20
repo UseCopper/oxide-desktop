@@ -16,9 +16,9 @@ void oxide_panel_destroy(struct oxide_panel *panel);
 void oxide_panel_reconfigure(struct oxide_panel *panel);
 
 /*
- * Taskbar: add/remove a button for a mapped view. Icons come from the
- * buffers the client itself provides (xdg-toplevel-icon / _NET_WM_ICON);
- * no icon-theme lookups are performed.
+ * Taskbar: add/remove a button for a mapped view. Icons are taken from the
+ * buffers the client itself provides (xdg-toplevel-icon / _NET_WM_ICON) and,
+ * when libsfdo is available, fall back to an icon-theme lookup by app_id.
  */
 void oxide_panel_add_view(struct oxide_panel *panel, struct view *view);
 void oxide_panel_remove_view(struct oxide_panel *panel, struct view *view);
