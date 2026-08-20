@@ -38,9 +38,6 @@
 #include "session-lock.h"
 #include "view.h"
 #include "xwayland.h"
-#if HAVE_SHELL
-#include "shell/shell.h"
-#endif
 
 #if WLR_HAS_X11_BACKEND
 	#include <wlr/backend/x11.h>
@@ -354,9 +351,6 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 #endif
 	)) {
 		wl_display_terminate(server.wl_display);
-#if HAVE_SHELL
-		shell_main_loop_quit();
-#endif
 	}
 
 	free(output);

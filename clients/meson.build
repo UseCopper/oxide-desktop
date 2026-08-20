@@ -59,3 +59,37 @@ endif
 
 clients = files('lab-sensible-terminal')
 install_data(clients, install_dir: get_option('bindir'))
+
+# ---- out-of-process GTK4 panel ------------------------------------------
+if get_option('oxide-panel').allowed()
+  panel_gtk4 = dependency('gtk4', required: get_option('oxide-panel'))
+  panel_layer = dependency('gtk4-layer-shell-0', required: get_option('oxide-panel'))
+  if panel_gtk4.found() and panel_layer.found()
+    panel_wayland = dependency('wayland-client')
+
+    panel_xml = '../protocols/wlr-foreign-toplevel-management-unstable-v1.xml'
+    panel_proto_c = custom_target('oxide_panel_ftl_c',
+      input: panel_xml,
+      output: 'wlr-foreign-toplevel-management-unstable-v1-protocol.c',
+      command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+    panel_proto_h = custom_target('oxide_panel_ftl_h',
+      input: panel_xml,
+      output: 'wlr-foreign-toplevel-management-unstable-v1-client-protocol.h',
+      command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+    executable(
+      'oxide-panel',
+      'oxide-panel.c',
+      panel_proto_c,
+      panel_proto_h,
+      dependencies: [
+        panel_gtk4,
+        panel_layer,
+        panel_wayland,
+        glib,
+      ],
+      include_directories: [oxide_desktop_inc],
+      install: true,
+    )
+  endif
+endif

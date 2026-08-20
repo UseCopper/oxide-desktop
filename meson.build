@@ -188,25 +188,10 @@ if have_libsfdo
   ]
 endif
 
-# ---- in-process shell (GTK4 + gtk4-layer-shell) ----------------------------
-# Auto: enabled if both deps are found. Disabled explicitly with -Dshell=disabled.
-# The shell is optional; the compositor still builds and runs shell-less without it.
-gtk4_dep = dependency('gtk4', required: get_option('shell'))
-gtk4_layer_shell_dep = dependency('gtk4-layer-shell-0', required: get_option('shell'))
-if get_option('shell').allowed() and gtk4_dep.found() and gtk4_layer_shell_dep.found()
-  have_shell = true
-else
-  have_shell = false
-endif
-conf_data.set10('HAVE_SHELL', have_shell)
-
-if have_shell
-  threads_dep = dependency('threads')
-  # gtk4-layer-shell must be linked before libwayland-client: it interposes
-  # wl_display_connect() so GTK talks layer-shell instead of xdg-shell. If it
-  # appears later on the link line, libwayland wins and the shim never runs.
-  oxide_desktop_deps = [gtk4_layer_shell_dep, gtk4_dep, threads_dep] + oxide_desktop_deps
-endif
+# ---- panel (out-of-process GTK4 client) -----------------------------------
+# The panel is a separate process (clients/oxide-panel) launched by the
+# compositor. It is NOT linked into the compositor, so the compositor has no
+# GTK dependency and can never deadlock on an in-process client.
 
 subdir('include')
 subdir('src')

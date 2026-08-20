@@ -72,16 +72,11 @@
 #include "resize-indicator.h"
 #include "scaled-buffer/scaled-buffer.h"
 #include "session-lock.h"
-#include "settings/settings.h"
 #include "ssd.h"
 #include "theme.h"
 #include "view.h"
 #include "workspaces.h"
 #include "xwayland.h"
-
-#if HAVE_SHELL
-#include "shell/shell.h"
-#endif
 
 #define LAB_EXT_DATA_CONTROL_VERSION 1
 #define LAB_EXT_FOREIGN_TOPLEVEL_LIST_VERSION 1
@@ -137,12 +132,6 @@ handle_sighup(int signal, void *data)
 	session_environment_init();
 	reload_config_and_theme();
 	output_virtual_update_fallback();
-
-	/* Re-read the settings store and re-apply shell geometry. */
-	oxide_settings_reload();
-#if HAVE_SHELL
-	shell_reconfigure();
-#endif
 	return 0;
 }
 
@@ -152,12 +141,6 @@ handle_sigterm(int signal, void *data)
 	struct wl_display *display = data;
 
 	wl_display_terminate(display);
-#if HAVE_SHELL
-	/* With the GLib main loop, wl_display_terminate() alone is not enough
-	 * to unblock g_main_loop_run(); the wlroots pump source would just keep
-	 * seeing an idle epoll fd. Quit the GLib loop explicitly. */
-	shell_main_loop_quit();
-#endif
 	return 0;
 }
 
@@ -238,9 +221,6 @@ handle_sigchld(int signal, void *data)
 		if (info.si_pid == server.primary_client_pid) {
 			wlr_log(WLR_INFO, "primary client %ld exited", (long)info.si_pid);
 			wl_display_terminate(server.wl_display);
-#if HAVE_SHELL
-			shell_main_loop_quit();
-#endif
 		}
 check_next:
 		/*

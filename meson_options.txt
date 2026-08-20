@@ -3,7 +3,7 @@ option('xwayland', type: 'feature', value: 'auto', description: 'Enable support 
 option('svg', type: 'feature', value: 'enabled', description: 'Enable svg window buttons')
 option('icon', type: 'feature', value: 'enabled', description: 'Enable window icons')
 option('oxide-nag', type: 'feature', value: 'auto', description: 'Build oxide-nag notification daemon')
-option('shell', type: 'feature', value: 'auto', description: 'Build the in-process GTK4 shell (panel/tray/thumbnails); needs gtk4-layer-shell')
+option('oxide-panel', type: 'feature', value: 'auto', description: 'Build the out-of-process GTK4 panel (taskbar); needs gtk4 + gtk4-layer-shell')
 option('nls', type: 'feature', value: 'auto', description: 'Enable native language support')
 option('systemd-session', type: 'feature', value: 'auto', description: 'Install oxide-desktop-session.target systemd user unit')
 option('static_analyzer', type: 'feature', value: 'disabled', description: 'Run gcc static analyzer')

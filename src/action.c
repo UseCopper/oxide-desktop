@@ -35,9 +35,6 @@
 #include "translate.h"
 #include "view.h"
 #include "workspaces.h"
-#if HAVE_SHELL
-#include "shell/shell.h"
-#endif
 
 enum action_arg_type {
 	LAB_ACTION_ARG_STR = 0,
@@ -1093,15 +1090,6 @@ run_action(struct view *view, struct action *action,
 	}
 	case ACTION_TYPE_EXIT:
 		wl_display_terminate(server.wl_display);
-#if HAVE_SHELL
-		/*
-		 * The compositor runs on a GLib main loop (g_main_loop_run),
-		 * not wl_display_run(), so wl_display_terminate() alone is not
-		 * enough to stop it. Quit the GLib loop too, otherwise the
-		 * desktop never exits when "Exit" is chosen from the menu.
-		 */
-		shell_main_loop_quit();
-#endif
 		break;
 	case ACTION_TYPE_MOVE_TO_EDGE:
 		if (view) {
