@@ -212,6 +212,7 @@ manager_toplevel(void *data,
 	t->activated = FALSE;
 	t->button = NULL;
 	toplevels = g_slist_append(toplevels, t);
+	g_message("oxide-panel: new toplevel handle %p", (void *)handle);
 	zwlr_foreign_toplevel_handle_v1_add_listener(handle,
 		&handle_listener, t);
 }
@@ -234,6 +235,7 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
 			&zwlr_foreign_toplevel_manager_v1_interface, v);
 		zwlr_foreign_toplevel_manager_v1_add_listener(manager,
 			&manager_listener, NULL);
+		g_message("oxide-panel: bound zwlr_foreign_toplevel_manager_v1 (v%u)", v);
 	}
 }
 
@@ -255,10 +257,44 @@ setup_foreign_toplevel(void)
 {
 	wl_display = gdk_wayland_display_get_wl_display(
 		gdk_display_get_default());
+	if (!wl_display) {
+		g_warning("oxide-panel: failed to get wl_display from GDK");
+		return;
+	}
 	struct wl_registry *registry = wl_display_get_registry(wl_display);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	/* Round-trip so the manager global is bound before we return. */
 	wl_display_roundtrip(wl_display);
+	if (!manager) {
+		g_warning("oxide-panel: foreign-toplevel manager not available; "
+			"is oxide-desktop advertising it?");
+	}
+}
+
+static void
+apply_css(GtkWidget *win)
+{
+	gtk_widget_add_css_class(win, "oxide-panel");
+	GtkCssProvider *prov = gtk_css_provider_new();
+	gtk_css_provider_load_from_data(prov,
+		"window.oxide-panel {"
+		"	background-color: rgba(40, 42, 48, 0.92);"
+		"	color: #e6e6e6;"
+		"	font-size: 12px;"
+		"}"
+		"window.oxide-panel button {"
+		"	background: none;"
+		"	border: none;"
+		"	border-radius: 4px;"
+		"	padding: 2px 8px;"
+		"}"
+		"window.oxide-panel button:hover {"
+		"	background-color: rgba(255, 255, 255, 0.12);"
+		"}", -1);
+	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+		GTK_STYLE_PROVIDER(prov),
+		GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+	g_object_unref(prov);
 }
 
 int
@@ -281,12 +317,14 @@ main(int argc, char **argv)
 	gtk_layer_set_exclusive_zone(GTK_WINDOW(win), panel_height);
 	gtk_window_set_default_size(GTK_WINDOW(win), -1, panel_height);
 
+	apply_css(win);
+
 	button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 	gtk_widget_set_margin_start(button_box, 6);
 	gtk_widget_set_margin_end(button_box, 6);
 	gtk_window_set_child(GTK_WINDOW(win), button_box);
 
-	gtk_widget_set_visible(win, TRUE);
+	gtk_window_present(GTK_WINDOW(win));
 
 	setup_foreign_toplevel();
 

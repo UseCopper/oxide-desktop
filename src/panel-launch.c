@@ -52,17 +52,29 @@ oxide_launch_panel(void)
 	/*
 	 * 2. Look for the panel binary sitting next to the compositor. After
 	 *    a normal `meson install` both live in the same bindir, so this
-	 *    works no matter where that prefix is.
+	 *    works no matter where that prefix is. Also try a sibling
+	 *    `clients/` dir, which covers running straight from a build tree
+	 *    (build/oxide-desktop -> build/clients/oxide-panel).
 	 */
 	if (!cmd) {
 		char *dir = self_dir();
 		if (dir) {
-			char *candidate =
-				g_strdup_printf("%s/oxide-panel", dir);
-			if (access(candidate, X_OK) == 0) {
-				cmd = candidate;
-			} else {
-				g_free(candidate);
+			char *candidates[] = {
+				g_strdup_printf("%s/oxide-panel", dir),
+				g_strdup_printf("%s/clients/oxide-panel", dir),
+				NULL,
+			};
+			for (int i = 0; candidates[i]; i++) {
+				if (access(candidates[i], X_OK) == 0) {
+					cmd = candidates[i];
+					i++;
+					while (candidates[i]) {
+						g_free(candidates[i]);
+						i++;
+					}
+					break;
+				}
+				g_free(candidates[i]);
 			}
 			g_free(dir);
 		}
