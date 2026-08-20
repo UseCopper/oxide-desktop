@@ -92,7 +92,17 @@ shell_loop_init(void)
 	s->poll_fd.revents = 0;
 	g_source_add_poll(src, &s->poll_fd);
 	g_source_set_priority(src, G_PRIORITY_DEFAULT);
-	g_source_set_can_recurse(src, FALSE);
+	/*
+	 * The panel is an in-process Wayland client of this same compositor.
+	 * GTK (tooltips, popups, etc.) sometimes runs a nested
+	 * g_main_context_iteration() on this very context. If our source is
+	 * non-recursive, GLib skips dispatching the wlroots event loop during
+	 * that nested iteration, so the compositor can never answer GTK's
+	 * round-trips (e.g. tooltip surface teardown) and the whole thing
+	 * deadlocks. Allowing recursion lets wlroots keep running so those
+	 * round-trips complete.
+	 */
+	g_source_set_can_recurse(src, TRUE);
 	g_source_attach(src, g_main_context_default());
 	g_loop_source = s;
 }
