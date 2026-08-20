@@ -238,6 +238,9 @@ handle_sigchld(int signal, void *data)
 		if (info.si_pid == server.primary_client_pid) {
 			wlr_log(WLR_INFO, "primary client %ld exited", (long)info.si_pid);
 			wl_display_terminate(server.wl_display);
+#if HAVE_SHELL
+			shell_main_loop_quit();
+#endif
 		}
 check_next:
 		/*
