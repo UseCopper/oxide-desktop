@@ -9,7 +9,6 @@
 #include "node.h"
 #include "scaled-buffer/scaled-icon-buffer.h"
 #include "scaled-buffer/scaled-img-buffer.h"
-#include "img/img.h"
 #include "ssd.h"
 #include "ssd-internal.h"
 
@@ -64,30 +63,11 @@ attach_ssd_button(struct wl_list *button_parts, enum lab_node_type type,
 			if (!imgs[state_set]) {
 				continue;
 			}
-			int width = button_width;
-			int height = button_height;
-			int off_x = 0, off_y = 0;
-			int art_w, art_h;
-			/*
-			 * Render hand-authored icons 1:1 whenever they already
-			 * fit the hitbox, so xbm/png glyphs are never resampled
-			 * and keep their baked-in padding. Artwork larger than
-			 * the hitbox keeps the legacy scale-to-fit behavior.
-			 */
-			if (lab_img_get_size(imgs[state_set], &art_w, &art_h)
-					&& art_w <= button_width
-					&& art_h <= button_height) {
-				width = art_w;
-				height = art_h;
-				off_x = (button_width - art_w) / 2;
-				off_y = (button_height - art_h) / 2;
-			}
-			struct scaled_img_buffer *img_buffer =
-				scaled_img_buffer_create(root, imgs[state_set],
-					width, height);
+			struct scaled_img_buffer *img_buffer = scaled_img_buffer_create(
+				root, imgs[state_set], rc.theme->window_button_width,
+				rc.theme->window_button_height);
 			assert(img_buffer);
 			struct wlr_scene_node *icon_node = &img_buffer->scene_buffer->node;
-			wlr_scene_node_set_position(icon_node, off_x, off_y);
 			wlr_scene_node_set_enabled(icon_node, false);
 			button->img_buffers[state_set] = img_buffer;
 		}
