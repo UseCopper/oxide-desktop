@@ -535,15 +535,15 @@ theme_builtin(struct theme *theme)
 	theme->window_titlebar_padding_height = 0;
 	theme->window_titlebar_padding_width = 0;
 
-	parse_hexstr("#aaaaaa", theme->window[SSD_ACTIVE].border_color);
-	parse_hexstr("#aaaaaa", theme->window[SSD_INACTIVE].border_color);
+	parse_hexstr("#3a3c42", theme->window[SSD_ACTIVE].border_color);
+	parse_hexstr("#2c2e33", theme->window[SSD_INACTIVE].border_color);
 
 	parse_hexstr("#ff0000", theme->window_toggled_keybinds_color);
 
 	theme->window[SSD_ACTIVE].title_bg.gradient = LAB_GRADIENT_NONE;
 	theme->window[SSD_INACTIVE].title_bg.gradient = LAB_GRADIENT_NONE;
-	parse_hexstr("#e1dedb", theme->window[SSD_ACTIVE].title_bg.color);
-	parse_hexstr("#f6f5f4", theme->window[SSD_INACTIVE].title_bg.color);
+	parse_hexstr("#303237", theme->window[SSD_ACTIVE].title_bg.color);
+	parse_hexstr("#232529", theme->window[SSD_INACTIVE].title_bg.color);
 	theme->window[SSD_ACTIVE].title_bg.color_split_to[0] = FLT_MIN;
 	theme->window[SSD_INACTIVE].title_bg.color_split_to[0] = FLT_MIN;
 	theme->window[SSD_ACTIVE].title_bg.color_to[0] = FLT_MIN;
@@ -551,22 +551,22 @@ theme_builtin(struct theme *theme)
 	theme->window[SSD_ACTIVE].title_bg.color_to_split_to[0] = FLT_MIN;
 	theme->window[SSD_INACTIVE].title_bg.color_to_split_to[0] = FLT_MIN;
 
-	parse_hexstr("#000000", theme->window[SSD_ACTIVE].label_text_color);
-	parse_hexstr("#000000", theme->window[SSD_INACTIVE].label_text_color);
-	theme->window_label_text_justify = parse_justification("Center");
+	parse_hexstr("#ffffff", theme->window[SSD_ACTIVE].label_text_color);
+	parse_hexstr("#b8babf", theme->window[SSD_INACTIVE].label_text_color);
+	theme->window_label_text_justify = parse_justification("Left");
 
 	theme->window_button_width = 26;
 	theme->window_button_height = 26;
 	theme->window_button_spacing = 0;
 
-	parse_hexstr("#80808020", theme->window_button_hover_bg_color);
+	parse_hexstr("#ffffff28", theme->window_button_hover_bg_color);
 	theme->window_button_hover_bg_corner_radius = 0;
 
 	for (enum lab_node_type type = LAB_NODE_BUTTON_FIRST;
 			type <= LAB_NODE_BUTTON_LAST; type++) {
-		parse_hexstr("#000000",
+		parse_hexstr("#9a9da3",
 			theme->window[SSD_INACTIVE].button_colors[type]);
-		parse_hexstr("#000000",
+		parse_hexstr("#e6e6e6",
 			theme->window[SSD_ACTIVE].button_colors[type]);
 	}
 
@@ -584,10 +584,10 @@ theme_builtin(struct theme *theme)
 
 	theme->menu_items_padding_x = 7;
 	theme->menu_items_padding_y = 4;
-	parse_hexstr("#fcfbfa", theme->menu_items_bg_color);
-	parse_hexstr("#000000", theme->menu_items_text_color);
-	parse_hexstr("#e1dedb", theme->menu_items_active_bg_color);
-	parse_hexstr("#000000", theme->menu_items_active_text_color);
+	parse_hexstr("#282a30", theme->menu_items_bg_color);
+	parse_hexstr("#e6e6e6", theme->menu_items_text_color);
+	parse_hexstr("#3d4046", theme->menu_items_active_bg_color);
+	parse_hexstr("#ffffff", theme->menu_items_active_text_color);
 
 	theme->menu_separator_line_thickness = 1;
 	theme->menu_separator_padding_width = 6;

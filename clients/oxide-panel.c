@@ -108,6 +108,9 @@ rebuild_ui(void)
 		t->button = gtk_button_new_with_label(label);
 		gtk_widget_set_margin_start(t->button, 4);
 		gtk_widget_set_margin_end(t->button, 4);
+		if (t->activated) {
+			gtk_widget_add_css_class(t->button, "active");
+		}
 		gtk_box_append(GTK_BOX(button_box), t->button);
 		g_signal_connect(t->button, "clicked",
 			G_CALLBACK(on_button_clicked), t);
@@ -319,18 +322,24 @@ apply_css(GtkWidget *win)
 	GtkCssProvider *prov = gtk_css_provider_new();
 	gtk_css_provider_load_from_string(prov,
 		"window.oxide-panel {"
-		"	background-color: rgba(40, 42, 48, 0.92);"
+		"	background-color: rgba(24, 26, 29, 0.96);"
 		"	color: #e6e6e6;"
 		"	font-size: 12px;"
 		"}"
 		"window.oxide-panel button {"
 		"	background: none;"
 		"	border: none;"
-		"	border-radius: 4px;"
+		"	border-radius: 0;"
 		"	padding: 2px 8px;"
+		"	color: #b8babf;"
 		"}"
 		"window.oxide-panel button:hover {"
-		"	background-color: rgba(255, 255, 255, 0.12);"
+		"	background-color: rgba(255, 255, 255, 0.14);"
+		"	color: #ffffff;"
+		"}"
+		"window.oxide-panel button.active {"
+		"	background-color: rgba(255, 255, 255, 0.10);"
+		"	color: #ffffff;"
 		"}");
 	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
 		GTK_STYLE_PROVIDER(prov),
