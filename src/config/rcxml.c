@@ -1823,16 +1823,12 @@ post_processing(void)
 	}
 
 	if (!rc.title_layout_loaded) {
-#if HAVE_LIBSFDO
-		fill_title_layout("icon:iconify,max,close");
-#else
 		/*
-		 * 'icon' is replaced with 'menu' in fill_title_layout() when
-		 * libsfdo is not linked, but we also replace it here not to
-		 * show error message with default settings.
+		 * No buttons on the left by default so that left-justified
+		 * titles sit flush against the window edge. Users can restore
+		 * a left-side icon/menu button via <titlebar><layout>.
 		 */
-		fill_title_layout("menu:iconify,max,close");
-#endif
+		fill_title_layout(":iconify,max,close");
 	}
 
 	/*
