@@ -23,6 +23,12 @@ static void set_squared_corners(struct ssd *ssd, bool enable);
 static void set_alt_button_icon(struct ssd *ssd, enum lab_node_type type, bool enable);
 static void update_visible_buttons(struct ssd *ssd);
 
+/*
+ * Horizontal inset for left-justified titles so the text doesn't sit
+ * flush against the window edge/border.
+ */
+#define TITLE_TEXT_LEFT_PADDING 4
+
 void
 ssd_titlebar_create(struct ssd *ssd)
 {
@@ -399,7 +405,7 @@ ssd_update_title_positions(struct ssd *ssd, int offset_left, int offset_right)
 		} else if (theme->window_label_text_justify == LAB_JUSTIFY_RIGHT) {
 			x += title_bg_width - title->width;
 		} else if (theme->window_label_text_justify == LAB_JUSTIFY_LEFT) {
-			/* TODO: maybe add some theme x padding here? */
+			x += TITLE_TEXT_LEFT_PADDING;
 		}
 		wlr_scene_node_set_position(&title->scene_buffer->node, x, y);
 	}
