@@ -187,15 +187,47 @@ toplevel_closed(void *data, struct zwlr_foreign_toplevel_handle_v1 *h)
 	schedule_rebuild();
 }
 
+static void
+toplevel_output_enter(void *data, struct zwlr_foreign_toplevel_handle_v1 *h,
+	struct wl_output *output)
+{
+	(void)data;
+	(void)h;
+	(void)output;
+}
+
+static void
+toplevel_output_leave(void *data, struct zwlr_foreign_toplevel_handle_v1 *h,
+	struct wl_output *output)
+{
+	(void)data;
+	(void)h;
+	(void)output;
+}
+
+static void
+toplevel_parent(void *data, struct zwlr_foreign_toplevel_handle_v1 *h,
+	struct zwlr_foreign_toplevel_handle_v1 *parent)
+{
+	(void)data;
+	(void)h;
+	(void)parent;
+}
+
+/*
+ * NOTE: every listener entry must be non-NULL. libwayland dispatches events
+ * straight through the listener table, and a NULL entry aborts the process
+ * the moment the compositor sends that event (we crashed on output_enter).
+ */
 static const struct zwlr_foreign_toplevel_handle_v1_listener handle_listener = {
 	.title = toplevel_title,
 	.app_id = toplevel_app_id,
-	.output_enter = NULL,
-	.output_leave = NULL,
+	.output_enter = toplevel_output_enter,
+	.output_leave = toplevel_output_leave,
 	.state = toplevel_state,
 	.done = toplevel_done,
 	.closed = toplevel_closed,
-	/* parent and geometry are optional; NULL keeps the stub simple */
+	.parent = toplevel_parent,
 };
 
 static void
@@ -217,8 +249,17 @@ manager_toplevel(void *data,
 		&handle_listener, t);
 }
 
+static void
+manager_finished(void *data, struct zwlr_foreign_toplevel_manager_v1 *mgr)
+{
+	(void)data;
+	(void)mgr;
+	g_warning("oxide-panel: compositor finished the toplevel manager");
+}
+
 static const struct zwlr_foreign_toplevel_manager_v1_listener manager_listener = {
 	.toplevel = manager_toplevel,
+	.finished = manager_finished,
 };
 
 /* ------------------------------------------------------- registry glue */
@@ -276,7 +317,7 @@ apply_css(GtkWidget *win)
 {
 	gtk_widget_add_css_class(win, "oxide-panel");
 	GtkCssProvider *prov = gtk_css_provider_new();
-	gtk_css_provider_load_from_data(prov,
+	gtk_css_provider_load_from_string(prov,
 		"window.oxide-panel {"
 		"	background-color: rgba(40, 42, 48, 0.92);"
 		"	color: #e6e6e6;"
@@ -290,7 +331,7 @@ apply_css(GtkWidget *win)
 		"}"
 		"window.oxide-panel button:hover {"
 		"	background-color: rgba(255, 255, 255, 0.12);"
-		"}", -1);
+		"}");
 	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
 		GTK_STYLE_PROVIDER(prov),
 		GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);

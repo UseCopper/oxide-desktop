@@ -83,8 +83,12 @@ if get_option('oxide-panel').allowed()
       panel_proto_c,
       panel_proto_h,
       dependencies: [
-        panel_gtk4,
+        # Keep gtk4-layer-shell ahead of gtk4/wayland-client on the link
+        # line: older gtk-layer-shell releases relied on interposing
+        # wl_display_connect(), which only wins if linked first. Harmless
+        # (and cheap insurance) with gtk4-layer-shell >= 1.x.
         panel_layer,
+        panel_gtk4,
         panel_wayland,
         glib,
       ],
