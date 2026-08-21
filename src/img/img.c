@@ -189,3 +189,16 @@ lab_img_equal(struct lab_img *img_a, struct lab_img *img_b)
 		|| !memcmp(img_a->modifiers.data, img_b->modifiers.data,
 			img_a->modifiers.size);
 }
+
+bool
+lab_img_get_size(struct lab_img *img, int *width, int *height)
+{
+	struct lab_data_buffer *buffer = img->data->buffer;
+	if (!buffer) {
+		/* SVGs and other vector images have no intrinsic pixel size */
+		return false;
+	}
+	*width = buffer->logical_width;
+	*height = buffer->logical_height;
+	return true;
+}

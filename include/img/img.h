@@ -64,6 +64,16 @@ struct lab_data_buffer *lab_img_render(struct lab_img *img,
 	int width, int height, double scale);
 
 /**
+ * lab_img_get_size() - Get the native pixel dimensions of the image
+ * @img: source image
+ * @width: set to the image width
+ * @height: set to the image height
+ *
+ * Returns false for images without an intrinsic raster size (e.g. SVG).
+ */
+bool lab_img_get_size(struct lab_img *img, int *width, int *height);
+
+/**
  * lab_img_destroy() - destroy lab_img
  * @img: lab_img to destroy
  */
