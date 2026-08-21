@@ -555,8 +555,8 @@ theme_builtin(struct theme *theme)
 	parse_hexstr("#b8babf", theme->window[SSD_INACTIVE].label_text_color);
 	theme->window_label_text_justify = parse_justification("Left");
 
-	theme->window_button_width = 24;
-	theme->window_button_height = 24;
+	theme->window_button_width = 26;
+	theme->window_button_height = 26;
 	theme->window_button_spacing = 0;
 
 	parse_hexstr("#ffffff28", theme->window_button_hover_bg_color);
