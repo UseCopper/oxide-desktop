@@ -1818,6 +1818,14 @@ post_processing(void)
 		rc.fallback_app_icon_name = xstrdup("oxide-desktop");
 	}
 
+	/*
+	 * Default theme. Shipped button art lives in
+	 * <data-dir>/themes/oxide/oxide-desktop/ (installed via meson);
+	 * users override by creating their own config.
+	 */
+	if (!rc.theme_name) {
+		rc.theme_name = xstrdup("oxide");
+	}
 	if (!rc.icon_theme_name && rc.theme_name) {
 		rc.icon_theme_name = xstrdup(rc.theme_name);
 	}
@@ -1999,6 +2007,23 @@ validate(void)
 	}
 }
 
+/*
+ * Create an empty user config folder (e.g. ~/.config/oxide-desktop). We
+ * never populate it: everything works from compiled-in defaults, and the
+ * folder exists purely so users have an obvious place to drop overrides.
+ */
+static void
+create_config_dir(void)
+{
+	const char *base = g_get_user_config_dir();
+	if (!base) {
+		return;
+	}
+	char *dir = g_build_filename(base, "oxide-desktop", NULL);
+	g_mkdir_with_parents(dir, 0700);
+	g_free(dir);
+}
+
 void
 rcxml_read(const char *filename)
 {
@@ -2013,6 +2038,7 @@ rcxml_read(const char *filename)
 		path->string = xstrdup(filename);
 		wl_list_append(&paths, &path->link);
 	} else {
+		create_config_dir();
 		paths_config_create(&paths, "rc.xml");
 	}
 

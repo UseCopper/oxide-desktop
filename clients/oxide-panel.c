@@ -30,7 +30,7 @@ static struct wl_display *wl_display;
 static struct zwlr_foreign_toplevel_manager_v1 *manager;
 static GSList *toplevels;          /* list of struct toplevel * */
 static GtkWidget *button_box;
-static int panel_height = 36;
+static int panel_height = 35;
 static gboolean panel_on_bottom = FALSE;
 static guint rebuild_idle_id;
 

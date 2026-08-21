@@ -213,6 +213,13 @@ executable(
 )
 
 install_data('data/oxide-desktop.desktop', install_dir: get_option('datadir') / 'wayland-sessions')
+install_data(
+  'data/theme/oxide/oxide-desktop/close.xbm',
+  'data/theme/oxide/oxide-desktop/max.xbm',
+  'data/theme/oxide/oxide-desktop/max_toggled.xbm',
+  'data/theme/oxide/oxide-desktop/iconify.xbm',
+  install_dir: get_option('datadir') / 'themes/oxide/oxide-desktop',
+)
 
 install_data('data/oxide-desktop-portals.conf', install_dir: get_option('datadir') / 'xdg-desktop-portal')
 
