@@ -185,6 +185,12 @@ ssd_get_margin(const struct ssd *ssd)
 	return ssd ? ssd->margin : (struct border){ 0 };
 }
 
+struct wlr_scene_tree *
+ssd_get_tree(struct ssd *ssd)
+{
+	return ssd ? ssd->tree : NULL;
+}
+
 int
 ssd_get_corner_width(void)
 {

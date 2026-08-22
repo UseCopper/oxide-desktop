@@ -1602,6 +1602,16 @@ decorate(struct view *view)
 	if (!view->ssd) {
 		view->ssd = ssd_create(view,
 			view == server.active_view);
+		/*
+		 * Decorations negotiated after map (common with Qt apps:
+		 * xdg-decoration preference arrives late) must join the
+		 * running open animation at its current fade state, and
+		 * keep their original place behind the window content.
+		 */
+		animation_adopt_node(view,
+			&ssd_get_tree(view->ssd)->node);
+		wlr_scene_node_lower_to_bottom(
+			&ssd_get_tree(view->ssd)->node);
 	}
 }
 

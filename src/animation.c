@@ -103,13 +103,59 @@ set_subtree_opacity(struct wlr_scene_node *node, float opacity)
 }
 
 /*
+ * Current eased progress (0..1) of the running open animation.
+ */
+static float
+current_progress(struct view *view)
+{
+	float t = (float)(now_us() - view->open_anim.start_us)
+		/ (ANIM_DURATION_MS * 1000);
+	if (t > 1.0f) {
+		t = 1.0f;
+	}
+	if (t < 0.0f) {
+		t = 0.0f;
+	}
+	return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+
+void
+animation_adopt_node(struct view *view, struct wlr_scene_node *node)
+{
+	if (!view || !node || !view->open_anim.running
+			|| !view->open_anim.wrapper || node->parent ==
+				&view->open_anim.wrapper->node) {
+		return;
+	}
+
+	struct animation_child *kid =
+		wl_array_add(&view->open_anim.children, sizeof(*kid));
+	if (!kid) {
+		return;
+	}
+	kid->node = node;
+	kid->x = node->x;
+	kid->y = node->y;
+	wlr_scene_node_set_position(node,
+		node->x - view->open_anim.wrapper->node.x,
+		node->y - view->open_anim.wrapper->node.y);
+	wlr_scene_node_reparent(node, view->open_anim.wrapper);
+
+	/*
+	 * Apply the current fade immediately so the new subtree never
+	 * shows up at full brightness in the middle of the animation.
+	 */
+	set_subtree_opacity(node, current_progress(view));
+}
+
+/*
  * Adopt any node that appeared directly under the view's scene tree since
  * the animation started. Coordinates are stored relative to the scene tree
  * so restoring them at the end (when the wrapper sits at its final offset
  * of zero) places everything exactly where labwc left it.
  */
 static void
-adopt_strays(struct view *view, int wrap_x, int wrap_y)
+adopt_strays(struct view *view)
 {
 	struct wlr_scene_node *node, *tmp;
 	wl_list_for_each_safe(node, tmp, &view->scene_tree->children, link) {
@@ -117,17 +163,7 @@ adopt_strays(struct view *view, int wrap_x, int wrap_y)
 				node == &view->open_anim.wrapper->node) {
 			continue;
 		}
-		struct animation_child *kid =
-			wl_array_add(&view->open_anim.children, sizeof(*kid));
-		if (!kid) {
-			continue;
-		}
-		kid->node = node;
-		kid->x = node->x;
-		kid->y = node->y;
-		wlr_scene_node_set_position(node,
-			node->x - wrap_x, node->y - wrap_y);
-		wlr_scene_node_reparent(node, view->open_anim.wrapper);
+		animation_adopt_node(view, node);
 	}
 }
 
@@ -176,11 +212,9 @@ tick(void *data)
 	int ox, oy;
 	start_offset(&ox, &oy);
 
-	/* Adopt late arrivals before moving, using the current offset so
-	 * they don't jump; they then ride the wrapper like everything else */
-	int cur_x = view->open_anim.wrapper->node.x;
-	int cur_y = view->open_anim.wrapper->node.y;
-	adopt_strays(view, cur_x, cur_y);
+	/* Adopt late arrivals before moving; animation_adopt_node reads the
+	 * wrapper's current offset so they never jump. */
+	adopt_strays(view);
 
 	wlr_scene_node_set_position(&view->open_anim.wrapper->node,
 		(int)(ox * (1.0f - e) + 0.5f),

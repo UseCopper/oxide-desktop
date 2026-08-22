@@ -29,4 +29,14 @@ void animation_start_open(struct view *view);
 /* Stop any running open animation and restore the original tree. */
 void animation_cancel_open(struct view *view);
 
+struct wlr_scene_node;
+
+/*
+ * Fold a newly created child tree (e.g. decorations negotiated slightly
+ * after map, as Qt apps do) into the running open animation immediately,
+ * applying the current fade/slide state so it never pops in at full
+ * brightness. No-op when no animation is running.
+ */
+void animation_adopt_node(struct view *view, struct wlr_scene_node *node);
+
 #endif /* OXIDE_DESKTOP_ANIMATION_H */
