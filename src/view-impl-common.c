@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* view-impl-common.c: common code for shell view->impl functions */
 #include "view-impl-common.h"
+#include "animation.h"
 #include "config.h"
 #include "foreign-toplevel/foreign.h"
 #include "oxide-desktop.h"
@@ -40,11 +41,14 @@ view_impl_map(struct view *view)
 
 	wlr_log(WLR_DEBUG, "[map] identifier=%s, title=%s",
 		view->app_id, view->title);
+
+	animation_start_open(view);
 }
 
 void
 view_impl_unmap(struct view *view)
 {
+	animation_cancel_open(view);
 	view_update_visibility(view);
 
 	/*

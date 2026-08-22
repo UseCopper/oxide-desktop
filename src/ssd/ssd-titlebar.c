@@ -27,7 +27,7 @@ static void update_visible_buttons(struct ssd *ssd);
  * Horizontal inset for left-justified titles so the text doesn't sit
  * flush against the window edge/border.
  */
-#define TITLE_TEXT_LEFT_PADDING 4
+#define TITLE_TEXT_LEFT_PADDING 8
 
 void
 ssd_titlebar_create(struct ssd *ssd)

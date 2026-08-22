@@ -9,6 +9,7 @@
 #include <wlr/types/wlr_security_context_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include "action.h"
+#include "animation.h"
 #include "buffer.h"
 #include "common/box.h"
 #include "common/list.h"
@@ -2493,6 +2494,7 @@ view_destroy(struct view *view)
 {
 	assert(view);
 
+	animation_cancel_open(view);
 	wl_signal_emit_mutable(&view->events.destroy, NULL);
 	snap_constraints_invalidate(view);
 

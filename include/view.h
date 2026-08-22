@@ -173,6 +173,15 @@ struct view {
 	struct wlr_scene_tree *scene_tree;
 	struct wlr_scene_tree *content_tree; /* may be NULL for unmapped view */
 
+	/* Open animation state (see animation.h) */
+	struct {
+		bool running;
+		struct wl_event_source *timer;
+		int64_t start_us;
+		struct wlr_scene_tree *wrapper;
+		struct wl_array children;
+	} open_anim;
+
 	/* These are never NULL and an empty string is set instead. */
 	char *title;
 	char *app_id; /* WM_CLASS for xwayland windows */
