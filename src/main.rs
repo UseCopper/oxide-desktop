@@ -1,60 +1,69 @@
-#![allow(irrefutable_let_patterns)]
+static POSSIBLE_BACKENDS: &[&str] = &[
+    #[cfg(feature = "winit")]
+    "--winit : Run anvil as a X11 or Wayland client using winit.",
+    #[cfg(feature = "udev")]
+    "--tty-udev : Run anvil as a tty udev client (requires root if without logind).",
+    #[cfg(feature = "x11")]
+    "--x11 : Run anvil as an X11 client.",
+];
 
-mod handlers;
+#[cfg(feature = "profile-with-tracy-mem")]
+#[global_allocator]
+static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
+    profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
 
-mod grabs;
-mod input;
-mod state;
-mod winit;
-
-use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
-pub use state::Oxide;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging();
-
-    let mut event_loop: EventLoop<Oxide> = EventLoop::try_new()?;
-
-    let display: Display<Oxide> = Display::new()?;
-
-    let mut state = Oxide::new(&mut event_loop, display);
-
-    // Open a Wayland/X11 window for our nested compositor
-    crate::winit::init_winit(&mut event_loop, &mut state)?;
-
-    // Set WAYLAND_DISPLAY to our socket name, so child processes connect to Oxide rather
-    // than the host compositor
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
-
-    // Spawn a test client, that will run under Oxide
-    spawn_client();
-
-    event_loop.run(None, &mut state, move |_| {
-        // Oxide is running
-    })?;
-
-    Ok(())
-}
-
-fn init_logging() {
+// Allow in this function because of existing usage
+#[allow(clippy::uninlined_format_args)]
+fn main() {
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing_subscriber::fmt()
+            .compact()
+            .with_env_filter(env_filter)
+            .init();
     } else {
-        tracing_subscriber::fmt().init();
+        tracing_subscriber::fmt().compact().init();
     }
-}
 
-fn spawn_client() {
-    let mut args = std::env::args().skip(1);
-    let flag = args.next();
-    let arg = args.next();
+    #[cfg(feature = "profile-with-tracy")]
+    profiling::tracy_client::Client::start();
 
-    match (flag.as_deref(), arg) {
-        (Some("-c") | Some("--command"), Some(command)) => {
-            std::process::Command::new(command).spawn().ok();
+    profiling::register_thread!("Main Thread");
+
+    #[cfg(feature = "profile-with-puffin")]
+    let _server = puffin_http::Server::new(&format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT)).unwrap();
+    #[cfg(feature = "profile-with-puffin")]
+    profiling::puffin::set_scopes_on(true);
+
+    let arg = ::std::env::args().nth(1);
+    match arg.as_ref().map(|s| &s[..]) {
+        #[cfg(feature = "winit")]
+        Some("--winit") => {
+            tracing::info!("Starting oxide-desktop with winit backend");
+            oxide_desktop::winit::run_winit();
         }
-        _ => {
-            std::process::Command::new("weston-terminal").spawn().ok();
+        #[cfg(feature = "udev")]
+        Some("--tty-udev") => {
+            tracing::info!("Starting oxide-desktop on a tty using udev");
+            oxide_desktop::udev::run_udev();
+        }
+        #[cfg(feature = "x11")]
+        Some("--x11") => {
+            tracing::info!("Starting oxide-desktop with x11 backend");
+            oxide_desktop::x11::run_x11();
+        }
+        Some(other) => {
+            tracing::error!("Unknown backend: {}", other);
+        }
+        None => {
+            #[allow(clippy::disallowed_macros)]
+            {
+                println!("USAGE: oxide-desktop --backend");
+                println!();
+                println!("Possible backends are:");
+                for b in POSSIBLE_BACKENDS {
+                    println!("\t{b}");
+                }
+            }
         }
     }
 }

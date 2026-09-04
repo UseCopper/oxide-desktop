@@ -1,15 +1,33 @@
 [package]
 name = "oxide-desktop"
-version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
+publish = false
+version = "0.1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [dependencies]
 bitflags = "2.2.1"
+profiling = "1.0"
+rand = "0.8"
+thiserror = "1"
+tracing = { version = "0.1.37", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+xkbcommon = "0.8.0"
+xcursor = "0.3"
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
 rev = "e3d461a057ba244d213a8498ec372b0799cca103"
 default-features = false
-features = ["backend_winit", "wayland_frontend", "desktop"]
+features = ["backend_winit", "backend_egl", "backend_drm", "wayland_frontend", "desktop", "renderer_gl"]
+
+[features]
+default = ["winit"]
+winit = []
+
+[build-dependencies]
+gl_generator = "0.14"
