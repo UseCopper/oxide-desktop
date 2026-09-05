@@ -55,7 +55,6 @@ pub struct WinitData {
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
-    full_redraw: u8,
     #[cfg(feature = "debug")]
     pub fps: fps_ticker::Fps,
 }
@@ -84,9 +83,7 @@ impl Backend for WinitData {
     fn seat_name(&self) -> String {
         String::from("winit")
     }
-    fn reset_buffers(&mut self, _output: &Output) {
-        self.full_redraw = 4;
-    }
+    fn reset_buffers(&mut self, _output: &Output) {}
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
     fn update_led_state(&mut self, _led_state: LedState) {}
 }
@@ -193,7 +190,6 @@ pub fn run_winit() {
             backend,
             damage_tracker,
             dmabuf_state,
-            full_redraw: 0,
             #[cfg(feature = "debug")]
             fps: fps_ticker::Fps::default(),
         }
@@ -226,6 +222,9 @@ pub fn run_winit() {
                 crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
             }
             WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
+            WinitEvent::CloseRequested => {
+                state.running.store(false, Ordering::SeqCst);
+            }
             _ => (),
         });
 
@@ -264,8 +263,6 @@ pub fn run_winit() {
             #[cfg(feature = "debug")]
             fps_element.update_fps(fps);
 
-            let full_redraw = &mut state.backend_data.full_redraw;
-            *full_redraw = full_redraw.saturating_sub(1);
             let space = &mut state.space;
             let damage_tracker = &mut state.backend_data.damage_tracker;
             let show_window_preview = state.show_window_preview;
@@ -291,11 +288,7 @@ pub fn run_winit() {
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
 
-            let age = if *full_redraw > 0 {
-                0
-            } else {
-                backend.buffer_age().unwrap_or(0)
-            };
+            let age = 0;
             #[cfg(feature = "debug")]
             let window_handle = backend
                 .window()

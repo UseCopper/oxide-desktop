@@ -11,23 +11,61 @@ codegen-units = 1
 
 [dependencies]
 bitflags = "2.2.1"
-profiling = "1.0"
+profiling = { version = "1.0", features = ["profile-with-tracy"] }
 rand = "0.8"
 thiserror = "1"
 tracing = { version = "0.1.37", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 xkbcommon = "0.8.0"
 xcursor = "0.3"
+image = { version = "0.24", optional = true }
+fps_ticker = { version = "1", optional = true }
+renderdoc = { version = "0.12", optional = true }
+puffin_http = { version = "0.3", optional = true }
+nix = { version = "0.27", optional = true }
+libinput-rs = { version = "0.3", optional = true }
+drm-fourcc = { version = "2", optional = true }
+gbm = { version = "0.11", optional = true }
+wayland-backend = { version = "0.3", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-server = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.31", optional = true }
+wayland-egl = { version = "0.31", optional = true }
+x11rb = { version = "0.10", optional = true }
+puffin = { version = "0.3", optional = true }
+tracy-client = { version = "0.19", optional = true }
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
 rev = "e3d461a057ba244d213a8498ec372b0799cca103"
 default-features = false
-features = ["backend_winit", "backend_egl", "backend_drm", "wayland_frontend", "desktop", "renderer_gl"]
+features = [
+    "backend_winit",
+    "backend_egl",
+    "backend_drm",
+    "backend_gbm",
+    "drm",
+    "gbm",
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "xwayland",
+    "backend_libei",
+    "use_system_lib",
+]
 
 [features]
-default = ["winit"]
-winit = []
+default = ["winit", "xwayland"]
+winit = ["smithay/backend_winit", "smithay/backend_egl", "smithay/renderer_gl", "egl"]
+udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/drm", "smithay/gbm", "smithay/backend_egl", "smithay/renderer_gl", "egl", "nix", "libinput-rs", "drm-fourcc", "gbm", "wayland-backend", "wayland-client", "wayland-server", "wayland-protocols", "wayland-egl"]
+x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
+xwayland = ["smithay/xwayland", "smithay/backend_libei"]
+libei = []
+debug = ["image", "fps_ticker", "renderdoc"]
+egl = ["smithay/backend_egl", "smithay/renderer_gl", "wayland-egl"]
+profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client"]
+profile-with-tracy-mem = ["profile-with-tracy"]
+profile-with-puffin = ["puffin", "puffin_http"]
 
 [build-dependencies]
 gl_generator = "0.14"
