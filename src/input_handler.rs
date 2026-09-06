@@ -1,6 +1,6 @@
 use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
 
-use crate::{AnvilState, focus::PointerFocusTarget, shell::FullscreenSurface};
+use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement}};
 
 #[cfg(feature = "udev")]
 use crate::udev::UdevData;
@@ -123,6 +123,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         }
                     }
                 }
+            }
+
+            KeyAction::Minimize => {
+                let focus = self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|keyboard| keyboard.current_focus());
+                if let Some(KeyboardFocusTarget::Window(w)) = focus {
+                    self.minimize_request(WindowElement(w));
+                }
+            }
+
+            KeyAction::RestoreWindow => {
+                self.restore_last_minimized();
             }
 
             _ => unreachable!(
@@ -503,6 +517,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
+        self.update_ssd_drag_position(touch_location);
+
         let under = self.surface_under(touch_location);
         handle.motion(
             self,
@@ -622,7 +638,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::Minimize
+                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
 
                     _ => tracing::warn!(
                         ?action,
@@ -663,6 +681,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         let pos = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
         let serial = SCOUNTER.next_serial();
+
+        self.update_ssd_drag_position(pos);
 
         let pointer = self.pointer.clone();
         let under = self.surface_under(pos);
@@ -844,7 +864,9 @@ impl AnvilState<UdevData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::Minimize
+                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
 
                     _ => unreachable!(),
                 },
@@ -959,6 +981,8 @@ impl AnvilState<UdevData> {
 
         pointer_location += delta;
 
+        self.update_ssd_drag_position(pointer_location);
+
         let new_under = self.surface_under(pointer_location);
 
         // If confined, don't move pointer if it would go outside surface
@@ -1023,6 +1047,8 @@ impl AnvilState<UdevData> {
 
         // clamp to screen limits
         pointer_location = self.clamp_coords(pointer_location);
+
+        self.update_ssd_drag_position(pointer_location);
 
         let pointer = self.pointer.clone();
         let under = self.surface_under(pointer_location);
@@ -1363,6 +1389,10 @@ enum KeyAction {
     RotateOutput,
     ToggleTint,
     ToggleDecorations,
+    /// Minimize the focused window
+    Minimize,
+    /// Restore the most recently minimized window
+    RestoreWindow,
     /// Do nothing more
     None,
 }
@@ -1383,6 +1413,10 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::Run("weston-terminal".into()))
     } else if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
         Some(KeyAction::Screen((keysym.raw() - xkb::KEY_1) as usize))
+    } else if modifiers.logo && keysym == Keysym::M {
+        Some(KeyAction::Minimize)
+    } else if modifiers.logo && modifiers.shift && keysym == Keysym::Z {
+        Some(KeyAction::RestoreWindow)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::M {
         Some(KeyAction::ScaleDown)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::P {

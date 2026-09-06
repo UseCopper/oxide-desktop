@@ -3,8 +3,8 @@ use std::cell::RefCell;
 use smithay::{
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Space, Window,
-        WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
-        space::SpaceElement,
+        WindowSurface, WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords,
+        layer_map_for_output, space::SpaceElement,
     },
     input::{Seat, pointer::Focus},
     output::Output,
@@ -15,7 +15,7 @@ use smithay::{
             protocol::{wl_output, wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, Serial, Size},
+    utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER, Serial, Size},
     wayland::{
         compositor::{self, with_states},
         seat::WaylandFocus,
@@ -262,152 +262,27 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         }
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, mut wl_output: Option<wl_output::WlOutput>) {
-        // NOTE: This is only one part of the solution. We can set the
-        // location and configure size here, but the surface should be rendered fullscreen
-        // independently from its buffer size
-        let wl_surface = surface.wl_surface();
-
-        let output_geometry = fullscreen_output_geometry(wl_surface, wl_output.as_ref(), &mut self.space);
-
-        if let Some(geometry) = output_geometry {
-            let output = wl_output
-                .as_ref()
-                .and_then(Output::from_resource)
-                .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
-            let client = match self.display_handle.get_client(wl_surface.id()) {
-                Ok(client) => client,
-                Err(_) => return,
-            };
-            for output in output.client_outputs(&client) {
-                wl_output = Some(output);
-            }
-            let window = self
-                .space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
-                .unwrap();
-
-            let content_size = SpaceElement::geometry(&window.0).size;
-            let location = self.space.element_location(&window).unwrap();
-            let mut state = window.decoration_state();
-            state.header_bar.fullscreen = true;
-            state.header_bar.pointer_loc = None;
-            if state.fullscreen_restore.is_none() {
-                state.fullscreen_restore = Some((location, content_size));
-            }
-            drop(state);
-
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(Size::from((
-                    geometry.size.w,
-                    (geometry.size.h - HEADER_BAR_HEIGHT).max(0),
-                )));
-                state.fullscreen_output = wl_output;
-            });
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(window.clone());
-            trace!("Fullscreening: {:?}", window);
-        }
-
-        // The protocol demands us to always reply with a configure,
-        // regardless of we fulfilled the request or not
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
-        } else {
-            // Will be sent during initial configure
-        }
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, wl_output: Option<wl_output::WlOutput>) {
+        self.fullscreen_request_xdg(&surface, wl_output);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let wl_surface = surface.wl_surface();
-        let restore: Option<(WindowElement, Point<i32, Logical>, Size<i32, Logical>)> = self
-            .space
-            .elements()
-            .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
-            .map(|window| {
-                let mut state = window.decoration_state();
-                state.header_bar.fullscreen = false;
-                state.header_bar.pointer_loc = None;
-                state
-                    .fullscreen_restore
-                    .take()
-                    .map(|(loc, size)| (window.clone(), loc, size))
-            })
-            .flatten();
-
-        let ret = surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Fullscreen);
-            state.size = restore.as_ref().map(|(_, _, size)| *size);
-            state.fullscreen_output.take()
-        });
-        if let Some((window, location, _)) = restore {
-            self.space.map_element(window, location, false);
-        }
-        if let Some(output) = ret {
-            let output = Output::from_resource(&output).unwrap();
-            if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
-                trace!("Unfullscreening: {:?}", fullscreen.get());
-                fullscreen.clear();
-                self.backend_data.reset_buffers(&output);
-            }
-        }
-
-        // The protocol demands us to always reply with a configure,
-        // regardless of we fulfilled the request or not
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
-        } else {
-            // Will be sent during initial configure
-        }
+        self.unfullscreen_request_xdg(&surface);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        // NOTE: This should use layer-shell when it is implemented to
-        // get the correct maximum size
-        let window = self.window_for_surface(surface.wl_surface()).unwrap();
-        let outputs_for_window = self.space.outputs_for_element(&window);
-        let output = outputs_for_window
-            .first()
-            // The window hasn't been mapped yet, use the primary output instead
-            .or_else(|| self.space.outputs().next())
-            // Assumes that at least one output exists
-            .expect("No outputs found");
-        let geometry = self.space.output_geometry(output).unwrap();
-
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(geometry.size);
-        });
-        self.space.map_element(window, geometry.loc, true);
-
-        // The protocol demands us to always reply with a configure,
-        // regardless of we fulfilled the request or not
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
-        } else {
-            // Will be sent during initial configure
-        }
+        self.maximize_request_xdg(&surface);
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = None;
-        });
+        self.unmaximize_request_xdg(&surface);
+    }
 
-        // The protocol demands us to always reply with a configure,
-        // regardless of we fulfilled the request or not
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
-        } else {
-            // Will be sent during initial configure
-        }
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        self.minimize_request(window);
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -459,7 +334,237 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
-    pub fn minimize_request(&mut self, _window: WindowElement) {}
+    pub fn minimize_request(&mut self, window: WindowElement) {
+        let location = match self.space.element_location(&window) {
+            Some(loc) => loc,
+            None => return,
+        };
+        if self.minimized.iter().any(|(w, _)| w == &window) {
+            return;
+        }
+        self.minimized.push((window.clone(), location));
+        self.space.unmap_elem(&window);
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            if matches!(
+                keyboard.current_focus(),
+                Some(KeyboardFocusTarget::Window(w)) if w == window.0
+            ) {
+                keyboard.set_focus(self, None, SCOUNTER.next_serial());
+            }
+        }
+    }
+
+    pub fn unminimize_request(&mut self, window: WindowElement) {
+        let Some(index) = self.minimized.iter().position(|(w, _)| w == &window) else {
+            return;
+        };
+        let (_, location) = self.minimized.remove(index);
+        self.space.map_element(window, location, true);
+    }
+
+    pub fn restore_last_minimized(&mut self) {
+        let Some((window, location)) = self.minimized.pop() else {
+            return;
+        };
+        self.space.map_element(window, location, true);
+    }
+
+    // Shared window-management actions. Both the SSD title-bar buttons and the
+    // XDG / X11 protocol request handlers go through these, so a request and a
+    // button click always have the exact same effect.
+
+    pub fn close_window(&mut self, window: WindowElement) {
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => w.send_close(),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => {
+                let _ = w.close();
+            }
+        }
+    }
+
+    pub fn maximize_window(&mut self, window: WindowElement) {
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => self.maximize_request_xdg(w),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => self.maximize_request_x11(w),
+        }
+    }
+
+    pub fn unmaximize_window(&mut self, window: WindowElement) {
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => self.unmaximize_request_xdg(w),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => self.unmaximize_request_x11(w),
+        }
+    }
+
+    pub fn fullscreen_window(&mut self, window: WindowElement) {
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => self.fullscreen_request_xdg(w, None),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => self.fullscreen_request_x11(w),
+        }
+    }
+
+    pub fn unfullscreen_window(&mut self, window: WindowElement) {
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => self.unfullscreen_request_xdg(w),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => self.unfullscreen_request_x11(w),
+        }
+    }
+
+    fn maximize_request_xdg(&mut self, surface: &ToplevelSurface) {
+        // NOTE: This should use layer-shell when it is implemented to
+        // get the correct maximum size
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let outputs_for_window = self.space.outputs_for_element(&window);
+        let output = outputs_for_window
+            .first()
+            // The window hasn't been mapped yet, use the primary output instead
+            .or_else(|| self.space.outputs().next());
+
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Maximized);
+            state.size = output.and_then(|output| self.space.output_geometry(output)).map(|geo| geo.size);
+        });
+        if let Some(output) = output {
+            if let Some(geometry) = self.space.output_geometry(output) {
+                self.space.map_element(window, geometry.loc, true);
+            }
+        }
+
+        // The protocol demands us to always reply with a configure,
+        // regardless of we fulfilled the request or not
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        } else {
+            // Will be sent during initial configure
+        }
+    }
+
+    fn unmaximize_request_xdg(&mut self, surface: &ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+            state.size = None;
+        });
+
+        // The protocol demands us to always reply with a configure,
+        // regardless of we fulfilled the request or not
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        } else {
+            // Will be sent during initial configure
+        }
+    }
+
+    fn fullscreen_request_xdg(&mut self, surface: &ToplevelSurface, mut wl_output: Option<wl_output::WlOutput>) {
+        // NOTE: This is only one part of the solution. We can set the
+        // location and configure size here, but the surface should be rendered fullscreen
+        // independently from its buffer size
+        let wl_surface = surface.wl_surface();
+
+        let output_geometry = fullscreen_output_geometry(wl_surface, wl_output.as_ref(), &mut self.space);
+
+        if let Some(geometry) = output_geometry {
+            let output = wl_output
+                .as_ref()
+                .and_then(Output::from_resource)
+                .or_else(|| self.space.outputs().next().cloned());
+            let Some(output) = output else {
+                return;
+            };
+            let Ok(client) = self.display_handle.get_client(wl_surface.id()) else {
+                return;
+            };
+            for output in output.client_outputs(&client) {
+                wl_output = Some(output);
+            }
+            let Some(window) = self.window_for_surface(wl_surface) else {
+                return;
+            };
+
+            let content_size = SpaceElement::geometry(&window.0).size;
+            let location = self.space.element_location(&window);
+            let mut state = window.decoration_state();
+            state.header_bar.fullscreen = true;
+            state.header_bar.pointer_loc = None;
+            if state.fullscreen_restore.is_none() {
+                if let Some(location) = location {
+                    state.fullscreen_restore = Some((location, content_size));
+                }
+            }
+            drop(state);
+
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.size = Some(Size::from((
+                    geometry.size.w,
+                    (geometry.size.h - HEADER_BAR_HEIGHT).max(0),
+                )));
+                state.fullscreen_output = wl_output;
+            });
+            output.user_data().insert_if_missing(FullscreenSurface::default);
+            output
+                .user_data()
+                .get::<FullscreenSurface>()
+                .unwrap()
+                .set(window.clone());
+            trace!("Fullscreening: {:?}", window);
+        }
+
+        // The protocol demands us to always reply with a configure,
+        // regardless of we fulfilled the request or not
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        } else {
+            // Will be sent during initial configure
+        }
+    }
+
+    fn unfullscreen_request_xdg(&mut self, surface: &ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let restore: Option<(WindowElement, Point<i32, Logical>, Size<i32, Logical>)> = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+            .and_then(|window| {
+                let mut state = window.decoration_state();
+                state.header_bar.fullscreen = false;
+                state.header_bar.pointer_loc = None;
+                state
+                    .fullscreen_restore
+                    .take()
+                    .map(|(loc, size)| (window.clone(), loc, size))
+            });
+
+        let ret = surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Fullscreen);
+            state.size = restore.as_ref().map(|(_, _, size)| *size);
+            state.fullscreen_output.take()
+        });
+        if let Some((window, location, _)) = restore {
+            self.space.map_element(window, location, false);
+        }
+        if let Some(output) = ret.and_then(|output| Output::from_resource(&output)) {
+            if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
+                trace!("Unfullscreening: {:?}", fullscreen.get());
+                fullscreen.clear();
+                self.backend_data.reset_buffers(&output);
+            }
+        }
+
+        // The protocol demands us to always reply with a configure,
+        // regardless of we fulfilled the request or not
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        } else {
+            // Will be sent during initial configure
+        }
+    }
 
     pub fn move_request_xdg(&mut self, surface: &ToplevelSurface, seat: &Seat<Self>, serial: Serial) {
         if let Some(touch) = seat.get_touch() {

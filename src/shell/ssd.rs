@@ -12,8 +12,8 @@ use smithay::{
     },
     desktop::WindowSurface,
     input::Seat,
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Logical, Physical, Point, Scale, Serial, Size, Transform},
-    wayland::shell::xdg::XdgShellHandler,
 };
 
 use std::cell::{RefCell, RefMut};
@@ -26,6 +26,16 @@ pub struct WindowState {
     pub is_ssd: bool,
     pub fullscreen_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
     pub header_bar: HeaderBar,
+}
+
+#[derive(Debug, Clone)]
+pub struct SSDDrag {
+    /// The window being dragged
+    pub window: WindowElement,
+    /// Pointer position in the global compositor space at the start of the drag
+    pub start_global: Point<f64, Logical>,
+    /// Window position in the global compositor space at the start of the drag
+    pub start_origin: Point<i32, Logical>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +156,39 @@ impl HeaderBar {
         self.pointer_loc = None;
     }
 
+    /// Start dragging `window` from its title bar.
+    ///
+    /// Records the pointer's position in the global compositor space; each following
+    /// motion moves the window by exactly the delta the pointer moved since here.
+    ///
+    /// The drag lives on [`AnvilState`] and is driven from the compositor's input
+    /// path with the pointer's true global position, so it keeps tracking the
+    /// pointer no matter which surface is under the cursor, and only ends when
+    /// the pointer button is released.
+    pub fn start_drag<B: Backend>(
+        &mut self,
+        state: &mut AnvilState<B>,
+        window: &WindowElement,
+        window_origin: Point<i32, Logical>,
+    ) {
+        let Some(start_pointer) = self.pointer_loc else {
+            tracing::debug!(?window_origin, "SSD drag start skipped: no pointer location");
+            return;
+        };
+        let start_global = window_origin.to_f64() + start_pointer;
+        tracing::debug!(
+            ?window_origin,
+            ?start_pointer,
+            ?start_global,
+            "SSD drag started"
+        );
+        state.ssd_drag = Some(SSDDrag {
+            window: window.clone(),
+            start_global,
+            start_origin: window_origin,
+        });
+    }
+
     pub fn clicked<BackendData: Backend>(
         &mut self,
         seat: &Seat<AnvilState<BackendData>>,
@@ -158,35 +201,26 @@ impl HeaderBar {
         }
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => w.send_close(),
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let _ = w.close();
-                    }
-                };
+                state.close_window(window.clone());
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+                let fullscreen = !self.fullscreen;
+                let window = window.clone();
                 match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => {
-                        let fullscreen = !self.fullscreen;
-                        let surface = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| {
-                                if fullscreen {
-                                    data.fullscreen_request(surface.clone(), None);
-                                } else {
-                                    data.unfullscreen_request(surface.clone());
-                                }
-                            });
+                    WindowSurface::Wayland(_) => {
+                        state.handle.insert_idle(move |data| {
+                            if fullscreen {
+                                data.fullscreen_window(window.clone());
+                            } else {
+                                data.unfullscreen_window(window.clone());
+                            }
+                        });
                     }
                     #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let surface = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.maximize_request_x11(&surface));
+                    WindowSurface::X11(_) => {
+                        state.handle.insert_idle(move |data| {
+                            data.maximize_window(window.clone());
+                        });
                     }
                 };
             }
@@ -196,18 +230,28 @@ impl HeaderBar {
             Some(_) => {
                 match window.0.underlying_surface() {
                     WindowSurface::Wayland(w) => {
-                        let seat = seat.clone();
-                        let toplevel = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
+                        let maximized =
+                            w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+                        if maximized {
+                            let seat = seat.clone();
+                            let toplevel = w.clone();
+                            state
+                                .handle
+                                .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
+                        } else if let Some(origin) = state.space.element_location(window) {
+                            self.start_drag(state, window, origin);
+                        }
                     }
                     #[cfg(feature = "xwayland")]
                     WindowSurface::X11(w) => {
-                        let window = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_x11(&window));
+                        if w.is_maximized() {
+                            let window = w.clone();
+                            state
+                                .handle
+                                .insert_idle(move |data| data.move_request_x11(&window));
+                        } else if let Some(origin) = state.space.element_location(window) {
+                            self.start_drag(state, window, origin);
+                        }
                     }
                 };
             }
@@ -217,32 +261,19 @@ impl HeaderBar {
 
     pub fn touch_down<BackendData: Backend>(
         &mut self,
-        seat: &Seat<AnvilState<BackendData>>,
+        _seat: &Seat<AnvilState<BackendData>>,
         state: &mut AnvilState<BackendData>,
         window: &WindowElement,
-        serial: Serial,
+        _serial: Serial,
     ) {
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {}
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {}
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {}
             Some(_) => {
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => {
-                        let seat = seat.clone();
-                        let toplevel = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
-                    }
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let window = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_x11(&window));
-                    }
-                };
+                if let Some(origin) = state.space.element_location(window) {
+                    self.start_drag(state, window, origin);
+                }
             }
             _ => {}
         };
@@ -254,40 +285,32 @@ impl HeaderBar {
         state: &mut AnvilState<BackendData>,
         window: &WindowElement,
     ) {
+        state.end_ssd_drag();
         if !self.pointer_is_in_header() {
             return;
         }
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => w.send_close(),
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let _ = w.close();
-                    }
-                };
+                state.close_window(window.clone());
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+                let fullscreen = !self.fullscreen;
+                let window = window.clone();
                 match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => {
-                        let fullscreen = !self.fullscreen;
-                        let surface = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| {
-                                if fullscreen {
-                                    data.fullscreen_request(surface.clone(), None);
-                                } else {
-                                    data.unfullscreen_request(surface.clone());
-                                }
-                            });
+                    WindowSurface::Wayland(_) => {
+                        state.handle.insert_idle(move |data| {
+                            if fullscreen {
+                                data.fullscreen_window(window.clone());
+                            } else {
+                                data.unfullscreen_window(window.clone());
+                            }
+                        });
                     }
                     #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let surface = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.maximize_request_x11(&surface));
+                    WindowSurface::X11(_) => {
+                        state.handle.insert_idle(move |data| {
+                            data.maximize_window(window.clone());
+                        });
                     }
                 };
             }
@@ -562,5 +585,31 @@ impl WindowElement {
 
     pub fn set_ssd(&self, ssd: bool) {
         self.decoration_state().is_ssd = ssd;
+    }
+}
+
+impl<B: Backend> AnvilState<B> {
+    pub fn end_ssd_drag(&mut self) {
+        if self.ssd_drag.is_some() {
+            tracing::debug!("SSD drag ended");
+            self.ssd_drag = None;
+        }
+    }
+
+    /// Move the window being dragged so it tracks the pointer's current global
+    /// position. `global` is the authoritative pointer position in compositor
+    /// space, so this keeps working no matter which surface the cursor is over.
+    pub fn update_ssd_drag_position(&mut self, global: Point<f64, Logical>) {
+        let Some(drag) = self.ssd_drag.clone() else {
+            return;
+        };
+        if self.space.element_location(&drag.window).is_none() {
+            self.ssd_drag = None;
+            return;
+        }
+        let delta = global - drag.start_global;
+        let new_origin = drag.start_origin + delta.to_i32_round();
+        self.space.map_element(drag.window, new_origin, true);
+        tracing::trace!(?global, ?new_origin, "SSD drag moved window");
     }
 }

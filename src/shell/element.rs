@@ -2,7 +2,7 @@ use std::{borrow::Cow, time::Duration};
 
 use smithay::{
     backend::{
-        input::InputTime,
+        input::{ButtonState, InputTime},
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
@@ -207,7 +207,11 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
     ) {
         let mut state = self.0.decoration_state();
         if state.is_ssd {
-            state.header_bar.clicked(seat, data, &self.0, event.serial);
+            if event.state == ButtonState::Pressed {
+                state.header_bar.clicked(seat, data, &self.0, event.serial);
+            } else if event.state == ButtonState::Released {
+                data.end_ssd_drag();
+            }
         }
     }
     fn axis(
@@ -439,7 +443,7 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
         event: &smithay::input::tablet::tool::ButtonEvent,
     ) {
         let mut state = self.0.decoration_state();
-        if state.is_ssd {
+        if state.is_ssd && event.state == ButtonState::Pressed {
             state.header_bar.clicked(seat, data, &self.0, event.serial);
         }
     }

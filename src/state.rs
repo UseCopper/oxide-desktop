@@ -106,7 +106,7 @@ use smithay::{
 use crate::cursor::Cursor;
 use crate::{
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::WindowElement,
+    shell::{WindowElement, ssd::SSDDrag},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -187,6 +187,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub renderdoc: Option<renderdoc::RenderDoc<renderdoc::V141>>,
 
     pub show_window_preview: bool,
+
+    pub minimized: Vec<(WindowElement, Point<i32, Logical>)>,
+    pub ssd_drag: Option<SSDDrag>,
 }
 
 #[derive(Debug)]
@@ -798,6 +801,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             #[cfg(feature = "debug")]
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
+            minimized: Vec::new(),
+            ssd_drag: None,
         }
     }
 
