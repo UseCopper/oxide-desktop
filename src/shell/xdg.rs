@@ -15,7 +15,7 @@ use smithay::{
             protocol::{wl_output, wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, Serial},
+    utils::{Logical, Point, Serial, Size},
     wayland::{
         compositor::{self, with_states},
         seat::WaylandFocus,
@@ -37,6 +37,7 @@ use super::{
     FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState,
     SurfaceData, WindowElement, fullscreen_output_geometry, place_new_window,
 };
+use super::ssd::HEADER_BAR_HEIGHT;
 
 impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -287,9 +288,22 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
                 .unwrap();
 
+            let content_size = SpaceElement::geometry(&window.0).size;
+            let location = self.space.element_location(&window).unwrap();
+            let mut state = window.decoration_state();
+            state.header_bar.fullscreen = true;
+            state.header_bar.pointer_loc = None;
+            if state.fullscreen_restore.is_none() {
+                state.fullscreen_restore = Some((location, content_size));
+            }
+            drop(state);
+
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(geometry.size);
+                state.size = Some(Size::from((
+                    geometry.size.w,
+                    (geometry.size.h - HEADER_BAR_HEIGHT).max(0),
+                )));
                 state.fullscreen_output = wl_output;
             });
             output.user_data().insert_if_missing(FullscreenSurface::default);
@@ -311,11 +325,30 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let restore: Option<(WindowElement, Point<i32, Logical>, Size<i32, Logical>)> = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+            .map(|window| {
+                let mut state = window.decoration_state();
+                state.header_bar.fullscreen = false;
+                state.header_bar.pointer_loc = None;
+                state
+                    .fullscreen_restore
+                    .take()
+                    .map(|(loc, size)| (window.clone(), loc, size))
+            })
+            .flatten();
+
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
-            state.size = None;
+            state.size = restore.as_ref().map(|(_, _, size)| *size);
             state.fullscreen_output.take()
         });
+        if let Some((window, location, _)) = restore {
+            self.space.map_element(window, location, false);
+        }
         if let Some(output) = ret {
             let output = Output::from_resource(&output).unwrap();
             if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
@@ -426,6 +459,8 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
+    pub fn minimize_request(&mut self, _window: WindowElement) {}
+
     pub fn move_request_xdg(&mut self, surface: &ToplevelSurface, seat: &Seat<Self>, serial: Serial) {
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {

@@ -6,7 +6,8 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
-                AsRenderElements, solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Kind, memory::MemoryRenderBufferRenderElement,
+                solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
             },
         },
     },
@@ -33,7 +34,10 @@ use smithay::{
     wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
 };
 
-use super::ssd::HEADER_BAR_HEIGHT;
+use super::ssd::{
+    BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, icon_offset, content_offset,
+    fullscreen_content_offset,
+};
 use crate::{AnvilState, focus::PointerFocusTarget, state::Backend};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,8 +53,10 @@ impl WindowElement {
         if state.is_ssd && location.y < HEADER_BAR_HEIGHT as f64 {
             return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
         }
-        let offset = if state.is_ssd {
-            Point::from((0, HEADER_BAR_HEIGHT))
+        let offset = if state.is_ssd && state.header_bar.fullscreen {
+            fullscreen_content_offset()
+        } else if state.is_ssd {
+            content_offset()
         } else {
             Point::default()
         };
@@ -461,24 +467,31 @@ impl SpaceElement for WindowElement {
     fn geometry(&self) -> Rectangle<i32, Logical> {
         let mut geo = SpaceElement::geometry(&self.0);
         if self.decoration_state().is_ssd {
-            geo.size.h += HEADER_BAR_HEIGHT;
+            geo.size.w += 2 * BORDER_WIDTH;
+            geo.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
         }
         geo
     }
     fn bbox(&self) -> Rectangle<i32, Logical> {
         let mut bbox = SpaceElement::bbox(&self.0);
         if self.decoration_state().is_ssd {
-            bbox.size.h += HEADER_BAR_HEIGHT;
+            bbox.size.w += 2 * BORDER_WIDTH;
+            bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
         }
         bbox
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
         if self.decoration_state().is_ssd {
-            point.y < HEADER_BAR_HEIGHT as f64
-                || SpaceElement::is_in_input_region(
-                    &self.0,
-                    &(*point - Point::from((0.0, HEADER_BAR_HEIGHT as f64))),
-                )
+            if point.y < HEADER_BAR_HEIGHT as f64 {
+                return true;
+            }
+            let state = self.decoration_state();
+            let offset = if state.header_bar.fullscreen {
+                fullscreen_content_offset()
+            } else {
+                content_offset()
+            };
+            SpaceElement::is_in_input_region(&self.0, &(*point - offset.to_f64()))
         } else {
             SpaceElement::is_in_input_region(&self.0, point)
         }
@@ -506,6 +519,7 @@ render_elements!(
     pub WindowRenderElement<R> where R: ImportAll + ImportMem;
     Window=WaylandSurfaceRenderElement<R>,
     Decoration=SolidColorRenderElement,
+    Icon=MemoryRenderBufferRenderElement<R>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -513,6 +527,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
         match self {
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Decoration(arg0) => f.debug_tuple("Decoration").field(arg0).finish(),
+            Self::Icon(arg0) => f.debug_tuple("Icon").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -521,7 +536,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
 impl<R> AsRenderElements<R> for WindowElement
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + Texture + 'static,
+    R::TextureId: Clone + Texture + Send + 'static,
 {
     type RenderElement = WindowRenderElement<R>;
 
@@ -536,23 +551,74 @@ where
 
         if self.decoration_state().is_ssd && !window_bbox.is_empty() {
             let window_geo = SpaceElement::geometry(&self.0);
+            let content_size = window_geo.size;
 
             let mut state = self.decoration_state();
-            let width = window_geo.size.w;
-            state.header_bar.redraw(width as u32);
-            let mut vec = AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
+            let fullscreen = state.header_bar.fullscreen;
+            let width = window_geo.size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
+            state.header_bar.redraw(width.max(0) as u32, content_size);
+
+            let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
+
+            let icon_off = icon_offset();
+            let base = state.header_bar.width as i32;
+            let maximize_icon = if state.header_bar.fullscreen {
+                &state.header_bar.restore_icon
+            } else {
+                &state.header_bar.maximize_icon
+            };
+            let icon_locations = [
+                (base - BUTTON_WIDTH as i32 + icon_off.x, &state.header_bar.close_icon),
+                (base - BUTTON_WIDTH as i32 * 2 + icon_off.x, maximize_icon),
+                (base - BUTTON_WIDTH as i32 * 3 + icon_off.x, &state.header_bar.minimize_icon),
+            ];
+            for (icon_x, icon) in icon_locations {
+                let icon_pos: Point<i32, Logical> = Point::from((icon_x, icon_off.y));
+                let icon_physical = (location + icon_pos.to_physical_precise_round(scale)).to_f64();
+                vec.push(
+                    MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        icon_physical,
+                        &icon,
+                        Some(alpha),
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .expect("failed to import window icon")
+                    .into(),
+                );
+            }
+
+            vec.extend(AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
                 &state.header_bar,
                 renderer,
                 location,
                 scale,
                 alpha,
-            );
+            ));
 
-            location.y += (scale.y * HEADER_BAR_HEIGHT as f64) as i32;
+            if !fullscreen {
+                vec.extend(AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
+                    &state.header_bar.borders,
+                    renderer,
+                    location,
+                    scale,
+                    alpha,
+                ));
+            }
+
+            location += if fullscreen {
+                fullscreen_content_offset()
+            } else {
+                content_offset()
+            }
+            .to_physical_precise_round(scale);
 
             let window_elements =
                 AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
             vec.extend(window_elements);
+
             vec.into_iter().map(C::from).collect()
         } else {
             AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha)
