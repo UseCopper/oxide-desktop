@@ -1474,6 +1474,10 @@ impl AnvilState<UdevData> {
                     Transform::Normal,
                     None,
                 );
+                // Bound the cache: animated cursors would otherwise grow it without limit.
+                if pointer_images.len() >= 16 {
+                    pointer_images.remove(0);
+                }
                 pointer_images.push((frame, buffer.clone()));
                 buffer
             });
@@ -1582,10 +1586,8 @@ fn render_surface<'a>(
                 states
                     .data_map
                     .get::<Mutex<CursorImageAttributes>>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .hotspot
+                    .and_then(|attrs| attrs.lock().ok().map(|a| a.hotspot))
+                    .unwrap_or_default()
             })
         } else {
             (0, 0).into()

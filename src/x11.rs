@@ -103,9 +103,13 @@ pub fn run_x11() {
     let handle = backend.handle();
 
     // Obtain the DRM node the X server uses for direct rendering.
-    let (node, fd) = handle
-        .drm_node()
-        .expect("Could not get DRM node used by X server");
+    let (node, fd) = match handle.drm_node() {
+        Ok(ret) => ret,
+        Err(err) => {
+            error!(?err, "Could not get DRM node used by X server");
+            return;
+        }
+    };
 
     // Create the gbm device for buffer allocation.
     let device = gbm::Device::new(DeviceFd::from(fd)).expect("Failed to create gbm device");
@@ -350,10 +354,8 @@ pub fn run_x11() {
                     states
                         .data_map
                         .get::<Mutex<CursorImageAttributes>>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .hotspot
+                        .and_then(|attrs| attrs.lock().ok().map(|a| a.hotspot))
+                        .unwrap_or_default()
                 })
             } else {
                 (0, 0).into()

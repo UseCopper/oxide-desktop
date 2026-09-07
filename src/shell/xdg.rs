@@ -147,16 +147,22 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
         // Check that this surface has a click grab.
         if !pointer.has_grab(serial) {
             return;
         }
 
-        let start_data = pointer.grab_start_data().unwrap();
+        let Some(start_data) = pointer.grab_start_data() else {
+            return;
+        };
 
-        let window = self.window_for_surface(surface.wl_surface()).unwrap();
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            return;
+        };
 
         // If the focus was for a different surface, ignore the request.
         if start_data.focus.is_none()
@@ -171,20 +177,19 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         }
 
         let geometry = window.geometry();
-        let loc = self.space.element_location(&window).unwrap();
+        let Some(loc) = self.space.element_location(&window) else {
+            return;
+        };
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
-        with_states(surface.wl_surface(), move |states| {
-            states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut()
-                .resize_state = ResizeState::Resizing(ResizeData {
-                edges: edges.into(),
-                initial_window_location,
-                initial_window_size,
-            });
+        with_states(surface.wl_surface(), |states| {
+            if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                    edges: edges.into(),
+                    initial_window_location,
+                    initial_window_size,
+                });
+            }
         });
 
         let grab = PointerResizeSurfaceGrab {
@@ -508,11 +513,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 state.fullscreen_output = wl_output;
             });
             output.user_data().insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(window.clone());
+            if let Some(fs) = output.user_data().get::<FullscreenSurface>() {
+                // Don't leak a previous fullscreen window if a second one takes over.
+                if let Some(prev) = fs.get()
+                    && prev.wl_surface().as_deref() != Some(wl_surface)
+                {
+                    tracing::debug!("Replacing previous fullscreen window");
+                }
+                fs.set(window.clone());
+            }
             trace!("Fullscreening: {:?}", window);
         }
 
@@ -589,7 +598,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     return;
                 }
 
-                let mut initial_window_location = self.space.element_location(&window).unwrap();
+        let Some(mut initial_window_location) = self.space.element_location(&window) else {
+            return;
+        };
 
                 // If surface is maximized then unmaximize it
                 let changed = surface.with_pending_state(|state| {
@@ -628,14 +639,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
         // Check that this surface has a click grab.
         if !pointer.has_grab(serial) {
             return;
         }
 
-        let start_data = pointer.grab_start_data().unwrap();
+        let Some(start_data) = pointer.grab_start_data() else {
+            return;
+        };
 
         // If the client disconnects after requesting a move
         // we can just ignore the request

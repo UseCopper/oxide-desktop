@@ -53,21 +53,28 @@ impl<BackendData: Backend> XWaylandShellHandler for AnvilState<BackendData> {
 
 impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().unwrap()
+        self.xwm.as_mut().expect("XWM event with no XWM running")
     }
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        window.set_mapped(true).unwrap();
+        if let Err(err) = window.set_mapped(true) {
+            tracing::warn!(?err, "Failed to set X11 window mapped");
+            return;
+        }
         let window = WindowElement(Window::new_x11_window(window));
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
-        let bbox = self.space.element_bbox(&window).unwrap();
-        let Some(xsurface) = window.0.x11_surface() else {
-            unreachable!()
+        let Some(bbox) = self.space.element_bbox(&window) else {
+            return;
         };
-        xsurface.configure(Some(bbox)).unwrap();
+        let Some(xsurface) = window.0.x11_surface() else {
+            return;
+        };
+        if let Err(err) = xsurface.configure(Some(bbox)) {
+            tracing::warn!(?err, "Failed to configure X11 window");
+        }
         window.set_ssd(!xsurface.is_decorated());
     }
 
@@ -86,8 +93,10 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         if let Some(elem) = maybe {
             self.space.unmap_elem(&elem)
         }
-        if !window.is_override_redirect() {
-            window.set_mapped(false).unwrap();
+        if !window.is_override_redirect()
+            && let Err(err) = window.set_mapped(false)
+        {
+            tracing::warn!(?err, "Failed to set X11 window unmapped");
         }
     }
 
@@ -178,36 +187,40 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
 
     fn resize_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32, edges: X11ResizeEdge) {
         // luckily anvil only supports one seat anyway...
-        let start_data = self.pointer.grab_start_data().unwrap();
+        let Some(start_data) = self.pointer.grab_start_data() else {
+            return;
+        };
 
         let Some(element) = self
             .space
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
+            .cloned()
         else {
             return;
         };
 
         let geometry = element.geometry();
-        let loc = self.space.element_location(element).unwrap();
+        let Some(loc) = self.space.element_location(&element) else {
+            return;
+        };
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
-        with_states(&element.wl_surface().unwrap(), move |states| {
-            states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut()
-                .resize_state = ResizeState::Resizing(ResizeData {
-                edges: edges.into(),
-                initial_window_location,
-                initial_window_size,
+        if let Some(surface) = element.wl_surface() {
+            with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                    data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                        edges: edges.into(),
+                        initial_window_location,
+                        initial_window_size,
+                    });
+                }
             });
-        });
+        }
 
         let grab = PointerResizeSurfaceGrab {
             start_data,
-            window: element.clone(),
+            window: element,
             edges: edges.into(),
             initial_window_location,
             initial_window_size,
@@ -316,10 +329,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        window.set_maximized(true).unwrap();
-        window.configure(geometry).unwrap();
+        if let Err(err) = window.set_maximized(true) {
+            tracing::warn!(?err, "Failed to set X11 maximized");
+            return;
+        }
+        if let Err(err) = window.configure(geometry) {
+            tracing::warn!(?err, "Failed to configure maximized X11 window");
+        }
         window.user_data().insert_if_missing(OldGeometry::default);
-        window.user_data().get::<OldGeometry>().unwrap().save(old_geo);
+        if let Some(data) = window.user_data().get::<OldGeometry>() {
+            data.save(old_geo);
+        }
         self.space.map_element(elem, geometry.loc, false);
     }
 
@@ -328,13 +348,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        window.set_maximized(false).unwrap();
+        if let Err(err) = window.set_maximized(false) {
+            tracing::warn!(?err, "Failed to unset X11 maximized");
+        }
         if let Some(old_geo) = window
             .user_data()
             .get::<OldGeometry>()
             .and_then(|data| data.restore())
         {
-            window.configure(old_geo).unwrap();
+            if let Err(err) = window.configure(old_geo) {
+                tracing::warn!(?err, "Failed to restore X11 window geometry");
+            }
             self.space.map_element(elem, old_geo.loc, false);
         }
     }
@@ -356,15 +380,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        window.set_fullscreen(true).unwrap();
+        if let Err(err) = window.set_fullscreen(true) {
+            tracing::warn!(?err, "Failed to set X11 fullscreen");
+            return;
+        }
         elem.set_ssd(false);
-        window.configure(geometry).unwrap();
+        if let Err(err) = window.configure(geometry) {
+            tracing::warn!(?err, "Failed to configure fullscreen X11 window");
+        }
         output.user_data().insert_if_missing(FullscreenSurface::default);
-        output
-            .user_data()
-            .get::<FullscreenSurface>()
-            .unwrap()
-            .set(elem.clone());
+        if let Some(fs) = output.user_data().get::<FullscreenSurface>() {
+            // Clear any previous fullscreen window on this output so it doesn't leak.
+            if let Some(prev) = fs.get()
+                && prev != elem
+            {
+                tracing::debug!("Replacing previous fullscreen window");
+            }
+            fs.set(elem.clone());
+        }
         trace!("Fullscreening: {:?}", elem);
     }
 
@@ -373,7 +406,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        window.set_fullscreen(false).unwrap();
+        if let Err(err) = window.set_fullscreen(false) {
+            tracing::warn!(?err, "Failed to unset X11 fullscreen");
+        }
         elem.set_ssd(!window.is_decorated());
         if let Some(output) = self.space.outputs().find(|o| {
             o.user_data()
@@ -383,9 +418,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .unwrap_or(false)
         }) {
             trace!("Unfullscreening: {:?}", elem);
-            output.user_data().get::<FullscreenSurface>().unwrap().clear();
-            if let Some(bbox) = self.space.element_bbox(&elem) {
-                window.configure(bbox).unwrap();
+            if let Some(fs) = output.user_data().get::<FullscreenSurface>() {
+                fs.clear();
+            }
+            if let Some(bbox) = self.space.element_bbox(&elem)
+                && let Err(err) = window.configure(bbox)
+            {
+                tracing::warn!(?err, "Failed to restore X11 window geometry");
             }
             self.backend_data.reset_buffers(output);
         }
@@ -400,21 +439,25 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window));
 
                 if let Some(element) = element {
-                    let mut initial_window_location = self.space.element_location(element).unwrap();
+                    let Some(mut initial_window_location) = self.space.element_location(element) else {
+                        return;
+                    };
 
                     // If surface is maximized then unmaximize it
                     if window.is_maximized() {
-                        window.set_maximized(false).unwrap();
+                        if let Err(err) = window.set_maximized(false) {
+                            tracing::warn!(?err, "Failed to unset X11 maximized");
+                        }
                         let pos = start_data.location;
                         initial_window_location = (pos.x as i32, pos.y as i32).into();
                         if let Some(old_geo) = window
                             .user_data()
                             .get::<OldGeometry>()
                             .and_then(|data| data.restore())
+                            && let Err(err) =
+                                window.configure(Rectangle::new(initial_window_location, old_geo.size))
                         {
-                            window
-                                .configure(Rectangle::new(initial_window_location, old_geo.size))
-                                .unwrap();
+                            tracing::warn!(?err, "Failed to configure X11 window");
                         }
                     }
 
@@ -443,21 +486,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        let mut initial_window_location = self.space.element_location(element).unwrap();
+        let Some(mut initial_window_location) = self.space.element_location(element) else {
+            return;
+        };
 
         // If surface is maximized then unmaximize it
         if window.is_maximized() {
-            window.set_maximized(false).unwrap();
+            if let Err(err) = window.set_maximized(false) {
+                tracing::warn!(?err, "Failed to unset X11 maximized");
+            }
             let pos = self.pointer.current_location();
             initial_window_location = (pos.x as i32, pos.y as i32).into();
             if let Some(old_geo) = window
                 .user_data()
                 .get::<OldGeometry>()
                 .and_then(|data| data.restore())
+                && let Err(err) = window.configure(Rectangle::new(initial_window_location, old_geo.size))
             {
-                window
-                    .configure(Rectangle::new(initial_window_location, old_geo.size))
-                    .unwrap();
+                tracing::warn!(?err, "Failed to configure X11 window");
             }
         }
 

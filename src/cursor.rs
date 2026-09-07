@@ -49,32 +49,51 @@ impl Cursor {
 }
 
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
-    // Follow the nominal size of the cursor to choose the nearest
-    let nearest_image = images
+    // Follow the nominal size of the cursor to choose the nearest.
+    // Empty theme → no images; callers handle the empty case.
+    let nearest_dims = images
         .iter()
         .min_by_key(|image| (size as i32 - image.size as i32).abs())
-        .unwrap();
+        .map(|image| (image.width, image.height));
 
-    images
-        .iter()
-        .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
+    images.iter().filter(move |image| {
+        nearest_dims.is_some_and(|(w, h)| image.width == w && image.height == h)
+    })
 }
 
 fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
-    let total = nearest_images(size, images).fold(0, |acc, image| acc + image.delay);
+    let mut nearest = nearest_images(size, images);
+    let Some(first) = nearest.next() else {
+        // Defensive fallback: 1x1 transparent pixel so we never panic on
+        // malformed/empty themes; Cursor::load already falls back, but
+        // animated themes could still end up empty here.
+        return Image {
+            size,
+            width: 1,
+            height: 1,
+            xhot: 0,
+            yhot: 0,
+            delay: 1,
+            pixels_rgba: vec![0, 0, 0, 0],
+            pixels_argb: vec![],
+        };
+    };
+    let total: u32 = std::iter::once(first)
+        .chain(nearest)
+        .fold(0, |acc, image| acc.saturating_add(image.delay));
     if total == 0 {
-        return nearest_images(size, images).next().unwrap().clone();
+        return first.clone();
     }
     millis %= total;
 
-    for img in nearest_images(size, images) {
+    for img in std::iter::once(first).chain(nearest_images(size, images).skip(1)) {
         if millis < img.delay {
             return img.clone();
         }
         millis -= img.delay;
     }
 
-    unreachable!()
+    first.clone()
 }
 
 #[derive(thiserror::Error, Debug)]

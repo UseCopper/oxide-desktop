@@ -220,8 +220,12 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
 
         match type_ {
             GrabType::Pointer => {
-                let pointer = seat.get_pointer().unwrap();
-                let start_data = pointer.grab_start_data().unwrap();
+                let Some(pointer) = seat.get_pointer() else {
+                    return;
+                };
+                let Some(start_data) = pointer.grab_start_data() else {
+                    return;
+                };
                 pointer.set_grab(
                     self,
                     DnDGrab::new_pointer(&self.display_handle, start_data, source, seat),
@@ -230,8 +234,12 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
                 );
             }
             GrabType::Touch => {
-                let touch = seat.get_touch().unwrap();
-                let start_data = touch.grab_start_data().unwrap();
+                let Some(touch) = seat.get_touch() else {
+                    return;
+                };
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
                 touch.set_grab(
                     self,
                     DnDGrab::new_touch(&self.display_handle, start_data, source, seat),
@@ -414,13 +422,14 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
                         .to_f64();
 
                     let surface_location = origin + hint_location;
-                    if let Some(region) = locked_pointer.region()
-                        && region.contains(hint_location.to_i32_floor())
-                    {
-                        pointer.set_location(surface_location);
-                    } else {
+                    let inside = locked_pointer
+                        .region()
+                        .is_none_or(|region| region.contains(hint_location.to_i32_floor()));
+                    if inside {
                         pointer.set_location(surface_location);
                     }
+                    // If outside the locked region, keep the pointer where it is
+                    // instead of warping it to an invalid hint.
                 }
             },
             ConstraintRemove::PointerLeave(_region) => return,
@@ -812,7 +821,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         use smithay::wayland::compositor::CompositorHandler;
 
-        let (xwayland, client) = XWayland::spawn(
+        let (xwayland, client) = match XWayland::spawn(
             &self.display_handle,
             None,
             std::iter::empty::<(String, String)>(),
@@ -821,8 +830,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             Stdio::null(),
             Stdio::null(),
             |_| (),
-        )
-        .expect("failed to start XWayland");
+        ) {
+            Ok(ret) => ret,
+            Err(err) => {
+                warn!("Failed to start XWayland, continuing without it: {}", err);
+                return;
+            }
+        };
 
         let display_handle = self.display_handle.clone();
         let ret = self
@@ -877,8 +891,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         });
@@ -892,8 +907,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -909,8 +925,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -923,8 +940,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -972,8 +990,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1017,8 +1036,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1063,8 +1083,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1094,8 +1115,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });

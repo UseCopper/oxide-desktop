@@ -412,9 +412,14 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
-                    .unwrap();
+                let Some(location) = data.space.element_location(&self.window) else {
+                    return;
+                };
+                if let Err(err) =
+                    x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
+                {
+                    tracing::warn!(?err, "Failed to configure X11 window during resize");
+                }
             }
         }
     }
@@ -454,7 +459,9 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                     xdg.send_pending_configure();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.geometry();
-                        let mut location = data.space.element_location(&self.window).unwrap();
+                        let Some(mut location) = data.space.element_location(&self.window) else {
+                            return;
+                        };
 
                         if self.edges.intersects(ResizeEdge::LEFT) {
                             location.x = self.initial_window_location.x
@@ -468,22 +475,29 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                         data.space.map_element(self.window.clone(), location, true);
                     }
 
-                    with_states(&self.window.wl_surface().unwrap(), |states| {
-                        let mut data = states
-                            .data_map
-                            .get::<RefCell<SurfaceData>>()
-                            .unwrap()
-                            .borrow_mut();
-                        if let ResizeState::Resizing(resize_data) = data.resize_state {
-                            data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
-                        } else {
-                            panic!("invalid resize state: {:?}", data.resize_state);
+                    let Some(surface) = self.window.wl_surface() else {
+                        return;
+                    };
+                    with_states(&surface, |states| {
+                        if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                            let mut data = data.borrow_mut();
+                            if let ResizeState::Resizing(resize_data) = data.resize_state {
+                                data.resize_state =
+                                    ResizeState::WaitingForFinalAck(resize_data, event.serial);
+                            } else {
+                                tracing::warn!(
+                                    ?data.resize_state,
+                                    "Unexpected resize state at end of pointer resize"
+                                );
+                            }
                         }
                     });
                 }
                 #[cfg(feature = "xwayland")]
                 WindowSurface::X11(x11) => {
-                    let mut location = data.space.element_location(&self.window).unwrap();
+                    let Some(mut location) = data.space.element_location(&self.window) else {
+                        return;
+                    };
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.geometry();
 
@@ -498,23 +512,27 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
                         data.space.map_element(self.window.clone(), location, true);
                     }
-                    x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
-                        .unwrap();
+                    if let Err(err) =
+                        x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
+                    {
+                        tracing::warn!(?err, "Failed to configure X11 window at end of resize");
+                    }
 
                     let Some(surface) = self.window.wl_surface() else {
                         // X11 Window got unmapped, abort
                         return;
                     };
                     with_states(&surface, |states| {
-                        let mut data = states
-                            .data_map
-                            .get::<RefCell<SurfaceData>>()
-                            .unwrap()
-                            .borrow_mut();
-                        if let ResizeState::Resizing(resize_data) = data.resize_state {
-                            data.resize_state = ResizeState::WaitingForCommit(resize_data);
-                        } else {
-                            panic!("invalid resize state: {:?}", data.resize_state);
+                        if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                            let mut data = data.borrow_mut();
+                            if let ResizeState::Resizing(resize_data) = data.resize_state {
+                                data.resize_state = ResizeState::WaitingForCommit(resize_data);
+                            } else {
+                                tracing::warn!(
+                                    ?data.resize_state,
+                                    "Unexpected resize state at end of X11 resize"
+                                );
+                            }
                         }
                     });
                 }
@@ -665,7 +683,9 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
                 xdg.send_pending_configure();
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.geometry();
-                    let mut location = data.space.element_location(&self.window).unwrap();
+                    let Some(mut location) = data.space.element_location(&self.window) else {
+                        return;
+                    };
 
                     if self.edges.intersects(ResizeEdge::LEFT) {
                         location.x =
@@ -679,22 +699,29 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
                     data.space.map_element(self.window.clone(), location, true);
                 }
 
-                with_states(&self.window.wl_surface().unwrap(), |states| {
-                    let mut data = states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut();
-                    if let ResizeState::Resizing(resize_data) = data.resize_state {
-                        data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
-                    } else {
-                        panic!("invalid resize state: {:?}", data.resize_state);
+                let Some(surface) = self.window.wl_surface() else {
+                    return;
+                };
+                with_states(&surface, |states| {
+                    if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                        let mut data = data.borrow_mut();
+                        if let ResizeState::Resizing(resize_data) = data.resize_state {
+                            data.resize_state =
+                                ResizeState::WaitingForFinalAck(resize_data, event.serial);
+                        } else {
+                            tracing::warn!(
+                                ?data.resize_state,
+                                "Unexpected resize state at end of touch resize"
+                            );
+                        }
                     }
                 });
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let mut location = data.space.element_location(&self.window).unwrap();
+                let Some(mut location) = data.space.element_location(&self.window) else {
+                    return;
+                };
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.geometry();
 
@@ -709,23 +736,27 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
 
                     data.space.map_element(self.window.clone(), location, true);
                 }
-                x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
-                    .unwrap();
+                if let Err(err) =
+                    x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
+                {
+                    tracing::warn!(?err, "Failed to configure X11 window at end of touch resize");
+                }
 
                 let Some(surface) = self.window.wl_surface() else {
                     // X11 Window got unmapped, abort
                     return;
                 };
                 with_states(&surface, |states| {
-                    let mut data = states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut();
-                    if let ResizeState::Resizing(resize_data) = data.resize_state {
-                        data.resize_state = ResizeState::WaitingForCommit(resize_data);
-                    } else {
-                        panic!("invalid resize state: {:?}", data.resize_state);
+                    if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                        let mut data = data.borrow_mut();
+                        if let ResizeState::Resizing(resize_data) = data.resize_state {
+                            data.resize_state = ResizeState::WaitingForCommit(resize_data);
+                        } else {
+                            tracing::warn!(
+                                ?data.resize_state,
+                                "Unexpected resize state at end of X11 touch resize"
+                            );
+                        }
                     }
                 });
             }
@@ -806,9 +837,14 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
-                    .unwrap();
+                let Some(location) = data.space.element_location(&self.window) else {
+                    return;
+                };
+                if let Err(err) =
+                    x11.configure_with_sync(Rectangle::new(location, self.last_window_size), None)
+                {
+                    tracing::warn!(?err, "Failed to configure X11 window during touch resize");
+                }
             }
         }
     }

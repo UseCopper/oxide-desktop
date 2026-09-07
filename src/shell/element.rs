@@ -176,6 +176,10 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
         _data: &mut AnvilState<BackendData>,
         event: &MotionEvent,
     ) {
+        // NOTE: Smithay's pointer handling already subtracts the focus offset
+        // (`under.1`, which is the window origin for SSD) before calling us,
+        // so `event.location` is already window-relative here. Do NOT subtract
+        // the origin again.
         let mut state = self.0.decoration_state();
         if state.is_ssd {
             state.header_bar.pointer_enter(event.location);
@@ -299,6 +303,7 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::DownEvent,
     ) {
+        // Same as pointer: touch handling already subtracts the focus offset.
         let mut state = self.0.decoration_state();
         if state.is_ssd {
             state.header_bar.pointer_enter(event.location);
@@ -429,6 +434,7 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
         _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
         event: &smithay::input::tablet::tool::MotionEvent,
     ) {
+        // Same as pointer: tablet handling already subtracts the focus offset.
         let mut state = self.0.decoration_state();
         if state.is_ssd {
             state.header_bar.pointer_enter(event.location);
