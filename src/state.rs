@@ -35,8 +35,11 @@ use smithay::{
     output::Output,
     reexports::{
         calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic},
-        wayland_protocols::xdg::decoration::{
-            self as xdg_decoration, zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+        wayland_protocols::xdg::{
+            decoration::{
+                self as xdg_decoration, zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            },
+            shell::server::xdg_toplevel::XdgToplevel,
         },
         wayland_server::{
             Client, Display, DisplayHandle, Resource,
@@ -48,6 +51,7 @@ use smithay::{
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent, with_states},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufFeedback,
         fifo::{FifoBarrierCachedState, FifoManagerState},
         fixes::FixesState,
@@ -99,6 +103,7 @@ use smithay::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
         xdg_foreign::{XdgForeignHandler, XdgForeignState},
+        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager},
     },
 };
 
@@ -166,6 +171,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub image_capture_source_state: ImageCaptureSourceState,
     pub output_capture_source_state: OutputCaptureSourceState,
     pub image_copy_capture_state: ImageCopyCaptureState,
+    pub cursor_shape_state: CursorShapeManagerState,
+    pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
 
     pub dnd_icon: Option<DndIcon>,
 
@@ -606,6 +613,14 @@ impl<BackendData: Backend> XdgForeignHandler for AnvilState<BackendData> {
     }
 }
 
+impl<BackendData: Backend> XdgToplevelIconHandler for AnvilState<BackendData> {
+    fn set_icon(&mut self, _toplevel: XdgToplevel, _wl_surface: WlSurface) {
+        // The committed icon lives in the surface's `ToplevelIconCachedState`
+        // (readable from a window's `wl_surface`), so a shell can pick it up
+        // there; there is nothing to track on the compositor side yet.
+    }
+}
+
 impl<BackendData: Backend> ImageCaptureSourceHandler for AnvilState<BackendData> {
     fn source_destroyed(&mut self, _source: ImageCaptureSource) {
         // Anvil doesn't track sources
@@ -746,6 +761,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
 
+        // Server-side cursor theming and toplevel icons.
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
+        let mut xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&dh);
+        for size in [16, 24, 32, 48, 64] {
+            xdg_toplevel_icon_manager.add_icon_size(size);
+        }
+
         // init input
         let seat_name = backend_data.seat_name();
         let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
@@ -792,6 +814,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            cursor_shape_state,
+            xdg_toplevel_icon_manager,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             cursor_status: CursorImageStatus::default_named(),
