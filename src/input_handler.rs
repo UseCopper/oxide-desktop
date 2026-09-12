@@ -1,6 +1,6 @@
 use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
 
-use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement}};
+use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}};
 
 #[cfg(feature = "udev")]
 use crate::udev::UdevData;
@@ -15,7 +15,7 @@ use smithay::{
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, MotionEvent},
         tablet::{TabletDescriptor, TabletSeatTrait},
         touch::{DownEvent, UpEvent},
     },
@@ -37,6 +37,21 @@ use smithay::backend::input::AbsolutePositionEvent;
 #[cfg(any(feature = "winit", feature = "x11"))]
 use smithay::output::Output;
 use tracing::{debug, error, info};
+
+/// Whether a named cursor is one of the resize arrows.
+fn is_resize_icon(icon: CursorIcon) -> bool {
+    matches!(
+        icon,
+        CursorIcon::WResize
+            | CursorIcon::EResize
+            | CursorIcon::NResize
+            | CursorIcon::SResize
+            | CursorIcon::NwResize
+            | CursorIcon::NeResize
+            | CursorIcon::SwResize
+            | CursorIcon::SeResize
+    )
+}
 
 use crate::state::Backend;
 #[cfg(feature = "udev")]
@@ -238,7 +253,28 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         if wl_pointer::ButtonState::Pressed == state {
-            self.update_keyboard_focus(self.pointer.current_location(), serial);
+            let location = self.pointer.current_location();
+            self.update_keyboard_focus(location, serial);
+
+            // SSD resizing is compositor-owned, so resolve it straight from the
+            // space hit test instead of relying on the client pointer focus.
+            if button == BTN_LEFT {
+                let resize = self.surface_under(location).and_then(|(target, focus_loc)| {
+                    if let PointerFocusTarget::SSD(ssd) = target {
+                        let relative = location - focus_loc;
+                        let window = ssd.window();
+                        window
+                            .resize_edge_at(relative)
+                            .map(|edges| (window, edges, relative))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((window, edges, relative)) = resize {
+                    self.start_ssd_resize(window, edges, serial, button, relative);
+                    return;
+                }
+            }
         } else {
             // End any SSD drag regardless of which surface is under the pointer;
             // the release event may not hit the SSD decoration itself.
@@ -255,6 +291,43 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             },
         );
         pointer.frame(self);
+
+        // An SSD resize pins the cursor to a resize arrow for the duration of
+        // the drag. Recompute it on release so it updates immediately instead
+        // of waiting for the next motion event.
+        if wl_pointer::ButtonState::Released == state {
+            self.refresh_cursor();
+        }
+    }
+
+    /// Recompute the cursor shape from the current pointer position. Used after
+    /// a compositor-owned drag ends.
+    fn refresh_cursor(&mut self) {
+        // Only the resize cursor pinned during an SSD drag needs clearing.
+        // Leave client-provided cursors untouched when clicking on an app.
+        if !matches!(
+            &self.cursor_status,
+            CursorImageStatus::Named(icon) if is_resize_icon(*icon)
+        ) {
+            return;
+        }
+
+        let location = self.pointer.current_location();
+        let status = match self.surface_under(location) {
+            Some((PointerFocusTarget::SSD(ssd), focus_loc)) => {
+                let relative = location - focus_loc;
+                CursorImageStatus::Named(
+                    ssd.window()
+                        .resize_edge_at(relative)
+                        .map(resize_cursor)
+                        .unwrap_or(CursorIcon::Default),
+                )
+            }
+            _ => CursorImageStatus::default_named(),
+        };
+        if self.cursor_status != status {
+            self.cursor_status = status;
+        }
     }
 
     fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
@@ -588,6 +661,36 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
     }
+
+    /// Clamp a pointer position so it stays inside the compositor's outputs.
+    fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        if self.space.outputs().next().is_none() {
+            return pos;
+        }
+
+        let (pos_x, pos_y) = pos.into();
+        let max_x = self.space.outputs().fold(0, |acc, o| {
+            acc + self.space.output_geometry(o).map(|g| g.size.w).unwrap_or(0)
+        });
+        let clamped_x = pos_x.clamp(0.0, (max_x - 1).max(0) as f64);
+        let max_y = self
+            .space
+            .outputs()
+            .find(|o| {
+                self.space
+                    .output_geometry(o)
+                    .is_some_and(|geo| geo.contains((clamped_x as i32, 0)))
+            })
+            .and_then(|o| self.space.output_geometry(o))
+            .map(|g| g.size.h);
+
+        if let Some(max_y) = max_y {
+            let clamped_y = pos_y.clamp(0.0, (max_y - 1).max(0) as f64);
+            (clamped_x, clamped_y).into()
+        } else {
+            (clamped_x, pos_y).into()
+        }
+    }
 }
 
 #[cfg(any(feature = "winit", feature = "x11"))]
@@ -698,7 +801,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     ) {
         let output_geo = self.space.output_geometry(output).unwrap();
 
-        let pos = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        // Keep the pointer inside the compositor's outputs.
+        let pos = self.clamp_coords(evt.position_transformed(output_geo.size) + output_geo.loc.to_f64());
         let serial = SCOUNTER.next_serial();
 
         self.update_ssd_drag_position(pos);
@@ -1016,7 +1120,7 @@ impl AnvilState<UdevData> {
 
         pointer.motion(
             self,
-            under,
+            new_under.clone(),
             &MotionEvent {
                 location: pointer_location,
                 serial,
@@ -1361,34 +1465,6 @@ impl AnvilState<UdevData> {
         );
     }
 
-    fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        if self.space.outputs().next().is_none() {
-            return pos;
-        }
-
-        let (pos_x, pos_y) = pos.into();
-        let max_x = self.space.outputs().fold(0, |acc, o| {
-            acc + self.space.output_geometry(o).map(|g| g.size.w).unwrap_or(0)
-        });
-        let clamped_x = pos_x.clamp(0.0, max_x.max(0) as f64);
-        let max_y = self
-            .space
-            .outputs()
-            .find(|o| {
-                self.space
-                    .output_geometry(o)
-                    .is_some_and(|geo| geo.contains((clamped_x as i32, 0)))
-            })
-            .and_then(|o| self.space.output_geometry(o))
-            .map(|g| g.size.h);
-
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64);
-            (clamped_x, clamped_y).into()
-        } else {
-            (clamped_x, pos_y).into()
-        }
-    }
 }
 
 /// Possible results of a keyboard action

@@ -29,7 +29,7 @@ use smithay::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source},
         keyboard::{Keysym, LedState, XkbConfig},
-        pointer::{CursorImageStatus, Focus, PointerHandle},
+        pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle},
         tablet::TabletSeatHandler,
     },
     output::Output,
@@ -857,7 +857,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                             .expect("Failed to attach X11 Window Manager");
 
                     let cursor = Cursor::load();
-                    let image = cursor.get_image(1, Duration::ZERO);
+                    let image = cursor.get_image(CursorIcon::Default, 1, Duration::ZERO);
                     wm.set_cursor(
                         &image.pixels_rgba,
                         Size::from((image.width as u16, image.height as u16)),

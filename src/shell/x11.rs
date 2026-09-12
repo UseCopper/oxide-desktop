@@ -29,7 +29,8 @@ use tracing::{error, trace};
 use crate::{AnvilState, focus::KeyboardFocusTarget, state::Backend};
 
 use super::{
-    FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeState,
+    FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeGrabState,
+    ResizeState,
     SurfaceData, TouchMoveSurfaceGrab, WindowElement, place_new_window,
 };
 
@@ -200,7 +201,9 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             return;
         };
 
-        let geometry = element.geometry();
+        // Content geometry, not `WindowElement::geometry` which includes SSD
+        // decoration bounds; the resize math works in content space.
+        let geometry = SpaceElement::geometry(&element.0);
         let Some(loc) = self.space.element_location(&element) else {
             return;
         };
@@ -209,22 +212,25 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         if let Some(surface) = element.wl_surface() {
             with_states(&surface, |states| {
                 if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
-                    data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
-                        edges: edges.into(),
+                    data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData::new(
+                        edges.into(),
                         initial_window_location,
                         initial_window_size,
-                    });
+                    ));
                 }
             });
         }
 
+        let start_location = start_data.location;
         let grab = PointerResizeSurfaceGrab {
             start_data,
-            window: element,
-            edges: edges.into(),
-            initial_window_location,
-            initial_window_size,
-            last_window_size: initial_window_size,
+            resize: ResizeGrabState::new(
+                element,
+                edges.into(),
+                initial_window_location,
+                initial_window_size,
+                start_location,
+            ),
         };
 
         let pointer = self.pointer.clone();

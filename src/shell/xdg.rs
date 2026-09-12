@@ -17,7 +17,7 @@ use smithay::{
     },
     utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER, Serial, Size},
     wayland::{
-        compositor::{self, with_states},
+        compositor::with_states,
         seat::WaylandFocus,
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ToplevelCachedState, ToplevelSurface, XdgShellHandler,
@@ -34,8 +34,9 @@ use crate::{
 };
 
 use super::{
-    FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState,
-    SurfaceData, WindowElement, fullscreen_output_geometry, place_new_window,
+    FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge,
+    ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
+    fullscreen_output_geometry, place_new_window,
 };
 use super::ssd::HEADER_BAR_HEIGHT;
 
@@ -50,10 +51,6 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // the surface is not already configured
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
-
-        compositor::add_post_commit_hook(surface.wl_surface(), |state: &mut Self, _, surface| {
-            handle_toplevel_commit(&mut state.space, surface);
-        });
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -95,12 +92,11 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
                 let start_data = touch.grab_start_data().unwrap();
-                tracing::info!(?start_data);
 
-                // If the client disconnects after requesting a move
+                // If the client disconnects after requesting a resize
                 // we can just ignore the request
                 let Some(window) = self.window_for_surface(surface.wl_surface()) else {
-                    tracing::info!("no window");
+                    tracing::debug!("resize request ignored: no window");
                     return;
                 };
 
@@ -113,10 +109,10 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                         .0
                         .same_client_as(&surface.wl_surface().id())
                 {
-                    tracing::info!("different surface");
+                    tracing::debug!("resize request ignored: different surface");
                     return;
                 }
-                let geometry = window.geometry();
+                let geometry = SpaceElement::geometry(&window.0);
                 let loc = self.space.element_location(&window).unwrap();
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
@@ -126,20 +122,23 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                         .get::<RefCell<SurfaceData>>()
                         .unwrap()
                         .borrow_mut()
-                        .resize_state = ResizeState::Resizing(ResizeData {
-                        edges: edges.into(),
-                        initial_window_location,
-                        initial_window_size,
-                    });
+                        .resize_state = ResizeState::Resizing(ResizeData::new(
+                            edges.into(),
+                            initial_window_location,
+                            initial_window_size,
+                        ));
                 });
 
+                let start_location = start_data.location;
                 let grab = TouchResizeSurfaceGrab {
                     start_data,
-                    window,
-                    edges: edges.into(),
-                    initial_window_location,
-                    initial_window_size,
-                    last_window_size: initial_window_size,
+                    resize: ResizeGrabState::new(
+                        window,
+                        edges.into(),
+                        initial_window_location,
+                        initial_window_size,
+                        start_location,
+                    ),
                 };
 
                 touch.set_grab(self, grab, serial);
@@ -176,7 +175,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             return;
         }
 
-        let geometry = window.geometry();
+        let geometry = SpaceElement::geometry(&window.0);
         let Some(loc) = self.space.element_location(&window) else {
             return;
         };
@@ -184,21 +183,24 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
 
         with_states(surface.wl_surface(), |states| {
             if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
-                data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
-                    edges: edges.into(),
+                data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData::new(
+                    edges.into(),
                     initial_window_location,
                     initial_window_size,
-                });
+                ));
             }
         });
 
+        let start_location = start_data.location;
         let grab = PointerResizeSurfaceGrab {
             start_data,
-            window,
-            edges: edges.into(),
-            initial_window_location,
-            initial_window_size,
-            last_window_size: initial_window_size,
+            resize: ResizeGrabState::new(
+                window,
+                edges.into(),
+                initial_window_location,
+                initial_window_size,
+                start_location,
+            ),
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -744,52 +746,89 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 }
 
-/// Should be called on `WlSurface::commit` of xdg toplevel
-fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface) -> Option<()> {
+/// Update a toplevel's committed geometry and drive the resize pipeline after a
+/// buffer commit. Must run after `on_commit_buffer_handler`/`Window::on_commit`
+/// so the resize snapshot matches the buffer that will be rendered.
+pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface) -> Option<()> {
     let window = space
         .elements()
         .find(|w| w.wl_surface().as_deref() == Some(surface))
         .cloned()?;
 
     let mut window_loc = space.element_location(&window)?;
-    let geometry = window.geometry();
+    // `resize_content_size` uses the surface bbox for SSD windows so the move
+    // and resize land on the same commit; client-decorated windows keep using
+    // their declared geometry.
+    let geometry = window.committed_content_size();
 
-    let new_loc: Point<Option<i32>, Logical> = with_states(window.wl_surface().as_deref()?, |states| {
-        let data = states.data_map.get::<RefCell<SurfaceData>>()?.borrow_mut();
-
-        if let ResizeState::Resizing(resize_data) = data.resize_state {
-            let edges = resize_data.edges;
-            let loc = resize_data.initial_window_location;
-            let size = resize_data.initial_window_size;
-
-            // If the window is being resized by top or left, its location must be adjusted
-            // accordingly.
-            edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
-                let new_x = edges
-                    .intersects(ResizeEdge::LEFT)
-                    .then_some(loc.x + (size.w - geometry.size.w));
-
-                let new_y = edges
-                    .intersects(ResizeEdge::TOP)
-                    .then_some(loc.y + (size.h - geometry.size.h));
-
-                (new_x, new_y).into()
-            })
-        } else {
-            None
+    // Read the *committed* resize state (if any) and snapshot the committed
+    // geometry atomically with the buffer. The displayed frame is always taken
+    // from this snapshot, so a request can never advance what is drawn. This
+    // covers the in-progress state and the final ack/commit states.
+    let resize = with_states(window.wl_surface().as_deref()?, |states| {
+        let data = states.data_map.get::<RefCell<SurfaceData>>()?;
+        let mut data = data.borrow_mut();
+        match &mut data.resize_state {
+            ResizeState::Resizing(resize)
+            | ResizeState::WaitingForFinalAck(resize, _)
+            | ResizeState::WaitingForCommit(resize) => {
+                resize.committed_size = geometry;
+                Some(*resize)
+            }
+            ResizeState::NotResizing => None,
         }
-    })?;
+    });
 
-    if let Some(new_x) = new_loc.x {
-        window_loc.x = new_x;
-    }
-    if let Some(new_y) = new_loc.y {
-        window_loc.y = new_y;
+    let new_loc: Option<Point<Option<i32>, Logical>> = resize
+        .filter(|resize| resize.edges.intersects(ResizeEdge::TOP_LEFT))
+        .map(|resize| {
+            let loc = resize.initial_window_location;
+            let size = resize.initial_window_size;
+
+            // The edge opposite the one being dragged stays fixed.
+            let new_x = resize
+                .edges
+                .intersects(ResizeEdge::LEFT)
+                .then_some(loc.x + (size.w - geometry.w));
+
+            let new_y = resize
+                .edges
+                .intersects(ResizeEdge::TOP)
+                .then_some(loc.y + (size.h - geometry.h));
+
+            (new_x, new_y).into()
+        });
+
+    if let Some(new_loc) = new_loc {
+        if let Some(new_x) = new_loc.x {
+            window_loc.x = new_x;
+        }
+        if let Some(new_y) = new_loc.y {
+            window_loc.y = new_y;
+        }
+
+        if new_loc.x.is_some() || new_loc.y.is_some() {
+            // If TOP or LEFT side of the window got resized, we have to move it
+            space.map_element(window.clone(), window_loc, false);
+        }
     }
 
-    if new_loc.x.is_some() || new_loc.y.is_some() {
-        // If TOP or LEFT side of the window got resized, we have to move it
-        space.map_element(window, window_loc, false);
+    // Advance the serialized resize pipeline immediately: if the latest intended
+    // size differs from the size that was just committed, request it now instead
+    // of waiting for another pointer frame. This runs for every resize edge.
+    advance_resize_configure(&window, space);
+
+    // The final commit has landed; leave the resize state so the displayed
+    // geometry becomes the plain committed geometry.
+    if let Some(surface) = window.wl_surface() {
+        with_states(&surface, |states| {
+            if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                let mut data = data.borrow_mut();
+                if matches!(data.resize_state, ResizeState::WaitingForCommit(_)) {
+                    data.resize_state = ResizeState::NotResizing;
+                }
+            }
+        });
     }
 
     Some(())

@@ -205,7 +205,7 @@ pub fn run_winit() {
 
     info!("Initialization completed, starting the main loop.");
 
-    let mut pointer_element = PointerElement::default();
+    let mut pointer_element = PointerElement::with_cursor(crate::cursor::Cursor::load());
 
     while state.running.load(Ordering::SeqCst) {
         let status = winit.dispatch_new_events(|event| match event {
@@ -233,6 +233,21 @@ pub fn run_winit() {
             break;
         }
 
+        // Dispatch pending Wayland client requests (configure acks and buffer
+        // commits) BEFORE rendering. Otherwise a commit dispatched after the
+        // render is only shown on the next loop iteration, adding a whole frame
+        // of latency to every resize step.
+        if event_loop
+            .dispatch(Some(Duration::from_millis(1)), &mut state)
+            .is_err()
+        {
+            state.running.store(false, Ordering::SeqCst);
+            break;
+        }
+        state.space.refresh();
+        state.popups.cleanup();
+        display_handle.flush_clients().unwrap();
+
         // drawing logic
         {
             let now = state.clock.now();
@@ -254,7 +269,9 @@ pub fn run_winit() {
             if reset {
                 state.cursor_status = CursorImageStatus::default_named();
             }
-            let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
+            // The cursor is drawn by the compositor (including named shapes),
+            // so keep the host cursor hidden.
+            let cursor_visible = false;
 
             pointer_element.set_status(state.cursor_status.clone());
 
@@ -435,15 +452,6 @@ pub fn run_winit() {
                 }
                 Err(err) => warn!("Rendering error: {}", err),
             }
-        }
-
-        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
-        if result.is_err() {
-            state.running.store(false, Ordering::SeqCst);
-        } else {
-            state.space.refresh();
-            state.popups.cleanup();
-            display_handle.flush_clients().unwrap();
         }
 
         #[cfg(feature = "debug")]

@@ -55,6 +55,8 @@ mod xdg;
 pub use self::element::*;
 pub use self::grabs::*;
 
+use self::xdg::handle_toplevel_commit;
+
 fn fullscreen_output_geometry(
     wl_surface: &WlSurface,
     wl_output: Option<&wl_output::WlOutput>,
@@ -185,6 +187,14 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                 window.0.on_commit();
 
                 if &root == surface {
+                    // Snapshot the resize state here, after
+                    // `on_commit_buffer_handler`/`Window::on_commit` have refreshed
+                    // the render surface size and bounding box. Post-commit hooks
+                    // run *before* this handler in Smithay, so snapshotting there
+                    // would read the previous commit's size and let the SSD frame
+                    // lead the client buffer by one frame.
+                    handle_toplevel_commit(&mut self.space, surface);
+
                     let buffer_offset = with_states(surface, |states| {
                         states
                             .cached_state
@@ -336,18 +346,23 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             }
         }
 
-        with_states(surface, |states| {
-            let mut data = states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut();
+        // For xdg toplevels `handle_toplevel_commit` clears this *after* it has
+        // anchored the final location, so the move stays atomic with the commit.
+        // Windows without a toplevel (e.g. X11) have no such hook and finish here.
+        #[cfg_attr(not(feature = "xwayland"), allow(irrefutable_let_patterns))]
+        if window.0.toplevel().is_none() {
+            with_states(surface, |states| {
+                let mut data = states
+                    .data_map
+                    .get::<RefCell<SurfaceData>>()
+                    .unwrap()
+                    .borrow_mut();
 
-            // Finish resizing.
-            if let ResizeState::WaitingForCommit(_) = data.resize_state {
-                data.resize_state = ResizeState::NotResizing;
-            }
-        });
+                if let ResizeState::WaitingForCommit(_) = data.resize_state {
+                    data.resize_state = ResizeState::NotResizing;
+                }
+            });
+        }
 
         return;
     }

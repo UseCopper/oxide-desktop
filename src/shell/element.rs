@@ -17,9 +17,10 @@ use smithay::{
     input::{
         Seat,
         pointer::{
-            AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
-            GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
+            AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
+            GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
+            GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent,
+            PointerTarget, RelativeMotionEvent,
         },
         tablet::tool::TabletToolTarget,
         touch::{FrameMarker, TouchTarget},
@@ -35,8 +36,8 @@ use smithay::{
 };
 
 use super::ssd::{
-    BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, icon_offset, content_offset,
-    fullscreen_content_offset,
+    BTN_LEFT, BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, RESIZE_MARGIN, icon_offset,
+    content_offset, fullscreen_content_offset, resize_cursor,
 };
 use crate::{AnvilState, focus::PointerFocusTarget, state::Backend};
 
@@ -49,14 +50,23 @@ impl WindowElement {
         location: Point<f64, Logical>,
         window_type: WindowSurfaceType,
     ) -> Option<(PointerFocusTarget, Point<i32, Logical>)> {
-        let state = self.decoration_state();
-        if state.is_ssd && location.y < HEADER_BAR_HEIGHT as f64 {
-            return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
+        let is_ssd = self.decoration_state().is_ssd;
+        if is_ssd {
+            let size = self.geometry().size;
+            let in_header = location.y < HEADER_BAR_HEIGHT as f64
+                && location.x >= 0.0
+                && location.x < size.w as f64;
+            let edge = self.resize_edge_at(location);
+            if in_header || edge.is_some() {
+                return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
+            }
         }
-        let offset = if state.is_ssd && state.header_bar.fullscreen {
-            fullscreen_content_offset()
-        } else if state.is_ssd {
-            content_offset()
+        let offset = if is_ssd {
+            if self.decoration_state().header_bar.fullscreen {
+                fullscreen_content_offset()
+            } else {
+                content_offset()
+            }
         } else {
             Point::default()
         };
@@ -169,32 +179,60 @@ impl WaylandFocus for SSD {
     }
 }
 
+impl SSD {
+    /// The window this decoration belongs to.
+    pub fn window(&self) -> WindowElement {
+        self.0.clone()
+    }
+
+    /// Track the pointer over the decoration and show a resize cursor on edges.
+    ///
+    /// `location` is window-relative: Smithay already subtracts the focus offset
+    /// (the window origin) before invoking the pointer target.
+    fn update_hover<BackendData: Backend>(
+        &self,
+        data: &mut AnvilState<BackendData>,
+        location: Point<f64, Logical>,
+    ) {
+        let is_ssd = self.0.decoration_state().is_ssd;
+        // Use the exact same hit test as pointer focus and button handling so
+        // the cursor, focus and click always agree.
+        let status = if is_ssd {
+            CursorImageStatus::Named(
+                self.0
+                    .resize_edge_at(location)
+                    .map(resize_cursor)
+                    .unwrap_or(CursorIcon::Default),
+            )
+        } else {
+            CursorImageStatus::default_named()
+        };
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.pointer_enter(location);
+        }
+        if data.cursor_status != status {
+            data.cursor_status = status;
+        }
+    }
+}
+
 impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
     fn enter(
         &self,
         _seat: &Seat<AnvilState<BackendData>>,
-        _data: &mut AnvilState<BackendData>,
+        data: &mut AnvilState<BackendData>,
         event: &MotionEvent,
     ) {
-        // NOTE: Smithay's pointer handling already subtracts the focus offset
-        // (`under.1`, which is the window origin for SSD) before calling us,
-        // so `event.location` is already window-relative here. Do NOT subtract
-        // the origin again.
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-        }
+        self.update_hover(data, event.location);
     }
     fn motion(
         &self,
         _seat: &Seat<AnvilState<BackendData>>,
-        _data: &mut AnvilState<BackendData>,
+        data: &mut AnvilState<BackendData>,
         event: &MotionEvent,
     ) {
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-        }
+        self.update_hover(data, event.location);
     }
     fn relative_motion(
         &self,
@@ -209,13 +247,26 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
         data: &mut AnvilState<BackendData>,
         event: &ButtonEvent,
     ) {
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            if event.state == ButtonState::Pressed {
-                state.header_bar.clicked(seat, data, &self.0, event.serial);
-            } else if event.state == ButtonState::Released {
-                data.end_ssd_drag();
+        if !self.0.decoration_state().is_ssd {
+            return;
+        }
+        if event.state == ButtonState::Pressed {
+            // Resolve the edge exactly like pointer focus does, before taking a
+            // mutable borrow on the decoration state.
+            let pointer_loc = self.0.decoration_state().header_bar.pointer_loc;
+            if event.button == BTN_LEFT
+                && let Some(pointer) = pointer_loc
+                && let Some(edges) = self.0.resize_edge_at(pointer)
+            {
+                data.start_ssd_resize(self.0.clone(), edges, event.serial, event.button, pointer);
+                return;
             }
+            self.0
+                .decoration_state()
+                .header_bar
+                .clicked(seat, data, &self.0, event.serial);
+        } else if event.state == ButtonState::Released {
+            data.end_ssd_drag();
         }
     }
     fn axis(
@@ -229,7 +280,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
     fn leave(
         &self,
         _seat: &Seat<AnvilState<BackendData>>,
-        _data: &mut AnvilState<BackendData>,
+        data: &mut AnvilState<BackendData>,
         _serial: Serial,
         _time: InputTime,
     ) {
@@ -237,6 +288,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
         if state.is_ssd {
             state.header_bar.pointer_leave();
         }
+        data.cursor_status = CursorImageStatus::default_named();
     }
     fn gesture_swipe_begin(
         &self,
@@ -304,11 +356,23 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         event: &smithay::input::touch::DownEvent,
     ) {
         // Same as pointer: touch handling already subtracts the focus offset.
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-            state.header_bar.touch_down(seat, data, &self.0, event.serial);
+        if !self.0.decoration_state().is_ssd {
+            return;
         }
+        if let Some(edges) = self.0.resize_edge_at(event.location) {
+            data.start_ssd_touch_resize(
+                self.0.clone(),
+                edges,
+                event.serial,
+                event.slot,
+                event.location,
+            );
+            return;
+        }
+        self.0
+            .decoration_state()
+            .header_bar
+            .touch_down(seat, data, &self.0, event.serial);
     }
 
     fn up(
@@ -477,6 +541,8 @@ impl SpaceElement for WindowElement {
     fn geometry(&self) -> Rectangle<i32, Logical> {
         let mut geo = SpaceElement::geometry(&self.0);
         if self.decoration_state().is_ssd {
+            // Match the size used for rendering and resize math.
+            geo.size = self.resize_content_size();
             geo.size.w += 2 * BORDER_WIDTH;
             geo.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
         }
@@ -487,12 +553,27 @@ impl SpaceElement for WindowElement {
         if self.decoration_state().is_ssd {
             bbox.size.w += 2 * BORDER_WIDTH;
             bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
+            // Include the outside resize band so `Space` hit testing considers
+            // points just beyond the decorated window.
+            bbox.loc -= Point::from((RESIZE_MARGIN, RESIZE_MARGIN));
+            bbox.size.w += 2 * RESIZE_MARGIN;
+            bbox.size.h += 2 * RESIZE_MARGIN;
         }
         bbox
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
         if self.decoration_state().is_ssd {
-            if point.y < HEADER_BAR_HEIGHT as f64 {
+            let size = self.geometry().size;
+            let edge = self.resize_edge_at(*point);
+            if point.y < HEADER_BAR_HEIGHT as f64
+                && point.x >= 0.0
+                && point.x < size.w as f64
+            {
+                return true;
+            }
+            // The resize grip is compositor-owned, so accept input there even
+            // though it sits outside the client surface.
+            if edge.is_some() {
                 return true;
             }
             let state = self.decoration_state();
@@ -560,12 +641,13 @@ where
         let window_bbox = SpaceElement::bbox(&self.0);
 
         if self.decoration_state().is_ssd && !window_bbox.is_empty() {
-            let window_geo = SpaceElement::geometry(&self.0);
-            let content_size = window_geo.size;
+            // Use the same content size as the resize/position math so the
+            // frame and its location update on the same commit.
+            let content_size = self.resize_content_size();
 
             let mut state = self.decoration_state();
             let fullscreen = state.header_bar.fullscreen;
-            let width = window_geo.size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
+            let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
             state.header_bar.redraw(width.max(0) as u32, content_size);
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();

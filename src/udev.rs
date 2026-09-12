@@ -271,7 +271,7 @@ pub fn run_udev() {
         backends: HashMap::new(),
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
-        pointer_element: PointerElement::default(),
+        pointer_element: PointerElement::with_cursor(crate::cursor::Cursor::load()),
         #[cfg(feature = "debug")]
         fps_texture: None,
         debug_flags: DebugFlags::empty(),
