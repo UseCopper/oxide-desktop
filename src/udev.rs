@@ -1677,7 +1677,7 @@ fn render_surface<'a>(
         .map(|render_frame_result| {
             #[cfg(feature = "renderer_sync")]
             if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
-                element.sync.wait();
+                let _ = element.sync.wait();
             }
             (!render_frame_result.is_empty, render_frame_result.states)
         })

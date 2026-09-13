@@ -62,6 +62,7 @@ udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_udev", "s
 x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
 xwayland = ["smithay/xwayland", "smithay/backend_libei"]
 libei = []
+renderer_sync = []
 debug = ["image", "fps_ticker", "renderdoc"]
 egl = ["smithay/backend_egl", "smithay/renderer_gl", "wayland-egl"]
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client"]
