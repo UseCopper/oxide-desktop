@@ -63,7 +63,7 @@ use smithay::{
     },
     input::{
         keyboard::LedState,
-        pointer::{CursorImageAttributes, CursorImageStatus},
+        pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     },
     output::{Mode as WlMode, Output, PhysicalProperties},
     reexports::{
@@ -1118,6 +1118,12 @@ impl AnvilState<UdevData> {
     }
 
     fn device_changed(&mut self, node: DrmNode) {
+        // Snapshot floating-window geometry against the current output layout so
+        // it can be reapplied proportionally after any connectors change.
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            crate::shell::capture_relative_geometries(&self.space, &output);
+        }
+
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
         } else {
@@ -1159,9 +1165,15 @@ impl AnvilState<UdevData> {
 
         // fixup window coordinates
         crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            crate::shell::apply_relative_geometries(&mut self.space, &output);
+        }
     }
 
     fn device_removed(&mut self, node: DrmNode) {
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            crate::shell::capture_relative_geometries(&self.space, &output);
+        }
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
         } else {
@@ -1196,6 +1208,9 @@ impl AnvilState<UdevData> {
         }
 
         crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            crate::shell::apply_relative_geometries(&mut self.space, &output);
+        }
     }
 
     fn frame_finish(&mut self, dev_id: DrmNode, crtc: crtc::Handle, metadata: &mut Option<DrmEventMetadata>) {
@@ -1441,7 +1456,7 @@ impl AnvilState<UdevData> {
         let frame = self
             .backend_data
             .pointer_image
-            .get_image(1 /*scale*/, self.clock.now().into());
+            .get_image(CursorIcon::Default, 1, Duration::ZERO);
 
         let primary_gpu = self.backend_data.primary_gpu;
         let render_node = surface.render_node.unwrap_or(primary_gpu);
@@ -1662,7 +1677,7 @@ fn render_surface<'a>(
         .map(|render_frame_result| {
             #[cfg(feature = "renderer_sync")]
             if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
-                element.sync.wait();
+                let _ = element.sync.wait();
             }
             (!render_frame_result.is_empty, render_frame_result.states)
         })

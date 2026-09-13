@@ -45,7 +45,7 @@ use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT};
 /// Only server-decorated windows reserve room for the compositor's header bar.
 /// Client-decorated windows have to fill the whole output, otherwise the
 /// undecorated strip they leave behind is never painted (black).
-fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+pub(crate) fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
     if is_ssd {
         Size::from((output.w, (output.h - HEADER_BAR_HEIGHT).max(0)))
     } else {
@@ -56,7 +56,7 @@ fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32
 /// Size a toplevel should use while maximized, leaving room for the SSD frame
 /// (borders + header bar) so the decorated window fits inside the output
 /// instead of hanging off the right/bottom edge.
-fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+pub(crate) fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
     if is_ssd {
         Size::from((
             (output.w - 2 * BORDER_WIDTH).max(0),
@@ -65,6 +65,30 @@ fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, 
     } else {
         output
     }
+}
+
+/// Where to anchor a window being dragged out of the maximized state so the
+/// pointer keeps grabbing the same spot on the titlebar: the same horizontal
+/// fraction of the width, and the same vertical offset from the top.
+fn restore_drag_location(
+    window_loc: Point<i32, Logical>,
+    decorated_size: Size<i32, Logical>,
+    grab: Point<f64, Logical>,
+    restore: Option<Size<i32, Logical>>,
+    is_ssd: bool,
+) -> Point<i32, Logical> {
+    let rel_x = grab.x - window_loc.x as f64;
+    let rel_y = grab.y - window_loc.y as f64;
+    let border = if is_ssd { 2 * BORDER_WIDTH } else { 0 };
+    let old_w = decorated_size.w as f64;
+    let new_w = restore
+        .map(|size| (size.w + border) as f64)
+        .unwrap_or(old_w);
+    let fraction = if old_w > 0.0 { rel_x / old_w } else { 0.5 };
+    Point::from((
+        (grab.x - fraction * new_w).round() as i32,
+        (grab.y - rel_y).round() as i32,
+    ))
 }
 
 impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
@@ -480,14 +504,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // The window hasn't been mapped yet, use the primary output instead
             .or_else(|| self.space.outputs().next());
 
-        // Remember where the window was so unmaximizing can put it back.
+        // Remember where the window was so unmaximizing can put it back, stored
+        // as a fraction of the work area so it survives resolution changes.
         let already_maximized =
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
-        if !already_maximized
-            && let Some(location) = self.space.element_location(&window)
-        {
-            let size = SpaceElement::geometry(&window.0).size;
-            window.decoration_state().maximize_restore = Some((location, size));
+        if !already_maximized {
+            window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
         }
 
         surface.with_pending_state(|state| {
@@ -516,12 +538,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         let restore = window.decoration_state().maximize_restore.take();
+        let geometry = restore.and_then(|rel| super::absolute_geometry(&self.space, &window, rel));
 
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = restore.as_ref().map(|(_, size)| *size);
+            state.size = geometry.map(|(_, size)| size);
         });
-        if let Some((location, _)) = restore {
+        if let Some((location, _)) = geometry {
             self.space.map_element(window, location, false);
         }
 
@@ -560,15 +583,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 return;
             };
 
-            let content_size = SpaceElement::geometry(&window.0).size;
-            let location = self.space.element_location(&window);
+            let restore = super::relative_geometry_of(&self.space, &window);
             let mut state = window.decoration_state();
             state.header_bar.fullscreen = true;
             state.header_bar.pointer_loc = None;
             if state.fullscreen_restore.is_none() {
-                if let Some(location) = location {
-                    state.fullscreen_restore = Some((location, content_size));
-                }
+                state.fullscreen_restore = restore;
             }
             drop(state);
 
@@ -602,7 +622,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     fn unfullscreen_request_xdg(&mut self, surface: &ToplevelSurface) {
         let wl_surface = surface.wl_surface();
-        let restore: Option<(WindowElement, Point<i32, Logical>, Size<i32, Logical>)> = self
+        let restore = self
             .space
             .elements()
             .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
@@ -610,18 +630,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let mut state = window.decoration_state();
                 state.header_bar.fullscreen = false;
                 state.header_bar.pointer_loc = None;
-                state
-                    .fullscreen_restore
-                    .take()
-                    .map(|(loc, size)| (window.clone(), loc, size))
+                state.fullscreen_restore.take().map(|rel| (window.clone(), rel))
             });
 
+        let geometry = restore
+            .as_ref()
+            .and_then(|(window, rel)| super::absolute_geometry(&self.space, window, *rel));
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
-            state.size = restore.as_ref().map(|(_, _, size)| *size);
+            state.size = geometry.map(|(_, size)| size);
             state.fullscreen_output.take()
         });
-        if let Some((window, location, _)) = restore {
+        if let Some((location, _)) = geometry
+            && let Some((window, _)) = restore
+        {
             self.space.map_element(window, location, false);
         }
         if let Some(output) = ret.and_then(|output| Output::from_resource(&output)) {
@@ -668,40 +690,40 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-                // If surface is maximized then unmaximize it
-                let changed = surface.with_pending_state(|state| {
-                    if state.states.unset(xdg_toplevel::State::Maximized) {
-                        state.size = None;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    surface.send_configure();
+        // If the surface is maximized, unmaximize it and keep the touch over
+        // the same spot on the titlebar while the window restores.
+        if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
+            let decorated_size = self
+                .space
+                .element_geometry(&window)
+                .map(|geo| geo.size)
+                .unwrap_or_default();
+            let restore = window.decoration_state().maximize_restore.take();
+            let restore_size = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, size)| size);
+            initial_window_location = restore_drag_location(
+                initial_window_location,
+                decorated_size,
+                start_data.location,
+                restore_size,
+                window.is_ssd(),
+            );
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
+                state.size = restore_size;
+            });
+            surface.send_configure();
+        }
 
-                    // NOTE: In real compositor mouse location should be mapped to a new window size
-                    // For example, you could:
-                    // 1) transform mouse pointer position from compositor space to window space (location relative)
-                    // 2) divide the x coordinate by width of the window to get the percentage
-                    //   - 0.0 would be on the far left of the window
-                    //   - 0.5 would be in middle of the window
-                    //   - 1.0 would be on the far right of the window
-                    // 3) multiply the percentage by new window width
-                    // 4) by doing that, drag will look a lot more natural
-                    //
-                    // but for anvil needs setting location to pointer location is fine
-                    initial_window_location = start_data.location.to_i32_round();
-                }
+        let grab = TouchMoveSurfaceGrab {
+            start_data,
+            window,
+            initial_window_location,
+        };
 
-                let grab = TouchMoveSurfaceGrab {
-                    start_data,
-                    window,
-                    initial_window_location,
-                };
-
-                touch.set_grab(self, grab, serial);
-                return;
+        touch.set_grab(self, grab, serial);
+        return;
             }
         }
 
@@ -738,31 +760,30 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         let mut initial_window_location = self.space.element_location(&window).unwrap();
 
-        // If surface is maximized then unmaximize it
-        let changed = surface.with_pending_state(|state| {
-            if state.states.unset(xdg_toplevel::State::Maximized) {
-                state.size = None;
-                true
-            } else {
-                false
-            }
-        });
-        if changed {
+        // If the surface is maximized, unmaximize it and keep the pointer over
+        // the same spot on the titlebar while the window restores.
+        if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
+            let decorated_size = self
+                .space
+                .element_geometry(&window)
+                .map(|geo| geo.size)
+                .unwrap_or_default();
+            let restore = window.decoration_state().maximize_restore.take();
+            let restore_size = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, size)| size);
+            initial_window_location = restore_drag_location(
+                initial_window_location,
+                decorated_size,
+                start_data.location,
+                restore_size,
+                window.is_ssd(),
+            );
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
+                state.size = restore_size;
+            });
             surface.send_configure();
-
-            // NOTE: In real compositor mouse location should be mapped to a new window size
-            // For example, you could:
-            // 1) transform mouse pointer position from compositor space to window space (location relative)
-            // 2) divide the x coordinate by width of the window to get the percentage
-            //   - 0.0 would be on the far left of the window
-            //   - 0.5 would be in middle of the window
-            //   - 1.0 would be on the far right of the window
-            // 3) multiply the percentage by new window width
-            // 4) by doing that, drag will look a lot more natural
-            //
-            // but for anvil needs setting location to pointer location is fine
-            let pos = pointer.current_location();
-            initial_window_location = (pos.x as i32, pos.y as i32).into();
         }
 
         let grab = PointerMoveSurfaceGrab {
@@ -896,4 +917,27 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_drag_keeps_relative_grab() {
+        let loc = Point::from((0, 0));
+        let decorated = Size::from((1280, 800));
+        let grab = Point::from((640.0, 15.0));
+        let restore = Some(Size::from((640, 480)));
+        // new decorated width = 640 + 4 = 644; middle -> 322
+        // origin = (640 - 322, 15 - 15) = (318, 0)
+        assert_eq!(
+            restore_drag_location(loc, decorated, grab, restore, true),
+            Point::from((318, 0))
+        );
+
+        // no restore size -> fraction of the current width is unchanged
+        let out = restore_drag_location(loc, decorated, grab, None, true);
+        assert_eq!(out, Point::from((0, 0)));
+    }
 }
