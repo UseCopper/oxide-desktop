@@ -55,6 +55,8 @@ mod xdg;
 pub use self::element::*;
 pub use self::grabs::*;
 
+use self::xdg::handle_toplevel_commit;
+
 fn fullscreen_output_geometry(
     wl_surface: &WlSurface,
     wl_output: Option<&wl_output::WlOutput>,
@@ -142,7 +144,9 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                 #[cfg(feature = "udev")]
                 if let Some(acquire_point) = acquire_point {
                     if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        let client = surface.client().unwrap();
+                        let Some(client) = surface.client() else {
+                            return;
+                        };
                         let res = state.handle.insert_source(source, move |_, _, data| {
                             let dh = data.display_handle.clone();
                             data.client_compositor_state(&client).blocker_cleared(data, &dh);
@@ -183,6 +187,14 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                 window.0.on_commit();
 
                 if &root == surface {
+                    // Snapshot the resize state here, after
+                    // `on_commit_buffer_handler`/`Window::on_commit` have refreshed
+                    // the render surface size and bounding box. Post-commit hooks
+                    // run *before* this handler in Smithay, so snapshotting there
+                    // would read the previous commit's size and let the SSD frame
+                    // lead the client buffer by one frame.
+                    handle_toplevel_commit(&mut self.space, surface);
+
                     let buffer_offset = with_states(surface, |states| {
                         states
                             .cached_state
@@ -192,8 +204,9 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                             .take()
                     });
 
-                    if let Some(buffer_offset) = buffer_offset {
-                        let current_loc = self.space.element_location(&window).unwrap();
+                    if let Some(buffer_offset) = buffer_offset
+                        && let Some(current_loc) = self.space.element_location(&window)
+                    {
                         self.space.map_element(window, current_loc + buffer_offset, false);
                     }
                 }
@@ -206,8 +219,8 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             with_states(surface, |states| {
                 let cursor_image_attributes = states.data_map.get::<CursorImageSurfaceData>();
 
-                if let Some(mut cursor_image_attributes) =
-                    cursor_image_attributes.map(|attrs| attrs.lock().unwrap())
+                if let Some(Ok(mut cursor_image_attributes)) =
+                    cursor_image_attributes.map(|attrs| attrs.lock())
                 {
                     let buffer_delta = states
                         .cached_state
@@ -223,8 +236,9 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             });
         }
 
-        if matches!(&self.dnd_icon, Some(icon) if &icon.surface == surface) {
-            let dnd_icon = self.dnd_icon.as_mut().unwrap();
+        if matches!(&self.dnd_icon, Some(icon) if &icon.surface == surface)
+            && let Some(dnd_icon) = self.dnd_icon.as_mut()
+        {
             with_states(&dnd_icon.surface, |states| {
                 let buffer_delta = states
                     .cached_state
@@ -254,12 +268,18 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
         _layer: Layer,
         namespace: String,
     ) {
-        let output = wl_output
+        let Some(output) = wl_output
             .as_ref()
             .and_then(Output::from_resource)
-            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            tracing::warn!("Dropping layer surface with no output available");
+            return;
+        };
         let mut map = layer_map_for_output(&output);
-        map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
+        if let Err(err) = map.map_layer(&LayerSurface::new(surface, namespace)) {
+            tracing::warn!(?err, "Failed to map layer surface");
+        }
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
@@ -326,18 +346,23 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             }
         }
 
-        with_states(surface, |states| {
-            let mut data = states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut();
+        // For xdg toplevels `handle_toplevel_commit` clears this *after* it has
+        // anchored the final location, so the move stays atomic with the commit.
+        // Windows without a toplevel (e.g. X11) have no such hook and finish here.
+        #[cfg_attr(not(feature = "xwayland"), allow(irrefutable_let_patterns))]
+        if window.0.toplevel().is_none() {
+            with_states(surface, |states| {
+                let mut data = states
+                    .data_map
+                    .get::<RefCell<SurfaceData>>()
+                    .unwrap()
+                    .borrow_mut();
 
-            // Finish resizing.
-            if let ResizeState::WaitingForCommit(_) = data.resize_state {
-                data.resize_state = ResizeState::NotResizing;
-            }
-        });
+                if let ResizeState::WaitingForCommit(_) = data.resize_state {
+                    data.resize_state = ResizeState::NotResizing;
+                }
+            });
+        }
 
         return;
     }
@@ -423,13 +448,20 @@ fn place_new_window(
         });
     }
 
+    // Guard against tiny outputs where the random range would be empty (panics in `Uniform::new`).
     let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
     let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let x_range = Uniform::new(output_geometry.loc.x, max_x);
-    let y_range = Uniform::new(output_geometry.loc.y, max_y);
     let mut rng = rand::thread_rng();
-    let x = x_range.sample(&mut rng);
-    let y = y_range.sample(&mut rng);
+    let x = if max_x > output_geometry.loc.x {
+        Uniform::new(output_geometry.loc.x, max_x).sample(&mut rng)
+    } else {
+        output_geometry.loc.x
+    };
+    let y = if max_y > output_geometry.loc.y {
+        Uniform::new(output_geometry.loc.y, max_y).sample(&mut rng)
+    } else {
+        output_geometry.loc.y
+    };
 
     space.map_element(window.clone(), (x, y), activate);
 }

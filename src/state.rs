@@ -29,14 +29,17 @@ use smithay::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source},
         keyboard::{Keysym, LedState, XkbConfig},
-        pointer::{CursorImageStatus, Focus, PointerHandle},
+        pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle},
         tablet::TabletSeatHandler,
     },
     output::Output,
     reexports::{
         calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic},
-        wayland_protocols::xdg::decoration::{
-            self as xdg_decoration, zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+        wayland_protocols::xdg::{
+            decoration::{
+                self as xdg_decoration, zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            },
+            shell::server::xdg_toplevel::XdgToplevel,
         },
         wayland_server::{
             Client, Display, DisplayHandle, Resource,
@@ -48,6 +51,7 @@ use smithay::{
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent, with_states},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufFeedback,
         fifo::{FifoBarrierCachedState, FifoManagerState},
         fixes::FixesState,
@@ -99,6 +103,7 @@ use smithay::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
         xdg_foreign::{XdgForeignHandler, XdgForeignState},
+        xdg_toplevel_icon::{XdgToplevelIconHandler, XdgToplevelIconManager},
     },
 };
 
@@ -106,7 +111,7 @@ use smithay::{
 use crate::cursor::Cursor;
 use crate::{
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::WindowElement,
+    shell::{WindowElement, ssd::SSDDrag},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -166,6 +171,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub image_capture_source_state: ImageCaptureSourceState,
     pub output_capture_source_state: OutputCaptureSourceState,
     pub image_copy_capture_state: ImageCopyCaptureState,
+    pub cursor_shape_state: CursorShapeManagerState,
+    pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
 
     pub dnd_icon: Option<DndIcon>,
 
@@ -187,6 +194,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub renderdoc: Option<renderdoc::RenderDoc<renderdoc::V141>>,
 
     pub show_window_preview: bool,
+
+    pub minimized: Vec<(WindowElement, Point<i32, Logical>)>,
+    pub ssd_drag: Option<SSDDrag>,
 }
 
 #[derive(Debug)]
@@ -217,8 +227,12 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
 
         match type_ {
             GrabType::Pointer => {
-                let pointer = seat.get_pointer().unwrap();
-                let start_data = pointer.grab_start_data().unwrap();
+                let Some(pointer) = seat.get_pointer() else {
+                    return;
+                };
+                let Some(start_data) = pointer.grab_start_data() else {
+                    return;
+                };
                 pointer.set_grab(
                     self,
                     DnDGrab::new_pointer(&self.display_handle, start_data, source, seat),
@@ -227,8 +241,12 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
                 );
             }
             GrabType::Touch => {
-                let touch = seat.get_touch().unwrap();
-                let start_data = touch.grab_start_data().unwrap();
+                let Some(touch) = seat.get_touch() else {
+                    return;
+                };
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
                 touch.set_grab(
                     self,
                     DnDGrab::new_touch(&self.display_handle, start_data, source, seat),
@@ -411,13 +429,14 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
                         .to_f64();
 
                     let surface_location = origin + hint_location;
-                    if let Some(region) = locked_pointer.region()
-                        && region.contains(hint_location.to_i32_floor())
-                    {
-                        pointer.set_location(surface_location);
-                    } else {
+                    let inside = locked_pointer
+                        .region()
+                        .is_none_or(|region| region.contains(hint_location.to_i32_floor()));
+                    if inside {
                         pointer.set_location(surface_location);
                     }
+                    // If outside the locked region, keep the pointer where it is
+                    // instead of warping it to an invalid hint.
                 }
             },
             ConstraintRemove::PointerLeave(_region) => return,
@@ -594,6 +613,14 @@ impl<BackendData: Backend> XdgForeignHandler for AnvilState<BackendData> {
     }
 }
 
+impl<BackendData: Backend> XdgToplevelIconHandler for AnvilState<BackendData> {
+    fn set_icon(&mut self, _toplevel: XdgToplevel, _wl_surface: WlSurface) {
+        // The committed icon lives in the surface's `ToplevelIconCachedState`
+        // (readable from a window's `wl_surface`), so a shell can pick it up
+        // there; there is nothing to track on the compositor side yet.
+    }
+}
+
 impl<BackendData: Backend> ImageCaptureSourceHandler for AnvilState<BackendData> {
     fn source_destroyed(&mut self, _source: ImageCaptureSource) {
         // Anvil doesn't track sources
@@ -734,6 +761,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
 
+        // Server-side cursor theming and toplevel icons.
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
+        let mut xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&dh);
+        for size in [16, 24, 32, 48, 64] {
+            xdg_toplevel_icon_manager.add_icon_size(size);
+        }
+
         // init input
         let seat_name = backend_data.seat_name();
         let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
@@ -780,6 +814,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            cursor_shape_state,
+            xdg_toplevel_icon_manager,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             cursor_status: CursorImageStatus::default_named(),
@@ -798,6 +834,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             #[cfg(feature = "debug")]
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
+            minimized: Vec::new(),
+            ssd_drag: None,
         }
     }
 
@@ -807,7 +845,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         use smithay::wayland::compositor::CompositorHandler;
 
-        let (xwayland, client) = XWayland::spawn(
+        let (xwayland, client) = match XWayland::spawn(
             &self.display_handle,
             None,
             std::iter::empty::<(String, String)>(),
@@ -816,8 +854,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             Stdio::null(),
             Stdio::null(),
             |_| (),
-        )
-        .expect("failed to start XWayland");
+        ) {
+            Ok(ret) => ret,
+            Err(err) => {
+                warn!("Failed to start XWayland, continuing without it: {}", err);
+                return;
+            }
+        };
 
         let display_handle = self.display_handle.clone();
         let ret = self
@@ -838,7 +881,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                             .expect("Failed to attach X11 Window Manager");
 
                     let cursor = Cursor::load();
-                    let image = cursor.get_image(1, Duration::ZERO);
+                    let image = cursor.get_image(CursorIcon::Default, 1, Duration::ZERO);
                     wm.set_cursor(
                         &image.pixels_rgba,
                         Size::from((image.width as u16, image.height as u16)),
@@ -872,8 +915,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         });
@@ -887,8 +931,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -904,8 +949,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -918,8 +964,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                 {
                     commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -967,8 +1014,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1012,8 +1060,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1058,8 +1107,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });
@@ -1089,8 +1139,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
                     if let Some(fifo_barrier) = fifo_barrier {
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     }
                 }
             });

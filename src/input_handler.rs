@@ -1,6 +1,6 @@
 use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
 
-use crate::{AnvilState, focus::PointerFocusTarget, shell::FullscreenSurface};
+use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}};
 
 #[cfg(feature = "udev")]
 use crate::udev::UdevData;
@@ -15,7 +15,7 @@ use smithay::{
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, MotionEvent},
         tablet::{TabletDescriptor, TabletSeatTrait},
         touch::{DownEvent, UpEvent},
     },
@@ -37,6 +37,21 @@ use smithay::backend::input::AbsolutePositionEvent;
 #[cfg(any(feature = "winit", feature = "x11"))]
 use smithay::output::Output;
 use tracing::{debug, error, info};
+
+/// Whether a named cursor is one of the resize arrows.
+fn is_resize_icon(icon: CursorIcon) -> bool {
+    matches!(
+        icon,
+        CursorIcon::WResize
+            | CursorIcon::EResize
+            | CursorIcon::NResize
+            | CursorIcon::SResize
+            | CursorIcon::NwResize
+            | CursorIcon::NeResize
+            | CursorIcon::SwResize
+            | CursorIcon::SeResize
+    )
+}
 
 use crate::state::Backend;
 #[cfg(feature = "udev")]
@@ -123,6 +138,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         }
                     }
                 }
+            }
+
+            KeyAction::Minimize => {
+                let focus = self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|keyboard| keyboard.current_focus());
+                if let Some(KeyboardFocusTarget::Window(w)) = focus {
+                    self.minimize_request(WindowElement(w));
+                }
+            }
+
+            KeyAction::RestoreWindow => {
+                self.restore_last_minimized();
             }
 
             _ => unreachable!(
@@ -224,8 +253,48 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         if wl_pointer::ButtonState::Pressed == state {
-            self.update_keyboard_focus(self.pointer.current_location(), serial);
-        };
+            let location = self.pointer.current_location();
+            self.update_keyboard_focus(location, serial);
+
+            // SSD resizing is compositor-owned, so resolve it straight from the
+            // space hit test instead of relying on the client pointer focus.
+            if button == BTN_LEFT {
+                let resize = self.surface_under(location).and_then(|(target, focus_loc)| {
+                    if let PointerFocusTarget::SSD(ssd) = target {
+                        let relative = location - focus_loc;
+                        let window = ssd.window();
+                        window
+                            .resize_edge_at(relative)
+                            .map(|edges| (window, edges, relative))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((window, edges, relative)) = resize {
+                    self.start_ssd_resize(window, edges, serial, button, relative);
+                    return;
+                }
+            }
+
+            // Focusing raises the clicked window, which can change what is under
+            // the pointer while the pointer focus still points at whatever was
+            // on top before. Re-evaluate it so the first click lands on the
+            // window the user actually clicked.
+            let under = self.surface_under(location);
+            self.pointer.clone().motion(
+                self,
+                under,
+                &MotionEvent {
+                    location,
+                    serial,
+                    time: evt.time(),
+                },
+            );
+        } else {
+            // End any SSD drag regardless of which surface is under the pointer;
+            // the release event may not hit the SSD decoration itself.
+            self.end_ssd_drag();
+        }
         let pointer = self.pointer.clone();
         pointer.button(
             self,
@@ -237,6 +306,43 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             },
         );
         pointer.frame(self);
+
+        // An SSD resize pins the cursor to a resize arrow for the duration of
+        // the drag. Recompute it on release so it updates immediately instead
+        // of waiting for the next motion event.
+        if wl_pointer::ButtonState::Released == state {
+            self.refresh_cursor();
+        }
+    }
+
+    /// Recompute the cursor shape from the current pointer position. Used after
+    /// a compositor-owned drag ends.
+    fn refresh_cursor(&mut self) {
+        // Only the resize cursor pinned during an SSD drag needs clearing.
+        // Leave client-provided cursors untouched when clicking on an app.
+        if !matches!(
+            &self.cursor_status,
+            CursorImageStatus::Named(icon) if is_resize_icon(*icon)
+        ) {
+            return;
+        }
+
+        let location = self.pointer.current_location();
+        let status = match self.surface_under(location) {
+            Some((PointerFocusTarget::SSD(ssd), focus_loc)) => {
+                let relative = location - focus_loc;
+                CursorImageStatus::Named(
+                    ssd.window()
+                        .resize_edge_at(relative)
+                        .map(resize_cursor)
+                        .unwrap_or(CursorIcon::Default),
+                )
+            }
+            _ => CursorImageStatus::default_named(),
+        };
+        if self.cursor_status != status {
+            self.cursor_status = status;
+        }
     }
 
     fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
@@ -258,7 +364,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             let output = self.space.output_under(location).next().cloned();
             if let Some(output) = output.as_ref() {
-                let output_geo = self.space.output_geometry(output).unwrap();
+                let Some(output_geo) = self.space.output_geometry(output) else {
+                    return;
+                };
                 if let Some(window) = output
                     .user_data()
                     .get::<FullscreenSurface>()
@@ -268,8 +376,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
                         #[cfg(feature = "xwayland")]
-                        if let Some(surface) = window.0.x11_surface() {
-                            self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
+                        if let Some(surface) = window.0.x11_surface()
+                            && let Some(xwm) = self.xwm.as_mut()
+                        {
+                            let _ = xwm.raise_window(surface);
                         }
                         keyboard.set_focus(self, Some(window.into()), serial);
                         return;
@@ -298,15 +408,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if let Some((window, _)) = self.space.element_under(location).map(|(w, p)| (w.clone(), p)) {
                 self.space.raise_element(&window, true);
                 #[cfg(feature = "xwayland")]
-                if let Some(surface) = window.0.x11_surface() {
-                    self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
+                if let Some(surface) = window.0.x11_surface()
+                    && let Some(xwm) = self.xwm.as_mut()
+                {
+                    let _ = xwm.raise_window(surface);
                 }
                 keyboard.set_focus(self, Some(window.into()), serial);
                 return;
             }
 
             if let Some(output) = output.as_ref() {
-                let output_geo = self.space.output_geometry(output).unwrap();
+                let Some(output_geo) = self.space.output_geometry(output) else {
+                    keyboard.set_focus(self, None, serial);
+                    return;
+                };
                 let layers = layer_map_for_output(output);
                 if let Some(layer) = layers
                     .layer_under(WlrLayer::Bottom, location - output_geo.loc.to_f64())
@@ -320,10 +435,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             WindowSurfaceType::ALL,
                         ) {
                             keyboard.set_focus(self, Some(layer.clone().into()), serial);
+                            return;
                         }
                     }
                 }
             };
+            // Clicked on empty space: clear keyboard focus so the previously
+            // focused client doesn't keep receiving keys.
+            keyboard.set_focus(self, None, serial);
         }
     }
 
@@ -484,6 +603,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(handle) = self.seat.get_touch() else {
             return;
         };
+        // Touch release may land off the decoration; always end SSD drag.
+        self.end_ssd_drag();
         let serial = SCOUNTER.next_serial();
         handle.up(
             self,
@@ -502,6 +623,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(touch_location) = self.touch_location_transformed(&evt) else {
             return;
         };
+
+        self.update_ssd_drag_position(touch_location);
 
         let under = self.surface_under(touch_location);
         handle.motion(
@@ -551,6 +674,36 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if tablet_seat.count_tablets() == 0 {
                 tablet_seat.clear_tools();
             }
+        }
+    }
+
+    /// Clamp a pointer position so it stays inside the compositor's outputs.
+    fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        if self.space.outputs().next().is_none() {
+            return pos;
+        }
+
+        let (pos_x, pos_y) = pos.into();
+        let max_x = self.space.outputs().fold(0, |acc, o| {
+            acc + self.space.output_geometry(o).map(|g| g.size.w).unwrap_or(0)
+        });
+        let clamped_x = pos_x.clamp(0.0, (max_x - 1).max(0) as f64);
+        let max_y = self
+            .space
+            .outputs()
+            .find(|o| {
+                self.space
+                    .output_geometry(o)
+                    .is_some_and(|geo| geo.contains((clamped_x as i32, 0)))
+            })
+            .and_then(|o| self.space.output_geometry(o))
+            .map(|g| g.size.h);
+
+        if let Some(max_y) = max_y {
+            let clamped_y = pos_y.clamp(0.0, (max_y - 1).max(0) as f64);
+            (clamped_x, clamped_y).into()
+        } else {
+            (clamped_x, pos_y).into()
         }
     }
 }
@@ -622,7 +775,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::Minimize
+                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
 
                     _ => tracing::warn!(
                         ?action,
@@ -661,8 +816,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     ) {
         let output_geo = self.space.output_geometry(output).unwrap();
 
-        let pos = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        // Keep the pointer inside the compositor's outputs.
+        let pos = self.clamp_coords(evt.position_transformed(output_geo.size) + output_geo.loc.to_f64());
         let serial = SCOUNTER.next_serial();
+
+        self.update_ssd_drag_position(pos);
 
         let pointer = self.pointer.clone();
         let under = self.surface_under(pos);
@@ -844,7 +1002,9 @@ impl AnvilState<UdevData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::Minimize
+                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
 
                     _ => unreachable!(),
                 },
@@ -959,6 +1119,8 @@ impl AnvilState<UdevData> {
 
         pointer_location += delta;
 
+        self.update_ssd_drag_position(pointer_location);
+
         let new_under = self.surface_under(pointer_location);
 
         // If confined, don't move pointer if it would go outside surface
@@ -973,7 +1135,7 @@ impl AnvilState<UdevData> {
 
         pointer.motion(
             self,
-            under,
+            new_under.clone(),
             &MotionEvent {
                 location: pointer_location,
                 serial,
@@ -1023,6 +1185,8 @@ impl AnvilState<UdevData> {
 
         // clamp to screen limits
         pointer_location = self.clamp_coords(pointer_location);
+
+        self.update_ssd_drag_position(pointer_location);
 
         let pointer = self.pointer.clone();
         let under = self.surface_under(pointer_location);
@@ -1316,33 +1480,6 @@ impl AnvilState<UdevData> {
         );
     }
 
-    fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        if self.space.outputs().next().is_none() {
-            return pos;
-        }
-
-        let (pos_x, pos_y) = pos.into();
-        let max_x = self
-            .space
-            .outputs()
-            .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
-        let clamped_x = pos_x.clamp(0.0, max_x as f64);
-        let max_y = self
-            .space
-            .outputs()
-            .find(|o| {
-                let geo = self.space.output_geometry(o).unwrap();
-                geo.contains((clamped_x as i32, 0))
-            })
-            .map(|o| self.space.output_geometry(o).unwrap().size.h);
-
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64);
-            (clamped_x, clamped_y).into()
-        } else {
-            (clamped_x, pos_y).into()
-        }
-    }
 }
 
 /// Possible results of a keyboard action
@@ -1363,12 +1500,17 @@ enum KeyAction {
     RotateOutput,
     ToggleTint,
     ToggleDecorations,
+    /// Minimize the focused window
+    Minimize,
+    /// Restore the most recently minimized window
+    RestoreWindow,
     /// Do nothing more
     None,
 }
 
 fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
-    if modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace || modifiers.logo && keysym == Keysym::q
+    if (modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace)
+        || (modifiers.logo && keysym == Keysym::q)
     {
         // ctrl+alt+backspace = quit
         // logo + q = quit
@@ -1383,8 +1525,12 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::Run("weston-terminal".into()))
     } else if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
         Some(KeyAction::Screen((keysym.raw() - xkb::KEY_1) as usize))
+    // Shifted actions must be checked before unshifted ones sharing the same key,
+    // because `modified_sym` folds Shift into the keysym (`m` vs `M`).
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::M {
         Some(KeyAction::ScaleDown)
+    } else if modifiers.logo && modifiers.shift && keysym == Keysym::Z {
+        Some(KeyAction::RestoreWindow)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::P {
         Some(KeyAction::ScaleUp)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::W {
@@ -1395,6 +1541,8 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ToggleTint)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
         Some(KeyAction::ToggleDecorations)
+    } else if modifiers.logo && !modifiers.shift && (keysym == Keysym::m || keysym == Keysym::M) {
+        Some(KeyAction::Minimize)
     } else {
         None
     }

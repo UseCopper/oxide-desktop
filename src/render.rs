@@ -91,6 +91,9 @@ where
     let preview_padding = 10;
 
     let elements_on_space = space.elements_for_output(output).count();
+    // Note: when `elements_on_space == 0` the flat_map below yields nothing,
+    // so `elements_per_row` is never used as a divisor at runtime. Clamp to 1
+    // anyway to avoid 0-division / NaN in size math.
     let output_scale = output.current_scale().fractional_scale();
     let output_transform = output.current_transform();
     let output_size = output
@@ -104,12 +107,12 @@ where
         .unwrap_or_default();
 
     let max_elements_per_row = 4;
-    let elements_per_row = usize::min(elements_on_space, max_elements_per_row);
-    let rows = f64::ceil(elements_on_space as f64 / elements_per_row as f64);
+    let elements_per_row = usize::min(elements_on_space, max_elements_per_row).max(1);
+    let rows = f64::ceil(elements_on_space as f64 / elements_per_row as f64).max(1.0);
 
     let preview_size = Size::from((
-        f64::round(output_size.w / elements_per_row as f64) as i32 - preview_padding * 2,
-        f64::round(output_size.h / rows) as i32 - preview_padding * 2,
+        (f64::round(output_size.w / elements_per_row as f64) as i32 - preview_padding * 2).max(1),
+        (f64::round(output_size.h / rows) as i32 - preview_padding * 2).max(1),
     ));
 
     space

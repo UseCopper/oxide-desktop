@@ -103,9 +103,13 @@ pub fn run_x11() {
     let handle = backend.handle();
 
     // Obtain the DRM node the X server uses for direct rendering.
-    let (node, fd) = handle
-        .drm_node()
-        .expect("Could not get DRM node used by X server");
+    let (node, fd) = match handle.drm_node() {
+        Ok(ret) => ret,
+        Err(err) => {
+            error!(?err, "Could not get DRM node used by X server");
+            return;
+        }
+    };
 
     // Create the gbm device for buffer allocation.
     let device = gbm::Device::new(DeviceFd::from(fd)).expect("Failed to create gbm device");
@@ -292,9 +296,23 @@ pub fn run_x11() {
 
     info!("Initialization completed, starting the main loop.");
 
-    let mut pointer_element = PointerElement::default();
+    let mut pointer_element = PointerElement::with_cursor(crate::cursor::Cursor::load());
 
     while state.running.load(Ordering::SeqCst) {
+        // Dispatch pending Wayland client requests (configure acks and buffer
+        // commits) BEFORE rendering so a commit is shown in this frame rather
+        // than the next loop iteration.
+        if event_loop
+            .dispatch(Some(Duration::from_millis(16)), &mut state)
+            .is_err()
+        {
+            state.running.store(false, Ordering::SeqCst);
+            break;
+        }
+        state.space.refresh();
+        state.popups.cleanup();
+        display_handle.flush_clients().unwrap();
+
         if state.backend_data.render {
             profiling::scope!("render_frame");
 
@@ -342,7 +360,9 @@ pub fn run_x11() {
             if reset {
                 state.cursor_status = CursorImageStatus::default_named();
             }
-            let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
+            // The cursor is drawn by the compositor (including named shapes),
+            // so keep the host cursor hidden.
+            let cursor_visible = false;
 
             let scale = Scale::from(output.current_scale().fractional_scale());
             let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
@@ -350,10 +370,8 @@ pub fn run_x11() {
                     states
                         .data_map
                         .get::<Mutex<CursorImageAttributes>>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .hotspot
+                        .and_then(|attrs| attrs.lock().ok().map(|a| a.hotspot))
+                        .unwrap_or_default()
                 })
             } else {
                 (0, 0).into()
@@ -480,15 +498,6 @@ pub fn run_x11() {
             state.backend_data.fps.tick();
             window.set_cursor_visible(cursor_visible);
             profiling::finish_frame!();
-        }
-
-        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
-        if result.is_err() {
-            state.running.store(false, Ordering::SeqCst);
-        } else {
-            state.space.refresh();
-            state.popups.cleanup();
-            display_handle.flush_clients().unwrap();
         }
     }
 }

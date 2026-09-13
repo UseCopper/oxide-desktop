@@ -1,18 +1,25 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::{cell::RefCell, collections::HashMap, time::Duration};
+
 use smithay::{
-    backend::renderer::{
-        Color32F, ImportAll, ImportMem, Renderer, Texture,
-        element::{
-            AsRenderElements, Kind,
-            memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-            surface::WaylandSurfaceRenderElement,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            Color32F, ImportAll, ImportMem, Renderer, Texture,
+            element::{
+                AsRenderElements, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                surface::WaylandSurfaceRenderElement,
+            },
         },
     },
-    input::pointer::CursorImageStatus,
+    input::pointer::{CursorIcon, CursorImageStatus},
     render_elements,
-    utils::{Physical, Point, Scale},
+    utils::{Logical, Physical, Point, Scale, Transform},
 };
+
+use crate::cursor::Cursor;
 #[cfg(feature = "debug")]
 use smithay::{
     backend::renderer::{
@@ -20,7 +27,7 @@ use smithay::{
         element::{Element, Id, RenderElement},
         utils::CommitCounter,
     },
-    utils::{Buffer, Logical, Rectangle, Size, Transform, user_data::UserDataMap},
+    utils::{Buffer, Rectangle, Size, user_data::UserDataMap},
 };
 
 pub static CLEAR_COLOR: Color32F = Color32F::new(0.0, 0.0, 0.0, 1.0);
@@ -29,6 +36,10 @@ pub static CLEAR_COLOR_FULLSCREEN: Color32F = Color32F::new(0.0, 0.0, 0.0, 0.0);
 pub struct PointerElement {
     buffer: Option<MemoryRenderBuffer>,
     status: CursorImageStatus,
+    /// Optional theme used to resolve named shapes (including resize cursors).
+    cursor: Option<Cursor>,
+    /// Cache of shape -> (buffer, hotspot) so icons are only decoded once.
+    named: RefCell<HashMap<CursorIcon, (MemoryRenderBuffer, Point<i32, Logical>)>>,
 }
 
 impl Default for PointerElement {
@@ -36,11 +47,21 @@ impl Default for PointerElement {
         Self {
             buffer: Default::default(),
             status: CursorImageStatus::default_named(),
+            cursor: None,
+            named: RefCell::new(HashMap::new()),
         }
     }
 }
 
 impl PointerElement {
+    /// Build a pointer element that renders named cursor shapes from `cursor`.
+    pub fn with_cursor(cursor: Cursor) -> Self {
+        Self {
+            cursor: Some(cursor),
+            ..Self::default()
+        }
+    }
+
     pub fn set_status(&mut self, status: CursorImageStatus) {
         self.status = status;
     }
@@ -83,9 +104,39 @@ where
     {
         match &self.status {
             CursorImageStatus::Hidden => vec![],
-            // Always render `Default` for a named shape.
-            CursorImageStatus::Named(_) => {
-                if let Some(buffer) = self.buffer.as_ref() {
+            CursorImageStatus::Named(icon) => {
+                if let Some(cursor) = self.cursor.as_ref() {
+                    let scale_int = scale.x.max(scale.y).round().max(1.0) as u32;
+                    let mut named = self.named.borrow_mut();
+                    let (buffer, hotspot) = named.entry(*icon).or_insert_with(|| {
+                        let image = cursor.get_image(*icon, scale_int, Duration::ZERO);
+                        let buffer = MemoryRenderBuffer::from_slice(
+                            &image.pixels_rgba,
+                            Fourcc::Argb8888,
+                            (image.width as i32, image.height as i32),
+                            1,
+                            Transform::Normal,
+                            None,
+                        );
+                        (buffer, Point::from((image.xhot as i32, image.yhot as i32)))
+                    });
+                    let location = location - hotspot.to_physical_precise_round(scale);
+                    vec![
+                        PointerRenderElement::<R>::from(
+                            MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                location.to_f64(),
+                                buffer,
+                                None,
+                                None,
+                                None,
+                                Kind::Cursor,
+                            )
+                            .expect("Lost system pointer buffer"),
+                        )
+                        .into(),
+                    ]
+                } else if let Some(buffer) = self.buffer.as_ref() {
                     vec![
                         PointerRenderElement::<R>::from(
                             MemoryRenderBufferRenderElement::from_buffer(
