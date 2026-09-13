@@ -55,6 +55,8 @@ mod xdg;
 pub use self::element::*;
 pub use self::grabs::*;
 
+use self::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, RelativeGeometry};
+
 use self::xdg::handle_toplevel_commit;
 
 fn fullscreen_output_geometry(
@@ -503,5 +505,105 @@ pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point
     }
     for window in orphaned_windows.into_iter() {
         place_new_window(space, pointer_location, &window, false);
+    }
+}
+
+/// The area of an output that floating windows are laid out within, i.e. its
+/// geometry minus any layer-shell exclusive zones (panels, docks, ...).
+fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
+    let geo = space.output_geometry(output)?;
+    let zone = layer_map_for_output(output).non_exclusive_zone();
+    let area = Rectangle::new(geo.loc + zone.loc, zone.size);
+    (area.size.w > 0 && area.size.h > 0).then_some(area)
+}
+
+/// Snapshot every window's position and size as a fraction of its output's work
+/// area. Call this *before* changing the output's mode, so the fractions
+/// describe the layout the user is currently looking at.
+pub fn capture_relative_geometries(space: &Space<WindowElement>, output: &Output) {
+    let Some(area) = output_work_area(space, output) else {
+        return;
+    };
+    for window in space.elements_for_output(output) {
+        // Fullscreen and maximized windows are re-configured to the output
+        // rather than scaled, so they don't need a snapshot.
+        if window.decoration_state().header_bar.fullscreen || window.is_maximized() {
+            continue;
+        }
+        let Some(loc) = space.element_location(window) else {
+            continue;
+        };
+        let size = window.geometry().size;
+        window.decoration_state().relative = Some(RelativeGeometry {
+            x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
+            y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
+            w: size.w as f64 / area.size.w as f64,
+            h: size.h as f64 / area.size.h as f64,
+        });
+    }
+}
+
+/// Reapply fractional geometry against the output's (possibly new) work area,
+/// and refresh fullscreen/maximized windows to the new output size. Call this
+/// *after* the output's mode has changed.
+pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Output) {
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+    let Some(area) = output_work_area(space, output) else {
+        return;
+    };
+    let Some(output_geo) = space.output_geometry(output) else {
+        return;
+    };
+
+    let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
+    for window in windows {
+        if let Some(toplevel) = window.0.toplevel() {
+            let fullscreen = window.decoration_state().header_bar.fullscreen;
+            if fullscreen {
+                let size = self::xdg::fullscreen_content_size(output_geo.size, window.is_ssd());
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.size = Some(size);
+                });
+                toplevel.send_configure();
+                space.map_element(window, output_geo.loc, false);
+                continue;
+            }
+            if window.is_maximized() {
+                let size = self::xdg::maximize_content_size(output_geo.size, window.is_ssd());
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                    state.size = Some(size);
+                });
+                toplevel.send_configure();
+                space.map_element(window, output_geo.loc, false);
+                continue;
+            }
+        }
+
+        let Some(rel) = window.decoration_state().relative else {
+            continue;
+        };
+        let new_loc = Point::from((
+            area.loc.x + (rel.x * area.size.w as f64).round() as i32,
+            area.loc.y + (rel.y * area.size.h as f64).round() as i32,
+        ));
+        // The snapshot is of the decorated size, so subtract the frame before
+        // configuring the client (which sizes its content).
+        let decoration: Size<i32, Logical> = if window.is_ssd() {
+            Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
+        } else {
+            Size::from((0, 0))
+        };
+        let new_size = Size::from((
+            ((rel.w * area.size.w as f64).round() as i32 - decoration.w).max(1),
+            ((rel.h * area.size.h as f64).round() as i32 - decoration.h).max(1),
+        ));
+        if let Some(toplevel) = window.0.toplevel() {
+            toplevel.with_pending_state(|state| state.size = Some(new_size));
+            toplevel.send_configure();
+        }
+        space.map_element(window, new_loc, false);
     }
 }

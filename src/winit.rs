@@ -212,6 +212,7 @@ pub fn run_winit() {
             WinitEvent::Resized { size, .. } => {
                 // We only have one output
                 let output = state.space.outputs().next().unwrap().clone();
+                crate::shell::capture_relative_geometries(&state.space, &output);
                 state.space.map_output(&output, (0, 0));
                 let mode = Mode {
                     size,
@@ -220,6 +221,7 @@ pub fn run_winit() {
                 output.change_current_state(Some(mode), None, None, None);
                 output.set_preferred(mode);
                 crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+                crate::shell::apply_relative_geometries(&mut state.space, &output);
             }
             WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
             WinitEvent::CloseRequested => {
@@ -247,6 +249,7 @@ pub fn run_winit() {
         state.space.refresh();
         state.popups.cleanup();
         display_handle.flush_clients().unwrap();
+
 
         // drawing logic
         {

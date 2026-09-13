@@ -45,7 +45,7 @@ use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT};
 /// Only server-decorated windows reserve room for the compositor's header bar.
 /// Client-decorated windows have to fill the whole output, otherwise the
 /// undecorated strip they leave behind is never painted (black).
-fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+pub(crate) fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
     if is_ssd {
         Size::from((output.w, (output.h - HEADER_BAR_HEIGHT).max(0)))
     } else {
@@ -56,7 +56,7 @@ fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32
 /// Size a toplevel should use while maximized, leaving room for the SSD frame
 /// (borders + header bar) so the decorated window fits inside the output
 /// instead of hanging off the right/bottom edge.
-fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+pub(crate) fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
     if is_ssd {
         Size::from((
             (output.w - 2 * BORDER_WIDTH).max(0),

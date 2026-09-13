@@ -24,6 +24,7 @@ renderdoc = { version = "0.12", optional = true }
 puffin_http = { version = "0.3", optional = true }
 nix = { version = "0.27", optional = true }
 libinput-rs = { version = "0.3", optional = true }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay", rev = "e3d461a057ba244d213a8498ec372b0799cca103", optional = true }
 drm-fourcc = { version = "2", optional = true }
 gbm = { version = "0.11", optional = true }
 wayland-backend = { version = "0.3", optional = true }
@@ -57,7 +58,7 @@ features = [
 [features]
 default = ["winit", "xwayland"]
 winit = ["smithay/backend_winit", "smithay/backend_egl", "smithay/renderer_gl", "egl"]
-udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/drm", "smithay/gbm", "smithay/backend_egl", "smithay/renderer_gl", "egl", "nix", "libinput-rs", "drm-fourcc", "gbm", "wayland-backend", "wayland-client", "wayland-server", "wayland-protocols", "wayland-egl"]
+udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_udev", "smithay/backend_libinput", "smithay/backend_session_libseat", "smithay/renderer_multi", "smithay/input", "smithay/drm", "smithay/gbm", "smithay/backend_egl", "smithay/renderer_gl", "egl", "nix", "libinput-rs", "drm-fourcc", "gbm", "smithay-drm-extras", "wayland-backend", "wayland-client", "wayland-server", "wayland-protocols", "wayland-egl"]
 x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
 xwayland = ["smithay/xwayland", "smithay/backend_libei"]
 libei = []

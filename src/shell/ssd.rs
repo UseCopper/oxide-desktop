@@ -38,7 +38,21 @@ pub struct WindowState {
     pub is_ssd: bool,
     pub fullscreen_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
     pub maximize_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
+    /// Position and size of the window as fractions of its output's work area
+    /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
+    /// resize and reapplied against the new work area so floating windows keep
+    /// their relative placement across resolution changes and monitor layouts.
+    pub relative: Option<RelativeGeometry>,
     pub header_bar: HeaderBar,
+}
+
+/// A window's geometry expressed relative to its output's work area.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelativeGeometry {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -621,6 +635,7 @@ impl WindowElement {
                 is_ssd: false,
                 fullscreen_restore: None,
                 maximize_restore: None,
+                relative: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,

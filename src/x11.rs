@@ -269,6 +269,7 @@ pub fn run_x11() {
                 let output = &output_clone;
                 let size = { (new_size.w as i32, new_size.h as i32).into() };
 
+                crate::shell::capture_relative_geometries(&data.space, output);
                 data.backend_data.mode = Mode {
                     size,
                     refresh: 60_000,
@@ -277,6 +278,7 @@ pub fn run_x11() {
                 output.change_current_state(Some(data.backend_data.mode), None, None, None);
                 output.set_preferred(data.backend_data.mode);
                 crate::shell::fixup_positions(&mut data.space, data.pointer.current_location());
+                crate::shell::apply_relative_geometries(&mut data.space, output);
 
                 data.backend_data.render = true;
             }
