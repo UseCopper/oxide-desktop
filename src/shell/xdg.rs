@@ -38,7 +38,34 @@ use super::{
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
     fullscreen_output_geometry, place_new_window,
 };
-use super::ssd::HEADER_BAR_HEIGHT;
+use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT};
+
+/// Size a toplevel should use while fullscreen.
+///
+/// Only server-decorated windows reserve room for the compositor's header bar.
+/// Client-decorated windows have to fill the whole output, otherwise the
+/// undecorated strip they leave behind is never painted (black).
+fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+    if is_ssd {
+        Size::from((output.w, (output.h - HEADER_BAR_HEIGHT).max(0)))
+    } else {
+        output
+    }
+}
+
+/// Size a toplevel should use while maximized, leaving room for the SSD frame
+/// (borders + header bar) so the decorated window fits inside the output
+/// instead of hanging off the right/bottom edge.
+fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+    if is_ssd {
+        Size::from((
+            (output.w - 2 * BORDER_WIDTH).max(0),
+            (output.h - HEADER_BAR_HEIGHT - BORDER_WIDTH).max(0),
+        ))
+    } else {
+        output
+    }
+}
 
 impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -265,6 +292,25 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     .map(|mode| mode == Mode::ServerSide)
                     .unwrap_or(false);
                 window.set_ssd(is_ssd);
+
+                // A fullscreen configure may have been sent before the client's
+                // decoration preference was known (clients often request
+                // fullscreen and server-side decorations in the same batch). Now
+                // that the mode is acked, re-send the size so client-decorated
+                // windows fill the whole output instead of reserving space for a
+                // header bar that is never drawn.
+                let is_fullscreen = window.decoration_state().header_bar.fullscreen;
+                if is_fullscreen
+                    && let Some(output) = self.space.outputs_for_element(window).first().cloned()
+                    && let Some(geometry) = self.space.output_geometry(&output)
+                    && let Some(toplevel) = window.0.toplevel()
+                {
+                    let desired = fullscreen_content_size(geometry.size, is_ssd);
+                    if toplevel.with_pending_state(|state| state.size != Some(desired)) {
+                        toplevel.with_pending_state(|state| state.size = Some(desired));
+                        toplevel.send_configure();
+                    }
+                }
             }
         }
     }
@@ -434,9 +480,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // The window hasn't been mapped yet, use the primary output instead
             .or_else(|| self.space.outputs().next());
 
+        // Remember where the window was so unmaximizing can put it back.
+        let already_maximized =
+            surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+        if !already_maximized
+            && let Some(location) = self.space.element_location(&window)
+        {
+            let size = SpaceElement::geometry(&window.0).size;
+            window.decoration_state().maximize_restore = Some((location, size));
+        }
+
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = output.and_then(|output| self.space.output_geometry(output)).map(|geo| geo.size);
+            state.size = output
+                .and_then(|output| self.space.output_geometry(output))
+                .map(|geo| maximize_content_size(geo.size, window.is_ssd()));
         });
         if let Some(output) = output {
             if let Some(geometry) = self.space.output_geometry(output) {
@@ -454,10 +512,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 
     fn unmaximize_request_xdg(&mut self, surface: &ToplevelSurface) {
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let restore = window.decoration_state().maximize_restore.take();
+
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = None;
+            state.size = restore.as_ref().map(|(_, size)| *size);
         });
+        if let Some((location, _)) = restore {
+            self.space.map_element(window, location, false);
+        }
 
         // The protocol demands us to always reply with a configure,
         // regardless of we fulfilled the request or not
@@ -506,12 +572,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
             drop(state);
 
+            let is_ssd = window.is_ssd();
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(Size::from((
-                    geometry.size.w,
-                    (geometry.size.h - HEADER_BAR_HEIGHT).max(0),
-                )));
+                state.size = Some(fullscreen_content_size(geometry.size, is_ssd));
                 state.fullscreen_output = wl_output;
             });
             output.user_data().insert_if_missing(FullscreenSurface::default);

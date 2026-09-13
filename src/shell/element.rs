@@ -645,16 +645,23 @@ where
             // frame and its location update on the same commit.
             let content_size = self.resize_content_size();
 
+            // Computed before borrowing the decoration state: the maximize
+            // button shows "restore" while the window is maximized, and the
+            // decorations are tinted while the window is focused.
+            let maximized = self.is_maximized();
+            let focused = self.is_activated();
             let mut state = self.decoration_state();
             let fullscreen = state.header_bar.fullscreen;
             let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
-            state.header_bar.redraw(width.max(0) as u32, content_size);
+            state
+                .header_bar
+                .redraw(width.max(0) as u32, content_size, focused);
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
 
             let icon_off = icon_offset();
             let base = state.header_bar.width as i32;
-            let maximize_icon = if state.header_bar.fullscreen {
+            let maximize_icon = if fullscreen || maximized {
                 &state.header_bar.restore_icon
             } else {
                 &state.header_bar.maximize_icon

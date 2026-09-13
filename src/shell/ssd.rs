@@ -37,6 +37,7 @@ use super::{
 pub struct WindowState {
     pub is_ssd: bool,
     pub fullscreen_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
+    pub maximize_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
     pub header_bar: HeaderBar,
 }
 
@@ -55,6 +56,7 @@ pub struct HeaderBar {
     pub pointer_loc: Option<Point<f64, Logical>>,
     pub width: u32,
     pub fullscreen: bool,
+    pub focused: bool,
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
     pub minimize_button_hover: bool,
@@ -78,9 +80,10 @@ pub struct Borders {
     pub height: u32,
 }
 
-const BG_COLOR: [f32; 4] = [0.13, 0.13, 0.15, 1.0];
-const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.84, 1.0];
-const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.34, 1.0];
+const BG_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 1.0];
+const BG_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0];
+const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
+const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
 
 pub const HEADER_BAR_HEIGHT: i32 = 30;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
@@ -296,25 +299,21 @@ impl HeaderBar {
                 state.close_window(window.clone());
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
-                let fullscreen = !self.fullscreen;
+                // Maximize/unmaximize like a normal titlebar button. If the
+                // client put itself fullscreen, this exits that instead so the
+                // user is never stuck (the icon shows "restore" for both).
                 let window = window.clone();
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(_) => {
-                        state.handle.insert_idle(move |data| {
-                            if fullscreen {
-                                data.fullscreen_window(window.clone());
-                            } else {
-                                data.unfullscreen_window(window.clone());
-                            }
-                        });
+                let fullscreen = self.fullscreen;
+                let maximized = window.is_maximized();
+                state.handle.insert_idle(move |data| {
+                    if fullscreen {
+                        data.unfullscreen_window(window.clone());
+                    } else if maximized {
+                        data.unmaximize_window(window.clone());
+                    } else {
+                        data.maximize_window(window.clone());
                     }
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(_) => {
-                        state.handle.insert_idle(move |data| {
-                            data.maximize_window(window.clone());
-                        });
-                    }
-                };
+                });
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
                 state.minimize_request(window.clone());
@@ -386,25 +385,18 @@ impl HeaderBar {
                 state.close_window(window.clone());
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
-                let fullscreen = !self.fullscreen;
                 let window = window.clone();
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(_) => {
-                        state.handle.insert_idle(move |data| {
-                            if fullscreen {
-                                data.fullscreen_window(window.clone());
-                            } else {
-                                data.unfullscreen_window(window.clone());
-                            }
-                        });
+                let fullscreen = self.fullscreen;
+                let maximized = window.is_maximized();
+                state.handle.insert_idle(move |data| {
+                    if fullscreen {
+                        data.unfullscreen_window(window.clone());
+                    } else if maximized {
+                        data.unmaximize_window(window.clone());
+                    } else {
+                        data.maximize_window(window.clone());
                     }
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(_) => {
-                        state.handle.insert_idle(move |data| {
-                            data.maximize_window(window.clone());
-                        });
-                    }
-                };
+                });
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
                 state.minimize_request(window.clone());
@@ -413,14 +405,16 @@ impl HeaderBar {
         };
     }
 
-    pub fn redraw(&mut self, width: u32, content_size: Size<i32, Logical>) {
+    pub fn redraw(&mut self, width: u32, content_size: Size<i32, Logical>, focused: bool) {
         if width == 0 {
             self.width = 0;
             return;
         }
 
+        let bg = if focused { BG_COLOR_FOCUSED } else { BG_COLOR };
+
         self.background
-            .update((width as i32, HEADER_BAR_HEIGHT), BG_COLOR);
+            .update((width as i32, HEADER_BAR_HEIGHT), bg);
 
         let content_width = content_size.w.max(0) as u32;
         let content_height = content_size.h.max(0) as u32;
@@ -428,20 +422,18 @@ impl HeaderBar {
         self.borders.height = content_height;
         let ring_w = (content_width + 2 * BORDER_WIDTH as u32) as i32;
         let ring_h = content_height as i32;
-        self.borders
-            .bottom
-            .update((ring_w, BORDER_WIDTH), BG_COLOR);
-        self.borders
-            .left
-            .update((BORDER_WIDTH, ring_h), BG_COLOR);
-        self.borders
-            .right
-            .update((BORDER_WIDTH, ring_h), BG_COLOR);
+        self.borders.bottom.update((ring_w, BORDER_WIDTH), bg);
+        self.borders.left.update((BORDER_WIDTH, ring_h), bg);
+        self.borders.right.update((BORDER_WIDTH, ring_h), bg);
 
         let mut needs_redraw_buttons = false;
         if width != self.width {
             needs_redraw_buttons = true;
             self.width = width;
+        }
+        if focused != self.focused {
+            needs_redraw_buttons = true;
+            self.focused = focused;
         }
 
         if self
@@ -475,7 +467,7 @@ impl HeaderBar {
             && (needs_redraw_buttons || self.close_button_hover)
         {
             self.close_button
-                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), BG_COLOR);
+                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), bg);
             self.close_button_hover = false;
         }
 
@@ -501,7 +493,7 @@ impl HeaderBar {
             && (needs_redraw_buttons || self.maximize_button_hover)
         {
             self.maximize_button
-                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), BG_COLOR);
+                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), bg);
             self.maximize_button_hover = false;
         }
 
@@ -527,7 +519,7 @@ impl HeaderBar {
             && (needs_redraw_buttons || self.minimize_button_hover)
         {
             self.minimize_button
-                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), BG_COLOR);
+                .update((BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32), bg);
             self.minimize_button_hover = false;
         }
     }
@@ -628,10 +620,12 @@ impl WindowElement {
             RefCell::new(WindowState {
                 is_ssd: false,
                 fullscreen_restore: None,
+                maximize_restore: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
                     fullscreen: false,
+                    focused: false,
                     close_button_hover: false,
                     maximize_button_hover: false,
                     minimize_button_hover: false,
@@ -690,6 +684,21 @@ impl WindowElement {
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(w) => w.is_maximized(),
+            #[cfg(not(feature = "xwayland"))]
+            _ => false,
+        }
+    }
+
+    /// Whether this window currently holds the seat's focus, used to tint the
+    /// decorations. The active element is tracked by [`Space`] via
+    /// `SpaceElement::set_activate`.
+    pub fn is_activated(&self) -> bool {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(w) => {
+                w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Activated))
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => w.is_activated(),
             #[cfg(not(feature = "xwayland"))]
             _ => false,
         }

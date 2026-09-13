@@ -275,6 +275,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     return;
                 }
             }
+
+            // Focusing raises the clicked window, which can change what is under
+            // the pointer while the pointer focus still points at whatever was
+            // on top before. Re-evaluate it so the first click lands on the
+            // window the user actually clicked.
+            let under = self.surface_under(location);
+            self.pointer.clone().motion(
+                self,
+                under,
+                &MotionEvent {
+                    location,
+                    serial,
+                    time: evt.time(),
+                },
+            );
         } else {
             // End any SSD drag regardless of which surface is under the pointer;
             // the release event may not hit the SSD decoration itself.
