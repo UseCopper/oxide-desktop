@@ -36,8 +36,8 @@ use super::{
 
 pub struct WindowState {
     pub is_ssd: bool,
-    pub fullscreen_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
-    pub maximize_restore: Option<(Point<i32, Logical>, Size<i32, Logical>)>,
+    pub fullscreen_restore: Option<RelativeGeometry>,
+    pub maximize_restore: Option<RelativeGeometry>,
     /// Position and size of the window as fractions of its output's work area
     /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
     /// resize and reapplied against the new work area so floating windows keep

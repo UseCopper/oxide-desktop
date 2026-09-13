@@ -504,14 +504,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // The window hasn't been mapped yet, use the primary output instead
             .or_else(|| self.space.outputs().next());
 
-        // Remember where the window was so unmaximizing can put it back.
+        // Remember where the window was so unmaximizing can put it back, stored
+        // as a fraction of the work area so it survives resolution changes.
         let already_maximized =
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
-        if !already_maximized
-            && let Some(location) = self.space.element_location(&window)
-        {
-            let size = SpaceElement::geometry(&window.0).size;
-            window.decoration_state().maximize_restore = Some((location, size));
+        if !already_maximized {
+            window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
         }
 
         surface.with_pending_state(|state| {
@@ -540,12 +538,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         let restore = window.decoration_state().maximize_restore.take();
+        let geometry = restore.and_then(|rel| super::absolute_geometry(&self.space, &window, rel));
 
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = restore.as_ref().map(|(_, size)| *size);
+            state.size = geometry.map(|(_, size)| size);
         });
-        if let Some((location, _)) = restore {
+        if let Some((location, _)) = geometry {
             self.space.map_element(window, location, false);
         }
 
@@ -584,15 +583,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 return;
             };
 
-            let content_size = SpaceElement::geometry(&window.0).size;
-            let location = self.space.element_location(&window);
+            let restore = super::relative_geometry_of(&self.space, &window);
             let mut state = window.decoration_state();
             state.header_bar.fullscreen = true;
             state.header_bar.pointer_loc = None;
             if state.fullscreen_restore.is_none() {
-                if let Some(location) = location {
-                    state.fullscreen_restore = Some((location, content_size));
-                }
+                state.fullscreen_restore = restore;
             }
             drop(state);
 
@@ -626,7 +622,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     fn unfullscreen_request_xdg(&mut self, surface: &ToplevelSurface) {
         let wl_surface = surface.wl_surface();
-        let restore: Option<(WindowElement, Point<i32, Logical>, Size<i32, Logical>)> = self
+        let restore = self
             .space
             .elements()
             .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
@@ -634,18 +630,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let mut state = window.decoration_state();
                 state.header_bar.fullscreen = false;
                 state.header_bar.pointer_loc = None;
-                state
-                    .fullscreen_restore
-                    .take()
-                    .map(|(loc, size)| (window.clone(), loc, size))
+                state.fullscreen_restore.take().map(|rel| (window.clone(), rel))
             });
 
+        let geometry = restore
+            .as_ref()
+            .and_then(|(window, rel)| super::absolute_geometry(&self.space, window, *rel));
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
-            state.size = restore.as_ref().map(|(_, _, size)| *size);
+            state.size = geometry.map(|(_, size)| size);
             state.fullscreen_output.take()
         });
-        if let Some((window, location, _)) = restore {
+        if let Some((location, _)) = geometry
+            && let Some((window, _)) = restore
+        {
             self.space.map_element(window, location, false);
         }
         if let Some(output) = ret.and_then(|output| Output::from_resource(&output)) {
@@ -701,7 +699,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().maximize_restore.take();
-            let restore_size = restore.map(|(_, size)| size);
+            let restore_size = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, size)| size);
             initial_window_location = restore_drag_location(
                 initial_window_location,
                 decorated_size,
@@ -769,7 +769,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().maximize_restore.take();
-            let restore_size = restore.map(|(_, size)| size);
+            let restore_size = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, size)| size);
             initial_window_location = restore_drag_location(
                 initial_window_location,
                 decorated_size,
