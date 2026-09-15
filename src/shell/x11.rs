@@ -346,7 +346,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if let Some(data) = window.user_data().get::<OldGeometry>() {
             data.save(old_geo);
         }
-        self.space.map_element(elem, geometry.loc, false);
+        self.animate_window(&elem, geometry.size, geometry.loc);
     }
 
     pub fn unmaximize_request_x11(&mut self, window: &X11Surface) {
@@ -365,7 +365,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if let Err(err) = window.configure(old_geo) {
                 tracing::warn!(?err, "Failed to restore X11 window geometry");
             }
-            self.space.map_element(elem, old_geo.loc, false);
+            self.animate_window(&elem, old_geo.size, old_geo.loc);
         }
     }
 

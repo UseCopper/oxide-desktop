@@ -1,4 +1,7 @@
-use std::{borrow::Cow, time::Duration};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::{
@@ -6,8 +9,11 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
-                AsRenderElements, Kind, memory::MemoryRenderBufferRenderElement,
-                solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::SolidColorRenderElement,
+                surface::WaylandSurfaceRenderElement,
+                utils::RescaleRenderElement,
             },
         },
     },
@@ -31,7 +37,9 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     render_elements,
-    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, user_data::UserDataMap},
+    utils::{
+        IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, user_data::UserDataMap,
+    },
     wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
 };
 
@@ -540,7 +548,20 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
 impl SpaceElement for WindowElement {
     fn geometry(&self) -> Rectangle<i32, Logical> {
         let mut geo = SpaceElement::geometry(&self.0);
-        if self.decoration_state().is_ssd {
+        let (is_ssd, animation) = {
+            let state = self.decoration_state();
+            (
+                state.is_ssd,
+                state.animation.as_ref().map(|anim| anim.sample(Instant::now()).0),
+            )
+        };
+        // While animating, report the interpolated (decorated) size so damage
+        // tracking and hit testing follow the visual window.
+        if let Some(rect) = animation {
+            geo.size = rect.decorated(is_ssd).to_i32_round();
+            return geo;
+        }
+        if is_ssd {
             // Match the size used for rendering and resize math.
             geo.size = self.resize_content_size();
             geo.size.w += 2 * BORDER_WIDTH;
@@ -549,15 +570,28 @@ impl SpaceElement for WindowElement {
         geo
     }
     fn bbox(&self) -> Rectangle<i32, Logical> {
+        let (is_ssd, animation) = {
+            let state = self.decoration_state();
+            (
+                state.is_ssd,
+                state.animation.as_ref().map(|anim| anim.sample(Instant::now()).0),
+            )
+        };
         let mut bbox = SpaceElement::bbox(&self.0);
-        if self.decoration_state().is_ssd {
-            bbox.size.w += 2 * BORDER_WIDTH;
-            bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
+        if is_ssd {
+            if let Some(rect) = animation {
+                bbox.size = rect.decorated(true).to_i32_round();
+            } else {
+                bbox.size.w += 2 * BORDER_WIDTH;
+                bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
+            }
             // Include the outside resize band so `Space` hit testing considers
             // points just beyond the decorated window.
             bbox.loc -= Point::from((RESIZE_MARGIN, RESIZE_MARGIN));
             bbox.size.w += 2 * RESIZE_MARGIN;
             bbox.size.h += 2 * RESIZE_MARGIN;
+        } else if let Some(rect) = animation {
+            bbox.size = rect.decorated(false).to_i32_round();
         }
         bbox
     }
@@ -611,6 +645,8 @@ render_elements!(
     Window=WaylandSurfaceRenderElement<R>,
     Decoration=SolidColorRenderElement,
     Icon=MemoryRenderBufferRenderElement<R>,
+    Scaled=RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
+    Snapshot=RescaleRenderElement<MemoryRenderBufferRenderElement<R>>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -619,6 +655,8 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Decoration(arg0) => f.debug_tuple("Decoration").field(arg0).finish(),
             Self::Icon(arg0) => f.debug_tuple("Icon").field(arg0).finish(),
+            Self::Scaled(arg0) => f.debug_tuple("Scaled").field(arg0).finish(),
+            Self::Snapshot(arg0) => f.debug_tuple("Snapshot").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -640,10 +678,29 @@ where
     ) -> Vec<C> {
         let window_bbox = SpaceElement::bbox(&self.0);
 
+        // While a maximize/unmaximize transition is running the window is drawn
+        // at the interpolated (animated) size. The client's content is
+        // crossfaded from a frozen snapshot of its pre-transition pixels to the
+        // live content, while the SSD frame is re-laid out at the new size.
+        let (animation_rect, progress, snapshot) = {
+            let state = self.decoration_state();
+            let animation = state.animation.as_ref();
+            let sample = animation.map(|anim| anim.sample(Instant::now()));
+            (
+                sample.map(|(rect, _)| rect),
+                sample.map(|(_, progress)| progress as f32).unwrap_or(1.0),
+                animation.and_then(|anim| anim.snapshot()).map(|(b, s)| (b.clone(), s)),
+            )
+        };
+
         if self.decoration_state().is_ssd && !window_bbox.is_empty() {
-            // Use the same content size as the resize/position math so the
-            // frame and its location update on the same commit.
+            // The size of the buffer we can actually draw right now.
             let content_size = self.resize_content_size();
+            // The size the frame should occupy on screen (the animation may
+            // stretch the buffer into this while the client catches up).
+            let display_size = animation_rect
+                .map(|rect| rect.content.to_i32_round())
+                .unwrap_or(content_size);
 
             // Computed before borrowing the decoration state: the maximize
             // button shows "restore" while the window is maximized, and the
@@ -652,10 +709,10 @@ where
             let focused = self.is_activated();
             let mut state = self.decoration_state();
             let fullscreen = state.header_bar.fullscreen;
-            let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
+            let width = display_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
             state
                 .header_bar
-                .redraw(width.max(0) as u32, content_size, focused);
+                .redraw(width.max(0) as u32, display_size, focused);
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
 
@@ -714,16 +771,111 @@ where
             }
             .to_physical_precise_round(scale);
 
-            let window_elements =
+            // Elements are ordered front-to-back and drawn back-to-front, so the
+            // snapshot must be pushed *before* the live content to land on top
+            // of it. It is stretched to the same animated content rect as the
+            // live content, so both frames crossfade in place.
+            push_crossfade_snapshot(
+                &mut vec,
+                renderer,
+                &snapshot,
+                location,
+                display_size,
+                alpha,
+                progress,
+            );
+            let window_elements: Vec<WaylandSurfaceRenderElement<R>> =
                 AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
-            vec.extend(window_elements);
+            extend_scaled(&mut vec, window_elements, location, content_size, display_size);
 
             vec.into_iter().map(C::from).collect()
         } else {
-            AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha)
-                .into_iter()
-                .map(C::from)
-                .collect()
+            let content_size = self.resize_content_size();
+            let display_size = animation_rect
+                .map(|rect| rect.content.to_i32_round())
+                .unwrap_or(content_size);
+
+            let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
+            push_crossfade_snapshot(
+                &mut vec,
+                renderer,
+                &snapshot,
+                location,
+                display_size,
+                alpha,
+                progress,
+            );
+            let window_elements: Vec<WaylandSurfaceRenderElement<R>> =
+                AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
+            extend_scaled(&mut vec, window_elements, location, content_size, display_size);
+            vec.into_iter().map(C::from).collect()
         }
     }
+}
+
+/// Draw the frozen pre-transition frame stretched into the animated content
+/// area, fading out as the live frame shows through. No-op without a snapshot.
+/// Pushed *before* the live content, since elements are front-to-back.
+#[allow(clippy::too_many_arguments)]
+fn push_crossfade_snapshot<R>(
+    out: &mut Vec<WindowRenderElement<R>>,
+    renderer: &mut R,
+    snapshot: &Option<(MemoryRenderBuffer, Size<i32, Logical>)>,
+    origin: Point<i32, Physical>,
+    display_size: Size<i32, Logical>,
+    alpha: f32,
+    progress: f32,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let Some((buffer, native)) = snapshot else {
+        return;
+    };
+    // Let the element use the buffer's native size as its source, then stretch
+    // it to the animated size. Overriding `from_buffer`'s `size` instead would
+    // make it sample a source rect larger than the captured texture.
+    let element = MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        origin.to_f64(),
+        buffer,
+        Some(alpha * (1.0 - progress)),
+        None,
+        None,
+        Kind::Unspecified,
+    )
+    .expect("failed to import window snapshot");
+    let scale = Scale::from((
+        display_size.w as f64 / native.w.max(1) as f64,
+        display_size.h as f64 / native.h.max(1) as f64,
+    ));
+    out.push(WindowRenderElement::Snapshot(RescaleRenderElement::from_element(
+        element, origin, scale,
+    )));
+}
+
+/// Append the client content, stretching it from the committed size to the
+/// displayed (animated) size when they differ. `origin` is the physical
+/// top-left the content is anchored to.
+fn extend_scaled<R>(
+    out: &mut Vec<WindowRenderElement<R>>,
+    elements: Vec<WaylandSurfaceRenderElement<R>>,
+    origin: Point<i32, Physical>,
+    committed: Size<i32, Logical>,
+    display: Size<i32, Logical>,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    if display == committed || committed.w <= 0 || committed.h <= 0 {
+        out.extend(elements.into_iter().map(WindowRenderElement::from));
+        return;
+    }
+    let scale = Scale::from((
+        display.w as f64 / committed.w as f64,
+        display.h as f64 / committed.h as f64,
+    ));
+    out.extend(elements.into_iter().map(|element| {
+        WindowRenderElement::Scaled(RescaleRenderElement::from_element(element, origin, scale))
+    }));
 }

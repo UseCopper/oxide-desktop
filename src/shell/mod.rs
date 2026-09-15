@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::time::Instant;
 
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::XWaylandClientData;
@@ -7,7 +8,18 @@ use smithay::xwayland::XWaylandClientData;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
+            damage::OutputDamageTracker,
+            element::{
+                AsRenderElements, memory::MemoryRenderBuffer, surface::WaylandSurfaceRenderElement,
+            },
+            gles::GlesTexture,
+            utils::on_commit_buffer_handler,
+        },
+    },
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, WindowSurfaceType, layer_map_for_output,
         space::SpaceElement,
@@ -21,7 +33,7 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{IsAlive, Logical, Point, Rectangle, Size},
+    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -45,6 +57,7 @@ use crate::{
     state::{AnvilState, Backend},
 };
 
+mod animation;
 mod element;
 mod grabs;
 pub(crate) mod ssd;
@@ -52,31 +65,13 @@ pub(crate) mod ssd;
 mod x11;
 mod xdg;
 
+pub use self::animation::*;
 pub use self::element::*;
 pub use self::grabs::*;
 
 use self::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, RelativeGeometry};
 
 use self::xdg::handle_toplevel_commit;
-
-fn fullscreen_output_geometry(
-    wl_surface: &WlSurface,
-    wl_output: Option<&wl_output::WlOutput>,
-    space: &mut Space<WindowElement>,
-) -> Option<Rectangle<i32, Logical>> {
-    // First test if a specific output has been requested
-    // if the requested output is not found ignore the request
-    wl_output
-        .and_then(Output::from_resource)
-        .or_else(|| {
-            let w = space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false));
-            w.and_then(|w| space.outputs_for_element(w).first().cloned())
-        })
-        .as_ref()
-        .and_then(|o| space.output_geometry(o))
-}
 
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
@@ -305,6 +300,149 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
             .cloned()
     }
+
+    /// Start an ease-out transition of `window` from its current geometry to
+    /// the given content size and location. The client keeps drawing at its own
+    /// pace; the frame and content are stretched to the animated rect until it
+    /// catches up.
+    pub fn animate_window(
+        &mut self,
+        window: &WindowElement,
+        target_content: Size<i32, Logical>,
+        target_loc: Point<i32, Logical>,
+    ) {
+        let Some(start_loc) = self.space.element_location(window) else {
+            return;
+        };
+        let start = WindowRect::from_geometry(start_loc, window.resize_content_size());
+        let end = WindowRect::from_geometry(target_loc, target_content);
+        if start.loc == end.loc && start.content == end.content {
+            return;
+        }
+        window.decoration_state().animation =
+            Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
+    }
+
+    /// Advance every in-flight window animation. Called once per frame before
+    /// rendering: updates where the window is mapped and retires animations
+    /// whose client has caught up with the configured size.
+    pub fn tick_animations(&mut self) {
+        let now = Instant::now();
+        let windows: Vec<WindowElement> = self.space.elements().cloned().collect();
+        for window in windows {
+            // Clone the animation out before touching the window again: sampling
+            // it and asking for the committed size both borrow the window state.
+            let Some(animation) = window.decoration_state().animation.clone() else {
+                continue;
+            };
+            let (rect, progress) = animation.sample(now);
+            let loc = Point::<i32, Logical>::from((
+                rect.loc.x.round() as i32,
+                rect.loc.y.round() as i32,
+            ));
+            if self.space.element_location(&window) != Some(loc) {
+                self.space.relocate_element(&window, loc);
+            }
+            // Once the curve is done, keep the animation (which holds the window
+            // at its target geometry) until the client has adopted the new size,
+            // so a slow client doesn't snap back to its old geometry.
+            if progress >= 1.0 {
+                let target: Size<i32, Logical> = rect.content.to_i32_round();
+                let committed = window.resize_content_size();
+                if (committed.w - target.w).abs() <= 1 && (committed.h - target.h).abs() <= 1 {
+                    window.decoration_state().animation = None;
+                }
+            }
+        }
+    }
+}
+
+/// Capture the pre-transition pixels of every window that is waiting for a
+/// snapshot, so its animation can crossfade from it. Must be called with the
+/// output framebuffer unbound, before rendering the frame.
+pub fn capture_window_snapshots<R>(space: &Space<WindowElement>, renderer: &mut R)
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let windows: Vec<WindowElement> = space.elements().cloned().collect();
+    for window in windows {
+        let pending = window
+            .decoration_state()
+            .animation
+            .as_ref()
+            .map(|animation| animation.needs_snapshot())
+            .unwrap_or(false);
+        if !pending {
+            continue;
+        }
+
+        let content = window.resize_content_size();
+        if content.w > 0 && content.h > 0 {
+            let size = Size::<i32, Buffer>::from((content.w, content.h));
+            if let Some(buffer) = capture_window_content(renderer, &window, size) {
+                window
+                    .decoration_state()
+                    .animation
+                    .as_mut()
+                    .unwrap()
+                    .set_snapshot(buffer, content);
+                continue;
+            }
+        }
+        window
+            .decoration_state()
+            .animation
+            .as_mut()
+            .unwrap()
+            .set_snapshot_unavailable();
+    }
+}
+
+/// Render a window's client content into an offscreen buffer and read it back
+/// as a [`MemoryRenderBuffer`]. Returns `None` if the renderer cannot provide
+/// a readable offscreen target.
+fn capture_window_content<R>(
+    renderer: &mut R,
+    window: &WindowElement,
+    size: Size<i32, Buffer>,
+) -> Option<MemoryRenderBuffer>
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let mut target = renderer.create_buffer(Fourcc::Abgr8888, size).ok()?;
+    let mut framebuffer = renderer.bind(&mut target).ok()?;
+
+    let elements: Vec<WaylandSurfaceRenderElement<R>> = AsRenderElements::render_elements(
+        &window.0,
+        renderer,
+        Point::from((0, 0)),
+        Scale::from(1.0),
+        1.0,
+    );
+
+    let physical_size = Size::<i32, Physical>::from((size.w, size.h));
+    let mut tracker = OutputDamageTracker::new(physical_size, 1.0, Transform::Normal);
+    tracker
+        .render_output(renderer, &mut framebuffer, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+        .ok()?;
+
+    let region = Rectangle::<i32, Buffer>::from_size(size);
+    let mapping = renderer
+        .copy_framebuffer(&framebuffer, region, Fourcc::Abgr8888)
+        .ok()?;
+    let data = renderer.map_texture(&mapping).ok()?;
+    // Smithay's GL renderer flips y while drawing into a `Normal` target, so the
+    // readback already comes out top-down: no extra transform is needed.
+    Some(MemoryRenderBuffer::from_slice(
+        data,
+        Fourcc::Abgr8888,
+        size,
+        1,
+        Transform::Normal,
+        None,
+    ))
 }
 
 #[derive(Default)]
@@ -517,13 +655,38 @@ fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rec
     (area.size.w > 0 && area.size.h > 0).then_some(area)
 }
 
-/// Compute a window's geometry as fractions of its output's work area.
-pub fn relative_geometry_of(
+/// The output a window belongs to.
+///
+/// [`Space::outputs_for_element`] returns its outputs in an unspecified order
+/// (they are kept in a `HashMap`), which is wrong when a window overlaps more
+/// than one output — e.g. a fullscreen window on a secondary monitor. Prefer
+/// the output under the window's top-left corner and only fall back to the
+/// arbitrary order/primary output when nothing contains it.
+pub fn output_for_window(space: &Space<WindowElement>, window: &WindowElement) -> Option<Output> {
+    let outputs = space.outputs_for_element(window);
+    if let Some(loc) = space.element_location(window)
+        && let Some(output) = outputs.iter().find(|output| {
+            space
+                .output_geometry(output)
+                .map(|geo| geo.contains(loc))
+                .unwrap_or(false)
+        })
+    {
+        return Some(output.clone());
+    }
+    outputs
+        .first()
+        .cloned()
+        .or_else(|| space.outputs().next().cloned())
+}
+
+/// Compute a window's geometry as fractions of a specific output's work area.
+pub fn relative_geometry_of_output(
     space: &Space<WindowElement>,
+    output: &Output,
     window: &WindowElement,
 ) -> Option<RelativeGeometry> {
-    let output = space.outputs_for_element(window).first().cloned()?;
-    let area = output_work_area(space, &output)?;
+    let area = output_work_area(space, output)?;
     let loc = space.element_location(window)?;
     let size = window.geometry().size;
     Some(RelativeGeometry {
@@ -534,20 +697,30 @@ pub fn relative_geometry_of(
     })
 }
 
-/// Turn a fractional geometry back into an absolute location and the
-/// (undecorated) content size to configure the client with.
-pub fn absolute_geometry(
+/// Compute a window's geometry as fractions of its output's work area.
+pub fn relative_geometry_of(
     space: &Space<WindowElement>,
     window: &WindowElement,
+) -> Option<RelativeGeometry> {
+    let output = output_for_window(space, window)?;
+    relative_geometry_of_output(space, &output, window)
+}
+
+/// Turn a fractional geometry back into an absolute location and the
+/// (undecorated) content size to configure the client with, against a specific
+/// output's work area.
+pub fn absolute_geometry_for_output(
+    space: &Space<WindowElement>,
+    output: &Output,
     rel: RelativeGeometry,
+    is_ssd: bool,
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
-    let output = space.outputs_for_element(window).first().cloned()?;
-    let area = output_work_area(space, &output)?;
+    let area = output_work_area(space, output)?;
     let loc = Point::from((
         area.loc.x + (rel.x * area.size.w as f64).round() as i32,
         area.loc.y + (rel.y * area.size.h as f64).round() as i32,
     ));
-    let decoration: Size<i32, Logical> = if window.is_ssd() {
+    let decoration: Size<i32, Logical> = if is_ssd {
         Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
     } else {
         Size::from((0, 0))
@@ -557,6 +730,17 @@ pub fn absolute_geometry(
         ((rel.h * area.size.h as f64).round() as i32 - decoration.h).max(1),
     ));
     Some((loc, size))
+}
+
+/// Turn a fractional geometry back into an absolute location and the
+/// (undecorated) content size to configure the client with.
+pub fn absolute_geometry(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    rel: RelativeGeometry,
+) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
+    let output = output_for_window(space, window)?;
+    absolute_geometry_for_output(space, &output, rel, window.is_ssd())
 }
 
 /// Snapshot every floating window's position and size as a fraction of its
@@ -586,6 +770,9 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
 
     let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
     for window in windows {
+        // An output mode change re-lays out every window, so any in-flight
+        // transition is superseded by the new geometry.
+        window.decoration_state().animation = None;
         if let Some(toplevel) = window.0.toplevel() {
             let fullscreen = window.decoration_state().header_bar.fullscreen;
             if fullscreen {

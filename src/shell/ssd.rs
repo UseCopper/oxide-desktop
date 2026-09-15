@@ -17,6 +17,7 @@ use smithay::{
         pointer::{CursorIcon, CursorImageStatus, Focus, GrabStartData as PointerGrabStartData},
         touch::GrabStartData as TouchGrabStartData,
     },
+    output::WeakOutput,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{IsAlive, Logical, Physical, Point, Scale, Serial, Size, Transform},
     wayland::compositor::with_states,
@@ -27,7 +28,7 @@ use std::cell::{RefCell, RefMut};
 use crate::{AnvilState, state::Backend};
 
 use super::{
-    SurfaceData, WindowElement,
+    SurfaceData, WindowAnimation, WindowElement,
     grabs::{
         PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeGrabState, ResizeState,
         TouchResizeSurfaceGrab,
@@ -36,13 +37,20 @@ use super::{
 
 pub struct WindowState {
     pub is_ssd: bool,
-    pub fullscreen_restore: Option<RelativeGeometry>,
+    /// Where to restore the window after fullscreen, as a fraction of the work
+    /// area of the output it was fullscreened on. A *weak* output handle is
+    /// stored so the window and the output's fullscreen state can't keep each
+    /// other alive (and because the output may be unplugged while fullscreen).
+    pub fullscreen_restore: Option<(WeakOutput, RelativeGeometry)>,
     pub maximize_restore: Option<RelativeGeometry>,
     /// Position and size of the window as fractions of its output's work area
     /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
     /// resize and reapplied against the new work area so floating windows keep
     /// their relative placement across resolution changes and monitor layouts.
     pub relative: Option<RelativeGeometry>,
+    /// An in-flight maximize/unmaximize transition, if any. While set, the
+    /// window is drawn at the sampled geometry instead of its committed size.
+    pub animation: Option<WindowAnimation>,
     pub header_bar: HeaderBar,
 }
 
@@ -309,10 +317,10 @@ impl HeaderBar {
             return;
         }
         match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
                 state.close_window(window.clone());
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
                 // Maximize/unmaximize like a normal titlebar button. If the
                 // client put itself fullscreen, this exits that instead so the
                 // user is never stuck (the icon shows "restore" for both).
@@ -329,7 +337,7 @@ impl HeaderBar {
                     }
                 });
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
                 state.minimize_request(window.clone());
             }
             Some(_) => {
@@ -372,9 +380,9 @@ impl HeaderBar {
         _serial: Serial,
     ) {
         match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {}
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {}
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {}
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {}
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {}
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {}
             Some(_) => {
                 if let Some(origin) = state.space.element_location(window) {
                     self.start_drag(state, window, origin);
@@ -395,10 +403,10 @@ impl HeaderBar {
             return;
         }
         match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
                 state.close_window(window.clone());
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
                 let window = window.clone();
                 let fullscreen = self.fullscreen;
                 let maximized = window.is_maximized();
@@ -412,7 +420,7 @@ impl HeaderBar {
                     }
                 });
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
+            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
                 state.minimize_request(window.clone());
             }
             _ => {}
@@ -466,7 +474,7 @@ impl HeaderBar {
         if self
             .pointer_loc
             .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH) as f64)
+            .map(|l| l.x >= (width.saturating_sub(BUTTON_WIDTH)) as f64)
             .unwrap_or(false)
             && (needs_redraw_buttons || !self.close_button_hover)
         {
@@ -476,7 +484,7 @@ impl HeaderBar {
         } else if !self
             .pointer_loc
             .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH) as f64)
+            .map(|l| l.x >= (width.saturating_sub(BUTTON_WIDTH)) as f64)
             .unwrap_or(false)
             && (needs_redraw_buttons || self.close_button_hover)
         {
@@ -489,7 +497,7 @@ impl HeaderBar {
             .pointer_loc
             .as_ref()
             .map(|l| {
-                l.x < (width - BUTTON_WIDTH) as f64 && l.x >= (width - BUTTON_WIDTH * 2) as f64
+                l.x < (width.saturating_sub(BUTTON_WIDTH)) as f64 && l.x >= (width.saturating_sub(BUTTON_WIDTH * 2)) as f64
             })
             .unwrap_or(false)
             && (needs_redraw_buttons || !self.maximize_button_hover)
@@ -501,7 +509,7 @@ impl HeaderBar {
             .pointer_loc
             .as_ref()
             .map(|l| {
-                l.x < (width - BUTTON_WIDTH) as f64 && l.x >= (width - BUTTON_WIDTH * 2) as f64
+                l.x < (width.saturating_sub(BUTTON_WIDTH)) as f64 && l.x >= (width.saturating_sub(BUTTON_WIDTH * 2)) as f64
             })
             .unwrap_or(false)
             && (needs_redraw_buttons || self.maximize_button_hover)
@@ -515,7 +523,7 @@ impl HeaderBar {
             .pointer_loc
             .as_ref()
             .map(|l| {
-                l.x < (width - BUTTON_WIDTH * 2) as f64 && l.x >= (width - BUTTON_WIDTH * 3) as f64
+                l.x < (width.saturating_sub(BUTTON_WIDTH * 2)) as f64 && l.x >= (width.saturating_sub(BUTTON_WIDTH * 3)) as f64
             })
             .unwrap_or(false)
             && (needs_redraw_buttons || !self.minimize_button_hover)
@@ -527,7 +535,7 @@ impl HeaderBar {
             .pointer_loc
             .as_ref()
             .map(|l| {
-                l.x < (width - BUTTON_WIDTH * 2) as f64 && l.x >= (width - BUTTON_WIDTH * 3) as f64
+                l.x < (width.saturating_sub(BUTTON_WIDTH * 2)) as f64 && l.x >= (width.saturating_sub(BUTTON_WIDTH * 3)) as f64
             })
             .unwrap_or(false)
             && (needs_redraw_buttons || self.minimize_button_hover)
@@ -636,6 +644,7 @@ impl WindowElement {
                 fullscreen_restore: None,
                 maximize_restore: None,
                 relative: None,
+                animation: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
@@ -818,6 +827,8 @@ impl<B: Backend> AnvilState<B> {
         if !window.alive() || edges.is_empty() {
             return None;
         }
+        // An interactive resize takes over from any in-flight transition.
+        window.decoration_state().animation = None;
         let initial_window_location = self.space.element_location(window)?;
         // Resizing works in surface (content) coordinates, so ignore the
         // decoration bounds that `SpaceElement::geometry` adds.

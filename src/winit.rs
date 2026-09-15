@@ -250,6 +250,7 @@ pub fn run_winit() {
         state.popups.cleanup();
         display_handle.flush_clients().unwrap();
 
+        state.tick_animations();
 
         // drawing logic
         {
@@ -260,6 +261,8 @@ pub fn run_winit() {
                     .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
                     .unwrap_or_default();
             state.pre_repaint(&output, frame_target);
+
+            crate::shell::capture_window_snapshots(&state.space, state.backend_data.backend.renderer());
 
             let backend = &mut state.backend_data.backend;
 

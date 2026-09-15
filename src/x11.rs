@@ -315,6 +315,8 @@ pub fn run_x11() {
         state.popups.cleanup();
         display_handle.flush_clients().unwrap();
 
+        state.tick_animations();
+
         if state.backend_data.render {
             profiling::scope!("render_frame");
 
@@ -325,6 +327,8 @@ pub fn run_x11() {
                     .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
                     .unwrap_or_default();
             state.pre_repaint(&output, frame_target);
+
+            crate::shell::capture_window_snapshots(&state.space, &mut state.backend_data.renderer);
 
             let backend_data = &mut state.backend_data;
             // We need to borrow everything we want to refer to inside the renderer callback otherwise rustc is unhappy.
