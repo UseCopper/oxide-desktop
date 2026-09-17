@@ -23,12 +23,15 @@ use smithay::{
     wayland::compositor::with_states,
 };
 
-use std::cell::{RefCell, RefMut};
+use std::{
+    cell::{RefCell, RefMut},
+    time::{Duration, Instant},
+};
 
 use crate::{AnvilState, state::Backend};
 
 use super::{
-    SurfaceData, WindowAnimation, WindowElement,
+    SurfaceData, VisibilityAnimation, WindowAnimation, WindowElement,
     grabs::{
         PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeGrabState, ResizeState,
         TouchResizeSurfaceGrab,
@@ -51,8 +54,30 @@ pub struct WindowState {
     /// An in-flight maximize/unmaximize transition, if any. While set, the
     /// window is drawn at the sampled geometry instead of its committed size.
     pub animation: Option<WindowAnimation>,
+    /// The window's open/close fade-and-scale transition.
+    pub visibility: VisibilityState,
     pub header_bar: HeaderBar,
 }
+
+/// State backing a window's open/close transition.
+#[derive(Debug, Clone, Default)]
+pub struct VisibilityState {
+    /// The in-flight transition, if any. Kept set at the end of a close so the
+    /// window stays hidden until the client actually destroys it.
+    pub animation: Option<VisibilityAnimation>,
+    /// A newly mapped window waits for its first buffer before the open
+    /// transition starts, so a slow client doesn't waste the animation.
+    pub open_pending: bool,
+    /// Set as soon as a close is requested: the window stops taking input and
+    /// the client is told to close once the transition finishes.
+    pub closing: bool,
+    /// When the close request was actually sent to the client, used to give up
+    /// waiting and un-hide a client that ignores the request.
+    pub close_sent_at: Option<Instant>,
+}
+
+/// How long to wait for a client to honour a close request before un-hiding it.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A window's geometry expressed relative to its output's work area.
 #[derive(Debug, Clone, Copy, Default)]
@@ -318,7 +343,10 @@ impl HeaderBar {
         }
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
-                state.close_window(window.clone());
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `close_window` mutates it.
+                let window = window.clone();
+                state.handle.insert_idle(move |data| data.close_window(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
                 // Maximize/unmaximize like a normal titlebar button. If the
@@ -404,7 +432,10 @@ impl HeaderBar {
         }
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
-                state.close_window(window.clone());
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `close_window` mutates it.
+                let window = window.clone();
+                state.handle.insert_idle(move |data| data.close_window(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
                 let window = window.clone();
@@ -645,6 +676,7 @@ impl WindowElement {
                 maximize_restore: None,
                 relative: None,
                 animation: None,
+                visibility: VisibilityState::default(),
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
@@ -699,6 +731,43 @@ impl WindowElement {
 
     pub fn is_ssd(&self) -> bool {
         self.decoration_state().is_ssd
+    }
+
+    /// Mark a freshly mapped window so its open transition starts as soon as it
+    /// has content to show.
+    pub fn begin_open(&self) {
+        let mut state = self.decoration_state();
+        if state.visibility.animation.is_none() && !state.visibility.closing {
+            state.visibility.open_pending = true;
+        }
+    }
+
+    /// Request that the window close: it fades and grows out, and the client is
+    /// told to close once the transition completes.
+    pub fn begin_close(&self) {
+        let mut state = self.decoration_state();
+        if state.visibility.closing {
+            return;
+        }
+        state.visibility.closing = true;
+        state.visibility.open_pending = false;
+        state.visibility.animation = Some(VisibilityAnimation::close());
+    }
+
+    /// Whether a close has been requested for this window.
+    pub fn is_closing(&self) -> bool {
+        self.decoration_state().visibility.closing
+    }
+
+    /// The opacity and center scale the window should be drawn with right now.
+    /// Returns `None` when no open/close transition is active.
+    pub fn visibility(&self) -> Option<(f32, f64)> {
+        let state = self.decoration_state();
+        state
+            .visibility
+            .animation
+            .as_ref()
+            .map(|animation| animation.sample(Instant::now()))
     }
 
     pub fn is_maximized(&self) -> bool {

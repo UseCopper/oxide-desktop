@@ -101,6 +101,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // of a xdg_surface has to be sent during the commit if
         // the surface is not already configured
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
+        window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
     }
 
@@ -451,6 +452,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     // button click always have the exact same effect.
 
     pub fn close_window(&mut self, window: WindowElement) {
+        if window.is_closing() {
+            return;
+        }
+        // Play the close transition first; the client is told to close once it
+        // has finished (see `tick_animations`).
+        window.begin_close();
+        // The window is no longer interactive, so move focus off it.
+        self.clear_window_focus(&window);
+    }
+
+    /// Deliver a close request to the client without any transition.
+    pub fn send_close(&mut self, window: &WindowElement) {
         match window.0.underlying_surface() {
             WindowSurface::Wayland(w) => w.send_close(),
             #[cfg(feature = "xwayland")]

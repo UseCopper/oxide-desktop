@@ -647,6 +647,9 @@ render_elements!(
     Icon=MemoryRenderBufferRenderElement<R>,
     Scaled=RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
     Snapshot=RescaleRenderElement<MemoryRenderBufferRenderElement<R>>,
+    ScaledDecoration=RescaleRenderElement<SolidColorRenderElement>,
+    ScaledScaled=RescaleRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>,
+    ScaledSnapshot=RescaleRenderElement<RescaleRenderElement<MemoryRenderBufferRenderElement<R>>>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -657,6 +660,9 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
             Self::Icon(arg0) => f.debug_tuple("Icon").field(arg0).finish(),
             Self::Scaled(arg0) => f.debug_tuple("Scaled").field(arg0).finish(),
             Self::Snapshot(arg0) => f.debug_tuple("Snapshot").field(arg0).finish(),
+            Self::ScaledDecoration(arg0) => f.debug_tuple("ScaledDecoration").field(arg0).finish(),
+            Self::ScaledScaled(arg0) => f.debug_tuple("ScaledScaled").field(arg0).finish(),
+            Self::ScaledSnapshot(arg0) => f.debug_tuple("ScaledSnapshot").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -677,6 +683,15 @@ where
         alpha: f32,
     ) -> Vec<C> {
         let window_bbox = SpaceElement::bbox(&self.0);
+        // The window's undecorated top-left, before `location` is advanced past
+        // the header bar; used as the pivot for the open/close scale.
+        let window_origin = location;
+
+        // A window opening or closing fades and scales as one piece. The alpha
+        // is folded into every sub-element; the scale is applied to the finished
+        // list, about the center of the decorated window.
+        let (visibility_alpha, visibility_scale) = self.visibility().unwrap_or((1.0, 1.0));
+        let alpha = alpha * visibility_alpha;
 
         // While a maximize/unmaximize transition is running the window is drawn
         // at the interpolated (animated) size. The client's content is
@@ -788,6 +803,16 @@ where
                 AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
             extend_scaled(&mut vec, window_elements, location, content_size, display_size);
 
+            let decorated_size: Size<i32, Logical> = if fullscreen {
+                Size::from((display_size.w, HEADER_BAR_HEIGHT + display_size.h))
+            } else {
+                Size::from((
+                    display_size.w + 2 * BORDER_WIDTH,
+                    display_size.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
+                ))
+            };
+            let center = window_origin + decorated_center(decorated_size, scale);
+            vec = scale_elements_about(vec, center, visibility_scale);
             vec.into_iter().map(C::from).collect()
         } else {
             let content_size = self.resize_content_size();
@@ -808,9 +833,59 @@ where
             let window_elements: Vec<WaylandSurfaceRenderElement<R>> =
                 AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
             extend_scaled(&mut vec, window_elements, location, content_size, display_size);
+            let center = window_origin + decorated_center(display_size, scale);
+            vec = scale_elements_about(vec, center, visibility_scale);
             vec.into_iter().map(C::from).collect()
         }
     }
+}
+
+/// The offset from a window's top-left to the center of its `decorated_size`,
+/// in physical pixels.
+fn decorated_center(decorated_size: Size<i32, Logical>, scale: Scale<f64>) -> Point<i32, Physical> {
+    Point::<f64, Physical>::from((
+        decorated_size.w as f64 / 2.0 * scale.x,
+        decorated_size.h as f64 / 2.0 * scale.y,
+    ))
+    .to_i32_round()
+}
+
+/// Re-scale every element of a window about `origin` by `scale`, used for the
+/// open/close transition. Already-scaled elements are wrapped one level deeper
+/// so the transforms compose.
+fn scale_elements_about<R>(
+    elements: Vec<WindowRenderElement<R>>,
+    origin: Point<i32, Physical>,
+    scale: f64,
+) -> Vec<WindowRenderElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return elements;
+    }
+    elements
+        .into_iter()
+        .map(|element| match element {
+            WindowRenderElement::Window(e) => WindowRenderElement::Scaled(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Decoration(e) => WindowRenderElement::ScaledDecoration(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Icon(e) => WindowRenderElement::Snapshot(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Scaled(e) => WindowRenderElement::ScaledScaled(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Snapshot(e) => WindowRenderElement::ScaledSnapshot(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            other => other,
+        })
+        .collect()
 }
 
 /// Draw the frozen pre-transition frame stretched into the animated content

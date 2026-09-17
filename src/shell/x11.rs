@@ -66,6 +66,7 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             return;
         }
         let window = WindowElement(Window::new_x11_window(window));
+        window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
         let Some(bbox) = self.space.element_bbox(&window) else {
             return;

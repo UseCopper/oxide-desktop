@@ -33,7 +33,7 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -54,6 +54,7 @@ use smithay::{
 
 use crate::{
     ClientState,
+    focus::KeyboardFocusTarget,
     state::{AnvilState, Backend},
 };
 
@@ -69,7 +70,7 @@ pub use self::animation::*;
 pub use self::element::*;
 pub use self::grabs::*;
 
-use self::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, RelativeGeometry};
+use self::ssd::{BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, RelativeGeometry, VisibilityState};
 
 use self::xdg::handle_toplevel_commit;
 
@@ -329,7 +330,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     pub fn tick_animations(&mut self) {
         let now = Instant::now();
         let windows: Vec<WindowElement> = self.space.elements().cloned().collect();
-        for window in windows {
+        for window in &windows {
             // Clone the animation out before touching the window again: sampling
             // it and asking for the committed size both borrow the window state.
             let Some(animation) = window.decoration_state().animation.clone() else {
@@ -340,8 +341,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
             ));
-            if self.space.element_location(&window) != Some(loc) {
-                self.space.relocate_element(&window, loc);
+            if self.space.element_location(window) != Some(loc) {
+                self.space.relocate_element(window, loc);
             }
             // Once the curve is done, keep the animation (which holds the window
             // at its target geometry) until the client has adopted the new size,
@@ -353,6 +354,79 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     window.decoration_state().animation = None;
                 }
             }
+        }
+
+        self.tick_visibility_animations(&windows, now);
+    }
+
+    /// Advance every window's open/close transition: start opens that were
+    /// waiting for their first buffer, retire finished opens, and deliver the
+    /// close request once a close transition has played out.
+    fn tick_visibility_animations(&mut self, windows: &[WindowElement], now: Instant) {
+        let mut to_close = Vec::new();
+        for window in windows {
+            // Resolve the committed size before borrowing the decoration state:
+            // it reads that same state on the SSD path.
+            let content = window.resize_content_size();
+            let mut send_close = false;
+            {
+                let mut state = window.decoration_state();
+
+                if state.visibility.open_pending
+                    && state.visibility.animation.is_none()
+                    && !state.visibility.closing
+                    && content.w > 0
+                    && content.h > 0
+                {
+                    state.visibility.open_pending = false;
+                    state.visibility.animation = Some(VisibilityAnimation::open());
+                }
+
+                let finished = state
+                    .visibility
+                    .animation
+                    .as_ref()
+                    .map(|animation| (animation.kind(), animation.finished(now)));
+                match finished {
+                    Some((VisibilityKind::Open, true)) => {
+                        state.visibility.animation = None;
+                    }
+                    Some((VisibilityKind::Close, true)) => {
+                        if state.visibility.close_sent_at.is_none() {
+                            state.visibility.close_sent_at = Some(now);
+                            send_close = true;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // A client that ignores the close request should not stay hidden
+                // forever: after a grace period, un-hide it.
+                if let Some(sent_at) = state.visibility.close_sent_at
+                    && now.saturating_duration_since(sent_at) > CLOSE_TIMEOUT
+                {
+                    state.visibility = VisibilityState::default();
+                }
+            }
+            if send_close {
+                to_close.push(window.clone());
+            }
+        }
+        for window in to_close {
+            self.send_close(&window);
+        }
+    }
+
+    /// Move the keyboard focus off `window` if it currently holds it. Used when
+    /// a window stops being interactive.
+    pub fn clear_window_focus(&mut self, window: &WindowElement) {
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && matches!(
+                keyboard.current_focus(),
+                Some(KeyboardFocusTarget::Window(w)) if w == window.0
+            )
+        {
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
     }
 }
