@@ -94,11 +94,29 @@ pub fn run_winit() {
     let mut display_handle = display.handle();
 
     #[cfg_attr(not(feature = "egl"), allow(unused_mut))]
-    let (mut backend, mut winit) = match winit::init::<GlesRenderer>() {
-        Ok(ret) => ret,
-        Err(err) => {
-            error!("Failed to initialize Winit backend: {}", err);
-            return;
+    let (mut backend, mut winit) = {
+        // Use vsync so `eglSwapBuffers` blocks on the display's refresh instead
+        // of the compositor spinning and swapping as fast as it can.
+        use smithay::backend::egl::context::GlAttributes;
+        use smithay::reexports::winit::{dpi::LogicalSize, window::WindowAttributes};
+
+        let attributes = WindowAttributes::default()
+            .with_surface_size(LogicalSize::new(1280.0, 800.0))
+            .with_title("Smithay")
+            .with_visible(true);
+        let gl_attributes = GlAttributes {
+            version: (3, 0),
+            profile: None,
+            debug: cfg!(debug_assertions),
+            vsync: true,
+        };
+
+        match winit::init_from_attributes_with_gl_attr::<GlesRenderer>(attributes, gl_attributes) {
+            Ok(ret) => ret,
+            Err(err) => {
+                error!("Failed to initialize Winit backend: {}", err);
+                return;
+            }
         }
     };
     let size = backend.window_size();
@@ -207,6 +225,11 @@ pub fn run_winit() {
 
     let mut pointer_element = PointerElement::with_cursor(crate::cursor::Cursor::load());
 
+    // Render only when the host says the surface is ready (`RedrawRequested`,
+    // driven by the compositor's frame callbacks), so presentation is paced by
+    // the display refresh rather than a fixed timer or a busy loop.
+    let mut redraw = true;
+
     while state.running.load(Ordering::SeqCst) {
         let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { size, .. } => {
@@ -227,6 +250,7 @@ pub fn run_winit() {
             WinitEvent::CloseRequested => {
                 state.running.store(false, Ordering::SeqCst);
             }
+            WinitEvent::Redraw => redraw = true,
             _ => (),
         });
 
@@ -253,7 +277,11 @@ pub fn run_winit() {
         state.tick_animations();
 
         // drawing logic
-        {
+        if redraw {
+            redraw = false;
+            // Ask the host for the next frame. It is delivered once the surface
+            // is ready, which paces us to the display's refresh.
+            state.backend_data.backend.window().request_redraw();
             let now = state.clock.now();
             let frame_target = now
                 + output
