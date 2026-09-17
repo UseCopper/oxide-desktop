@@ -105,6 +105,19 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
     }
 
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // The client is gone (or closing itself); play its close transition from
+        // the cached frame.
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.0.toplevel().is_some_and(|t| t == &surface))
+            .cloned();
+        if let Some(window) = window {
+            self.begin_window_ghost(&window);
+        }
+    }
+
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         // Do not send a configure here, the initial configure
         // of a xdg_surface has to be sent during the commit if

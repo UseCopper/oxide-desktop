@@ -270,6 +270,7 @@ pub fn run_winit() {
             state.running.store(false, Ordering::SeqCst);
             break;
         }
+        state.reap_closing_windows();
         state.space.refresh();
         state.popups.cleanup();
         display_handle.flush_clients().unwrap();

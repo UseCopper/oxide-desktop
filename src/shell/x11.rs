@@ -87,14 +87,7 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        let maybe = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-            .cloned();
-        if let Some(elem) = maybe {
-            self.space.unmap_elem(&elem)
-        }
+        self.ghost_or_unmap_x11(&window);
         if !window.is_override_redirect()
             && let Err(err) = window.set_mapped(false)
         {
@@ -102,7 +95,11 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         }
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        // A window is normally unmapped before it is destroyed, but handle the
+        // direct case too so it still gets a close transition.
+        self.ghost_or_unmap_x11(&window);
+    }
 
     fn configure_request(
         &mut self,
@@ -313,6 +310,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
             .cloned()
+    }
+
+    /// Turn an X11 window that is going away into a closing ghost (if it has a
+    /// cached frame and isn't override-redirect), otherwise remove it.
+    fn ghost_or_unmap_x11(&mut self, window: &X11Surface) {
+        let Some(elem) = self.window_for_x11(window) else {
+            return;
+        };
+        if !window.is_override_redirect() {
+            self.begin_window_ghost(&elem);
+        }
+        if !elem.is_ghosting() {
+            self.space.unmap_elem(&elem);
+        }
     }
 
     pub fn maximize_request_x11(&mut self, window: &X11Surface) {

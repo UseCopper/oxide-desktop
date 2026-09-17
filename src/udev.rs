@@ -539,6 +539,7 @@ pub fn run_udev() {
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
+            state.reap_closing_windows();
             state.space.refresh();
             state.popups.cleanup();
             display_handle.flush_clients().unwrap();

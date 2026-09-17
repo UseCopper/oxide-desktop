@@ -12,7 +12,7 @@ pub const WINDOW_ANIMATION_DURATION: Duration = Duration::from_millis(270);
 
 /// How long a window takes to fade/scale in when it opens, or out when it
 /// closes.
-pub const WINDOW_VISIBILITY_DURATION: Duration = Duration::from_millis(200);
+pub const WINDOW_VISIBILITY_DURATION: Duration = Duration::from_millis(150);
 
 /// How much larger (as a fraction) than its final size a window is drawn at the
 /// start of the open transition; the close transition grows out by the same

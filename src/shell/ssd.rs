@@ -9,6 +9,7 @@ use smithay::{
                 memory::MemoryRenderBuffer,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
             },
+            utils::Buffer as RenderBuffer,
         },
     },
     desktop::{WindowSurface, space::SpaceElement},
@@ -19,12 +20,12 @@ use smithay::{
     },
     output::WeakOutput,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
-    utils::{IsAlive, Logical, Physical, Point, Scale, Serial, Size, Transform},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, Transform},
     wayland::compositor::with_states,
 };
 
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     time::{Duration, Instant},
 };
 
@@ -56,7 +57,70 @@ pub struct WindowState {
     pub animation: Option<WindowAnimation>,
     /// The window's open/close fade-and-scale transition.
     pub visibility: VisibilityState,
+    /// The last buffer the client committed. Holding Smithay's `Buffer` (an
+    /// `Arc`) keeps the pixels alive after the client destroys its surface, so an
+    /// app-triggered close can be rendered from it. Cheap: no GPU work until the
+    /// ghost actually renders.
+    pub last_frame: Option<LastFrame>,
     pub header_bar: HeaderBar,
+}
+
+/// The last committed frame of a window: every mapped surface in its tree, so
+/// both the client content and any subsurfaces (e.g. Firefox's content) are
+/// kept. Holding Smithay's `Buffer` (an `Arc`) keeps the pixels alive after the
+/// client destroys its surface, and costs no GPU work until the ghost renders.
+#[derive(Debug, Clone)]
+pub struct LastFrame {
+    pub surfaces: Vec<SurfaceFrame>,
+    /// The client-declared window geometry: its offset within the root buffer
+    /// (the CSD shadow padding) and the content size. Lets the ghost line the
+    /// content up exactly where the live window drew it.
+    pub geometry: Rectangle<i32, Logical>,
+}
+
+/// One mapped surface of a window, at its position relative to the window's
+/// top-left.
+#[derive(Debug, Clone)]
+pub struct SurfaceFrame {
+    pub buffer: RenderBuffer,
+    pub location: Point<i32, Logical>,
+    /// Logical destination size.
+    pub size: Size<i32, Logical>,
+    pub scale: i32,
+    pub transform: Transform,
+    /// Viewport source crop, if the surface uses a viewport.
+    pub src: Option<Rectangle<f64, Logical>>,
+}
+
+/// Per-window state for a window whose client is gone but whose close
+/// transition is still playing from its cached frame.
+///
+/// Kept in its own `Cell`-based struct (not `WindowState`) so `IsAlive::alive`
+/// and geometry hit tests can read it without borrowing the decoration state,
+/// which would re-enter and panic.
+#[derive(Debug, Default)]
+pub struct GhostState {
+    active: Cell<bool>,
+    size: Cell<Size<i32, Logical>>,
+}
+
+impl GhostState {
+    pub fn is_active(&self) -> bool {
+        self.active.get()
+    }
+
+    pub fn size(&self) -> Option<Size<i32, Logical>> {
+        self.active.get().then(|| self.size.get())
+    }
+
+    pub fn begin(&self, size: Size<i32, Logical>) {
+        self.size.set(size);
+        self.active.set(true);
+    }
+
+    pub fn end(&self) {
+        self.active.set(false);
+    }
 }
 
 /// State backing a window's open/close transition.
@@ -590,37 +654,55 @@ impl<R: Renderer> AsRenderElements<R> for HeaderBar {
     ) -> Vec<C> {
         let button_offset: Point<i32, Logical> = Point::from((BUTTON_WIDTH as i32, 0));
 
-        vec![
-            SolidColorRenderElement::from_buffer(
-                &self.close_button,
-                location + (Point::from((self.width as i32, 0)) - button_offset)
-                    .to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
-            SolidColorRenderElement::from_buffer(
-                &self.maximize_button,
-                location + (Point::from((self.width as i32, 0)) - button_offset.upscale(2))
-                    .to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
-            SolidColorRenderElement::from_buffer(
-                &self.minimize_button,
-                location + (Point::from((self.width as i32, 0)) - button_offset.upscale(3))
-                    .to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
+        // Only draw a button's background while it is hovered: otherwise it is
+        // the same color as the bar and drawing it as a separate opaque rect
+        // makes it show through as a rectangle whenever the whole frame is faded
+        // out (each element is alpha-composited independently).
+        let mut vec: Vec<C> = Vec::new();
+        if self.close_button_hover {
+            vec.push(
+                SolidColorRenderElement::from_buffer(
+                    &self.close_button,
+                    location + (Point::from((self.width as i32, 0)) - button_offset)
+                        .to_physical_precise_round(scale),
+                    scale,
+                    alpha,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
+        if self.maximize_button_hover {
+            vec.push(
+                SolidColorRenderElement::from_buffer(
+                    &self.maximize_button,
+                    location + (Point::from((self.width as i32, 0)) - button_offset.upscale(2))
+                        .to_physical_precise_round(scale),
+                    scale,
+                    alpha,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
+        if self.minimize_button_hover {
+            vec.push(
+                SolidColorRenderElement::from_buffer(
+                    &self.minimize_button,
+                    location + (Point::from((self.width as i32, 0)) - button_offset.upscale(3))
+                        .to_physical_precise_round(scale),
+                    scale,
+                    alpha,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
+        vec.push(
             SolidColorRenderElement::from_buffer(&self.background, location, scale, alpha, Kind::Unspecified)
                 .into(),
-        ]
+        );
+        vec
     }
 }
 
@@ -677,6 +759,7 @@ impl WindowElement {
                 relative: None,
                 animation: None,
                 visibility: VisibilityState::default(),
+                last_frame: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
@@ -720,9 +803,43 @@ impl WindowElement {
         });
 
         self.user_data()
+            .insert_if_missing(GhostState::default);
+
+        self.user_data()
             .get::<RefCell<WindowState>>()
             .unwrap()
             .borrow_mut()
+    }
+
+    /// The ghost tracking for this window, if its decoration state was ever set
+    /// up. Returns `None` before the first `decoration_state()` call.
+    fn ghost_state(&self) -> Option<&GhostState> {
+        self.user_data().get::<GhostState>()
+    }
+
+    /// Whether the client is gone and the window is being drawn from its cached
+    /// frame for the remainder of its close transition.
+    pub fn is_ghosting(&self) -> bool {
+        self.ghost_state().is_some_and(GhostState::is_active)
+    }
+
+    /// The cached frame size, while ghosting.
+    pub fn ghost_size(&self) -> Option<Size<i32, Logical>> {
+        self.ghost_state().and_then(GhostState::size)
+    }
+
+    /// Turn a window whose client is gone into a self-contained closing ghost.
+    /// The window stays in the space (via `IsAlive`) until the transition ends.
+    pub fn begin_ghost(&self, size: Size<i32, Logical>) {
+        self.user_data().insert_if_missing(GhostState::default);
+        self.user_data().get::<GhostState>().unwrap().begin(size);
+    }
+
+    /// Stop ghosting; the window is no longer retained by `IsAlive`.
+    pub fn end_ghost(&self) {
+        if let Some(ghost) = self.ghost_state() {
+            ghost.end();
+        }
     }
 
     pub fn set_ssd(&self, ssd: bool) {
@@ -752,6 +869,9 @@ impl WindowElement {
         state.visibility.closing = true;
         state.visibility.open_pending = false;
         state.visibility.animation = Some(VisibilityAnimation::close());
+        // Drop the titlebar hover highlight so it doesn't linger (and fade as a
+        // rectangle) while the window closes.
+        state.header_bar.pointer_loc = None;
     }
 
     /// Whether a close has been requested for this window.
@@ -770,7 +890,21 @@ impl WindowElement {
             .map(|animation| animation.sample(Instant::now()))
     }
 
+    /// The last committed buffer of the whole window, if any.
+    pub fn last_frame(&self) -> Option<LastFrame> {
+        self.decoration_state().last_frame.clone()
+    }
+
+    /// Record the buffer the client just committed, keeping it alive so an
+    /// app-triggered close can be rendered from it.
+    pub fn set_last_frame(&self, frame: LastFrame) {
+        self.decoration_state().last_frame = Some(frame);
+    }
+
     pub fn is_maximized(&self) -> bool {
+        if self.is_ghosting() {
+            return false;
+        }
         match self.0.underlying_surface() {
             WindowSurface::Wayland(w) => {
                 w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized))
@@ -786,6 +920,9 @@ impl WindowElement {
     /// decorations. The active element is tracked by [`Space`] via
     /// `SpaceElement::set_activate`.
     pub fn is_activated(&self) -> bool {
+        if self.is_ghosting() {
+            return false;
+        }
         match self.0.underlying_surface() {
             WindowSurface::Wayland(w) => {
                 w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Activated))
@@ -816,6 +953,10 @@ impl WindowElement {
     /// drawn. This keeps the SSD frame and the client buffer as one visual
     /// state.
     pub fn resize_content_size(&self) -> Size<i32, Logical> {
+        // A ghost has no live surface to query.
+        if let Some(size) = self.ghost_size() {
+            return size;
+        }
         if let Some(size) = self.resize_committed_size() {
             return size;
         }

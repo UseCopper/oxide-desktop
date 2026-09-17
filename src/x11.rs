@@ -311,6 +311,7 @@ pub fn run_x11() {
             state.running.store(false, Ordering::SeqCst);
             break;
         }
+        state.reap_closing_windows();
         state.space.refresh();
         state.popups.cleanup();
         display_handle.flush_clients().unwrap();
