@@ -17,7 +17,7 @@ use smithay::{
         allocator::dmabuf::Dmabuf,
         egl::EGLDevice,
         renderer::{
-            ImportDma, ImportMemWl,
+            ImportDma, ImportMemWl, Renderer,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::AsRenderElements,
             gles::GlesRenderer,
@@ -487,6 +487,13 @@ pub fn run_winit() {
                 }
                 Err(err) => warn!("Rendering error: {}", err),
             }
+        }
+
+        // Unlike the DRM backend, nothing else prunes the renderer's texture
+        // caches on winit, so unreferenced dmabuf imports would accumulate
+        // forever. Do it once per frame.
+        if let Err(err) = state.backend_data.backend.renderer().cleanup_texture_cache() {
+            warn!("Failed to clean up renderer texture cache: {}", err);
         }
 
         #[cfg(feature = "debug")]

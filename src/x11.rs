@@ -22,8 +22,8 @@ use smithay::{
         },
         egl::{EGLContext, EGLDisplay},
         renderer::{
-            Bind, ImportDma, ImportMemWl, damage::OutputDamageTracker, element::AsRenderElements,
-            gles::GlesRenderer,
+            Bind, ImportDma, ImportMemWl, Renderer, damage::OutputDamageTracker,
+            element::AsRenderElements, gles::GlesRenderer,
         },
         vulkan::{Instance, PhysicalDevice, version::Version},
         x11::{WindowBuilder, X11Backend, X11Event, X11Surface},
@@ -499,6 +499,12 @@ pub fn run_x11() {
                     error!("Rendering error: {}", err);
                     // TODO: convert RenderError into SwapBuffersError and skip temporary (will retry) and panic on ContextLost or recreate
                 }
+            }
+
+            // Prune the renderer's texture caches; nothing else does it here, so
+            // unreferenced dmabuf imports would accumulate.
+            if let Err(err) = state.backend_data.renderer.cleanup_texture_cache() {
+                warn!("Failed to clean up renderer texture cache: {}", err);
             }
 
             #[cfg(feature = "debug")]

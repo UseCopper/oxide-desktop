@@ -435,6 +435,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         self.minimized.push((window.clone(), location));
         self.space.unmap_elem(&window);
+        // While minimized the window isn't rendered, so don't keep holding the
+        // client's buffers (and let it recycle them).
+        window.decoration_state().last_frame = None;
         if let Some(keyboard) = self.seat.get_keyboard() {
             if matches!(
                 keyboard.current_focus(),

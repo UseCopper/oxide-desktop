@@ -486,6 +486,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         for window in dead {
             self.begin_window_ghost(&window);
         }
+
+        // Minimized windows are out of the space and never animate, so a
+        // minimized window whose client exited would otherwise be kept (with
+        // its buffers) forever.
+        self.minimized.retain(|(window, _)| window.0.alive());
     }
 
     /// Start the close transition for a window whose client is already gone,
