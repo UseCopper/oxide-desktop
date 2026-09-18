@@ -3,7 +3,8 @@ use smithay::{
         Color32F, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
-            AsRenderElements, RenderElement, Wrap,
+            AsRenderElements, Kind, RenderElement, Wrap,
+            solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::WaylandSurfaceRenderElement,
             utils::{
                 ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
@@ -15,7 +16,7 @@ use smithay::{
         ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements, constrain_space_element,
     },
     output::Output,
-    utils::{Point, Rectangle, Scale, Size},
+    utils::{Logical, Point, Rectangle, Scale, Size},
     wayland::shell::wlr_layer::Layer,
 };
 
@@ -23,7 +24,10 @@ use smithay::{
 use crate::drawing::FpsElement;
 use crate::{
     drawing::{CLEAR_COLOR, CLEAR_COLOR_FULLSCREEN, PointerRenderElement},
-    shell::{FullscreenSurface, WindowElement, WindowRenderElement},
+    shell::{
+        FullscreenSurface, SNAP_PREVIEW_ALPHA, SNAP_PREVIEW_COLOR, SnapPreviewState, WindowElement,
+        WindowRenderElement,
+    },
 };
 
 smithay::backend::renderer::element::render_elements! {
@@ -56,6 +60,7 @@ smithay::backend::renderer::element::render_elements! {
     Space=SpaceRenderElements<R, E>,
     Window=Wrap<E>,
     Custom=CustomRenderElements<R>,
+    SnapPreview=SolidColorRenderElement,
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
 }
 
@@ -67,6 +72,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Space(arg0) => f.debug_tuple("Space").field(arg0).finish(),
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Custom(arg0) => f.debug_tuple("Custom").field(arg0).finish(),
+            Self::SnapPreview(arg0) => f.debug_tuple("SnapPreview").field(arg0).finish(),
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
@@ -137,6 +143,22 @@ where
                 constrain_behavior,
             )
         })
+}
+
+/// The active snap preview for `output` (translated into output-local logical
+/// coordinates) and its current fade alpha.
+fn snap_preview(
+    output: &Output,
+    space: &Space<WindowElement>,
+) -> Option<(Rectangle<i32, Logical>, f32)> {
+    let preview = output.user_data().get::<SnapPreviewState>()?;
+    let alpha = preview.alpha();
+    if alpha <= 0.0 {
+        return None;
+    }
+    let rect = preview.get()?;
+    let geo = space.output_geometry(output)?;
+    Some((Rectangle::new(rect.loc - geo.loc, rect.size), alpha))
 }
 
 #[profiling::function]
@@ -224,6 +246,22 @@ where
             .into_iter()
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
+
+        // The snap preview sits just behind the cursor and above the windows,
+        // so it highlights the target area without being hidden by them.
+        if let Some((rect, alpha)) = snap_preview(output, space) {
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let buffer = SolidColorBuffer::new(rect.size, SNAP_PREVIEW_COLOR);
+            output_render_elements.push(OutputRenderElements::SnapPreview(
+                SolidColorRenderElement::from_buffer(
+                    &buffer,
+                    rect.loc.to_physical_precise_round(scale),
+                    scale,
+                    alpha * SNAP_PREVIEW_ALPHA,
+                    Kind::Unspecified,
+                ),
+            ));
+        }
 
         if show_window_preview && space.elements_for_output(output).count() > 0 {
             output_render_elements.extend(space_preview_elements(renderer, space, output));

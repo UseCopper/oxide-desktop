@@ -32,7 +32,7 @@ use std::{
 use crate::{AnvilState, state::Backend};
 
 use super::{
-    SurfaceData, VisibilityAnimation, WindowAnimation, WindowElement,
+    SnapTarget, SurfaceData, VisibilityAnimation, WindowAnimation, WindowElement,
     grabs::{
         PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeGrabState, ResizeState,
         TouchResizeSurfaceGrab,
@@ -160,6 +160,9 @@ pub struct SSDDrag {
     pub start_global: Point<f64, Logical>,
     /// Window position in the global compositor space at the start of the drag
     pub start_origin: Point<i32, Logical>,
+    /// The snap target the pointer is currently over, resolved on each motion
+    /// and applied when the drag ends.
+    pub snap_target: Option<SnapTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,11 @@ pub struct HeaderBar {
     pub pointer_loc: Option<Point<f64, Logical>>,
     pub width: u32,
     pub fullscreen: bool,
+    /// The floating geometry to restore when a snapped window is dragged back
+    /// out of its zone. Set when a snap is applied and taken on drag start.
+    /// Lives here (rather than on [`WindowState`]) so `start_drag` can take it
+    /// while the decoration state is already borrowed.
+    pub snap_restore: Option<RelativeGeometry>,
     pub focused: bool,
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
@@ -180,6 +188,14 @@ pub struct HeaderBar {
     pub maximize_icon: MemoryRenderBuffer,
     pub minimize_icon: MemoryRenderBuffer,
     pub restore_icon: MemoryRenderBuffer,
+    /// The window title, cached so it is only re-rasterized when it or the
+    /// available width changes.
+    pub title: String,
+    pub title_buffer: MemoryRenderBuffer,
+    /// Logical width of `title_buffer`; `0` means there is nothing to draw.
+    pub title_width: i32,
+    /// The width the title was last laid out for, to detect relayouts.
+    pub title_max_width: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -194,11 +210,14 @@ pub struct Borders {
 const BG_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 1.0];
 const BG_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0];
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
+const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
 const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
 
 pub const HEADER_BAR_HEIGHT: i32 = 30;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
 pub const BUTTON_WIDTH: u32 = 30;
+/// Space between the title and the window edge / buttons.
+pub const TITLE_PADDING: i32 = 8;
 pub const ICON_SIZE: i32 = 10;
 pub const BORDER_WIDTH: i32 = 2;
 /// Width of the resize grab band just outside the decorated window.
@@ -388,10 +407,16 @@ impl HeaderBar {
             ?start_global,
             "SSD drag started"
         );
+        // The drag owns the window's position, so any restore animation that
+        // starts on the first motion only animates its size. Reset any stale
+        // preview so the dwell starts fresh from the first motion.
+        state.dragging_window = Some(window.clone());
+        state.clear_snap_preview();
         state.ssd_drag = Some(SSDDrag {
             window: window.clone(),
             start_global,
             start_origin: window_origin,
+            snap_target: None,
         });
     }
 
@@ -413,21 +438,12 @@ impl HeaderBar {
                 state.handle.insert_idle(move |data| data.close_window(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
-                // Maximize/unmaximize like a normal titlebar button. If the
-                // client put itself fullscreen, this exits that instead so the
-                // user is never stuck (the icon shows "restore" for both).
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `toggle_maximize` mutates it.
                 let window = window.clone();
-                let fullscreen = self.fullscreen;
-                let maximized = window.is_maximized();
-                state.handle.insert_idle(move |data| {
-                    if fullscreen {
-                        data.unfullscreen_window(window.clone());
-                    } else if maximized {
-                        data.unmaximize_window(window.clone());
-                    } else {
-                        data.maximize_window(window.clone());
-                    }
-                });
+                state
+                    .handle
+                    .insert_idle(move |data| data.toggle_maximize(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
                 // Deferred: the caller holds the decoration state borrowed, and
@@ -505,18 +521,12 @@ impl HeaderBar {
                 state.handle.insert_idle(move |data| data.close_window(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `toggle_maximize` mutates it.
                 let window = window.clone();
-                let fullscreen = self.fullscreen;
-                let maximized = window.is_maximized();
-                state.handle.insert_idle(move |data| {
-                    if fullscreen {
-                        data.unfullscreen_window(window.clone());
-                    } else if maximized {
-                        data.unmaximize_window(window.clone());
-                    } else {
-                        data.maximize_window(window.clone());
-                    }
-                });
+                state
+                    .handle
+                    .insert_idle(move |data| data.toggle_maximize(window));
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
                 // Deferred: the caller holds the decoration state borrowed, and
@@ -528,10 +538,36 @@ impl HeaderBar {
         };
     }
 
-    pub fn redraw(&mut self, width: u32, content_size: Size<i32, Logical>, focused: bool) {
+    pub fn redraw(
+        &mut self,
+        width: u32,
+        content_size: Size<i32, Logical>,
+        focused: bool,
+        title: Option<&str>,
+    ) {
         if width == 0 {
             self.width = 0;
             return;
+        }
+
+        // The title sits on the left, in the space the three buttons leave.
+        let max_title_width =
+            (width as i32 - BUTTON_WIDTH as i32 * 3 - 2 * TITLE_PADDING).max(0);
+        if let Some(title) = title
+            && (title != self.title || max_title_width != self.title_max_width)
+        {
+            self.title.clear();
+            self.title.push_str(title);
+            self.title_max_width = max_title_width;
+            match crate::text::rasterize(title, max_title_width, HEADER_BAR_HEIGHT, TITLE_COLOR) {
+                Some((buffer, size)) => {
+                    self.title_buffer = buffer;
+                    self.title_width = size.w;
+                }
+                None => {
+                    self.title_width = 0;
+                }
+            }
         }
 
         let bg = if focused { BG_COLOR_FOCUSED } else { BG_COLOR };
@@ -770,6 +806,7 @@ impl WindowElement {
                     pointer_loc: None,
                     width: 0,
                     fullscreen: false,
+                    snap_restore: None,
                     focused: false,
                     close_button_hover: false,
                     maximize_button_hover: false,
@@ -804,6 +841,10 @@ impl WindowElement {
                         ICON_SIZE as u32,
                         ICON_COLOR,
                     ),
+                    title: String::new(),
+                    title_buffer: MemoryRenderBuffer::default(),
+                    title_width: 0,
+                    title_max_width: -1,
                 },
             })
         });
@@ -1009,9 +1050,22 @@ impl WindowElement {
 
 impl<B: Backend> AnvilState<B> {
     pub fn end_ssd_drag(&mut self) {
-        if self.ssd_drag.is_some() {
+        if let Some(drag) = self.ssd_drag.take() {
+            // Keep any in-flight restore transition at the drop position, then
+            // hand the window back to the animation before tiling.
+            self.pin_window_animation(&drag.window);
+            self.dragging_window = None;
+            // The preview is only meaningful while the button is held.
+            self.clear_snap_preview();
+            if let Some(target) = drag.snap_target {
+                // Deferred: this may run while the window's decoration state is
+                // borrowed (e.g. from the touch/tablet target handlers), and
+                // `apply_snap` needs to borrow it.
+                let window = drag.window;
+                self.handle
+                    .insert_idle(move |data| data.apply_snap(&window, &target));
+            }
             tracing::debug!("SSD drag ended");
-            self.ssd_drag = None;
         }
     }
 
@@ -1019,18 +1073,54 @@ impl<B: Backend> AnvilState<B> {
     /// position. `global` is the authoritative pointer position in compositor
     /// space, so this keeps working no matter which surface the cursor is over.
     pub fn update_ssd_drag_position(&mut self, global: Point<f64, Logical>) {
-        let Some(drag) = self.ssd_drag.clone() else {
+        let Some(mut drag) = self.ssd_drag.clone() else {
             return;
         };
         if self.space.element_location(&drag.window).is_none() {
             self.ssd_drag = None;
+            self.clear_snap_preview();
             return;
         }
+
+        // A tiled window pops back to its floating size as soon as the drag
+        // actually moves. Done here (not at drag start) because `start_drag`
+        // runs while the window's decoration state is already borrowed.
+        let snap_restore = drag.window.decoration_state().header_bar.snap_restore.take();
+        if let Some(rel) = snap_restore
+            && let Some((_, content)) = super::absolute_geometry(&self.space, &drag.window, rel)
+        {
+            let decorated_size = self
+                .space
+                .element_geometry(&drag.window)
+                .map(|geo| geo.size)
+                .unwrap_or_default();
+            let restored = super::xdg::restore_drag_location(
+                drag.start_origin,
+                decorated_size,
+                drag.start_global,
+                Some(content),
+                drag.window.is_ssd(),
+            );
+            self.restore_snapped(&drag.window, restored, content);
+            drag.start_origin = restored;
+            if let Some(active) = self.ssd_drag.as_mut() {
+                active.start_origin = restored;
+            }
+        }
+
         let delta = global - drag.start_global;
         let new_origin = drag.start_origin + delta.to_i32_round();
         let new_origin =
             super::clamp_window_position(&self.space, &drag.window, global, new_origin);
-        self.space.map_element(drag.window, new_origin, true);
+        self.space.map_element(drag.window.clone(), new_origin, true);
+
+        // Track the snap target under the pointer and show its preview.
+        let target = self.snap_zone_at(global, Some(&drag.window));
+        self.note_snap_target(target.clone());
+        if let Some(active) = self.ssd_drag.as_mut() {
+            active.snap_target = target;
+        }
+
         tracing::trace!(?global, ?new_origin, "SSD drag moved window");
     }
 
@@ -1045,8 +1135,10 @@ impl<B: Backend> AnvilState<B> {
         if !window.alive() || edges.is_empty() {
             return None;
         }
-        // An interactive resize takes over from any in-flight transition.
+        // An interactive resize takes over from any in-flight transition and
+        // makes the snapped floating geometry stale.
         window.decoration_state().animation = None;
+        window.decoration_state().header_bar.snap_restore = None;
         let initial_window_location = self.space.element_location(window)?;
         // Resizing works in surface (content) coordinates, so ignore the
         // decoration bounds that `SpaceElement::geometry` adds.

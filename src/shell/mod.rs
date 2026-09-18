@@ -21,8 +21,8 @@ use smithay::{
         },
     },
     desktop::{
-        LayerSurface, PopupKind, PopupManager, Space, WindowSurfaceType, layer_map_for_output,
-        space::SpaceElement,
+        LayerSurface, PopupKind, PopupManager, Space, WindowSurface, WindowSurfaceType,
+        layer_map_for_output, space::SpaceElement,
     },
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::Output,
@@ -61,6 +61,7 @@ use crate::{
 mod animation;
 mod element;
 mod grabs;
+mod snap;
 pub(crate) mod ssd;
 #[cfg(feature = "xwayland")]
 mod x11;
@@ -69,13 +70,14 @@ mod xdg;
 pub use self::animation::*;
 pub use self::element::*;
 pub use self::grabs::*;
+pub use self::snap::*;
 
 use self::ssd::{
     BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, SurfaceFrame,
     VisibilityState,
 };
 
-use self::xdg::handle_toplevel_commit;
+use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
 
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
@@ -340,6 +342,221 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
     }
 
+    /// Pin any in-flight transition of `window` to its current location. Called
+    /// when an interactive drag ends so the window stays where it was dropped
+    /// while the size transition finishes.
+    pub fn pin_window_animation(&self, window: &WindowElement) {
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
+        if let Some(animation) = window.decoration_state().animation.as_mut() {
+            animation.pin_location(loc.to_f64());
+        }
+    }
+
+    /// Resolve the snap target under `global`. `exclude` is the window being
+    /// dragged: it is ignored when deciding whether the bottom half is
+    /// occupied, which is what turns a top-edge slam into a top-half snap
+    /// instead of fullscreen.
+    pub fn snap_zone_at(
+        &self,
+        global: Point<f64, Logical>,
+        exclude: Option<&WindowElement>,
+    ) -> Option<SnapTarget> {
+        let output = self.space.output_under(global).next().cloned()?;
+        let area = output_work_area(&self.space, &output)?;
+        let mut zone = snap::zone_at(area, global)?;
+        if zone == SnapZone::TopHalf && !self.bottom_half_occupied(&output, area, exclude) {
+            zone = SnapZone::Maximize;
+        }
+        Some(SnapTarget {
+            output,
+            area,
+            zone,
+        })
+    }
+
+    /// Whether any window other than `exclude` currently fills the bottom half
+    /// of `area` on `output`.
+    fn bottom_half_occupied(
+        &self,
+        output: &Output,
+        area: Rectangle<i32, Logical>,
+        exclude: Option<&WindowElement>,
+    ) -> bool {
+        const TOLERANCE: i32 = 4;
+        let target = SnapZone::BottomHalf.rect(area);
+        self.space.elements_for_output(output).any(|window| {
+            if window.is_ghosting() || exclude == Some(window) {
+                return false;
+            }
+            let Some(loc) = self.space.element_location(window) else {
+                return false;
+            };
+            let size = window.geometry().size;
+            (loc.x - target.loc.x).abs() <= TOLERANCE
+                && (loc.y - target.loc.y).abs() <= TOLERANCE
+                && (size.w - target.size.w).abs() <= TOLERANCE
+                && (size.h - target.size.h).abs() <= TOLERANCE
+        })
+    }
+
+    /// Record the snap zone under the pointer. Whenever the zone changes the
+    /// dwell timer restarts and any preview starts fading out; the preview for
+    /// the new zone is shown by [`Self::tick_snap_preview`] once the pointer
+    /// has stayed there long enough.
+    pub fn note_snap_target(&mut self, target: Option<SnapTarget>) {
+        if self.snap_candidate.as_ref() == target.as_ref() {
+            return;
+        }
+        self.snap_candidate = target;
+        self.snap_candidate_since = Instant::now();
+        // Fade out whatever was showing; the new zone fades in after the dwell.
+        self.hide_snap_preview();
+    }
+
+    /// Fade every snap preview out.
+    fn hide_snap_preview(&self) {
+        for output in self.space.outputs() {
+            if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                preview.hide();
+            }
+        }
+    }
+
+    /// Drop the snap candidate and fade the preview out.
+    pub fn clear_snap_preview(&mut self) {
+        self.snap_candidate = None;
+        self.hide_snap_preview();
+    }
+
+    /// Advance the snap preview: show it once the pointer has dwelled in the
+    /// current zone for long enough, and fade all previews toward their target.
+    pub fn tick_snap_preview(&mut self, now: Instant) {
+        let dwelled = self.snap_candidate.is_some()
+            && now.saturating_duration_since(self.snap_candidate_since) >= SNAP_PREVIEW_DWELL;
+        let show = if dwelled {
+            self.snap_candidate.clone()
+        } else {
+            None
+        };
+
+        for output in self.space.outputs() {
+            if let Some(target) = show.as_ref().filter(|target| target.output == *output) {
+                output
+                    .user_data()
+                    .insert_if_missing(SnapPreviewState::default);
+                if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                    preview.show(target.zone.rect(target.area));
+                }
+            }
+            if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                preview.tick(now);
+            }
+        }
+    }
+
+    /// Tile `window` into `target`'s zone. The top zone hands off to the
+    /// titlebar maximize button's behaviour; every other zone configures the
+    /// client to the zone and animates the frame into place, remembering the
+    /// floating geometry so a later drag can restore it.
+    pub fn apply_snap(&mut self, window: &WindowElement, target: &SnapTarget) {
+        if window.is_ghosting() || self.space.element_location(window).is_none() {
+            return;
+        }
+        if target.zone == SnapZone::Maximize {
+            self.toggle_maximize(window.clone());
+            return;
+        }
+        // A fullscreen window covers the output; there is nothing to tile.
+        if window.decoration_state().header_bar.fullscreen {
+            return;
+        }
+
+        // Tile to exactly the rectangle the preview showed, so the two never
+        // disagree on odd work-area sizes.
+        let rect = target.zone.rect(target.area);
+        if window.decoration_state().header_bar.snap_restore.is_none() {
+            window.decoration_state().header_bar.snap_restore =
+                relative_geometry_of_output(&self.space, &target.output, window);
+        }
+        let animated = self.configure_snapped(window, rect);
+        self.animate_window(window, animated, rect.loc);
+    }
+
+    /// Restore a snapped window to its floating geometry at `loc`, animating
+    /// the transition like an unmaximize. `content` is the undecorated client
+    /// size.
+    pub fn restore_snapped(
+        &mut self,
+        window: &WindowElement,
+        loc: Point<i32, Logical>,
+        content: Size<i32, Logical>,
+    ) {
+        let is_ssd = window.is_ssd();
+        let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
+        self.configure_snapped(window, rect);
+        self.space.map_element(window.clone(), loc, true);
+        self.animate_window(window, content, loc);
+    }
+
+    /// If `window` was tiled by a snap, restore its floating geometry and
+    /// return the window origin the drag should start from, keeping the pointer
+    /// over the same spot on the titlebar. Returns `None` for a floating
+    /// window. Used by the client-initiated move grabs.
+    pub fn take_snap_restore_for_drag(
+        &mut self,
+        window: &WindowElement,
+        pointer_global: Point<f64, Logical>,
+    ) -> Option<Point<i32, Logical>> {
+        let rel = window.decoration_state().header_bar.snap_restore.take()?;
+        let current_loc = self.space.element_location(window)?;
+        let decorated_size = self
+            .space
+            .element_geometry(window)
+            .map(|geo| geo.size)
+            .unwrap_or_default();
+        let (_, content) = absolute_geometry(&self.space, window, rel)?;
+        let restored = self::xdg::restore_drag_location(
+            current_loc,
+            decorated_size,
+            pointer_global,
+            Some(content),
+            window.is_ssd(),
+        );
+        self.restore_snapped(window, restored, content);
+        Some(restored)
+    }
+
+    /// Configure `window`'s client to occupy the decorated rectangle `rect`.
+    /// Wayland clients are given the undecorated content size; X11's
+    /// `configure` takes the frame rectangle directly. Returns the size to
+    /// animate the frame to.
+    fn configure_snapped(
+        &mut self,
+        window: &WindowElement,
+        rect: Rectangle<i32, Logical>,
+    ) -> Size<i32, Logical> {
+        let is_ssd = window.is_ssd();
+        let content = undecorated_content_size(rect.size, is_ssd);
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|state| state.size = Some(content));
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+                content
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => {
+                if let Err(err) = surface.configure(rect) {
+                    tracing::warn!(?err, "Failed to configure snapped X11 window");
+                }
+                rect.size
+            }
+        }
+    }
+
     /// Advance every in-flight window animation. Called once per frame before
     /// rendering: updates where the window is mapped and retires animations
     /// whose client has caught up with the configured size.
@@ -374,7 +591,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
             ));
-            if self.space.element_location(window) != Some(loc) {
+            // While a client move grab owns the window, it drives the position;
+            // the animation only supplies the (shrinking) size.
+            let being_dragged = self.dragging_window.as_ref() == Some(window);
+            if !being_dragged && self.space.element_location(window) != Some(loc) {
                 self.space.relocate_element(window, loc);
             }
             // Once the curve is done, keep the animation (which holds the window
@@ -397,6 +617,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
 
         self.tick_visibility_animations(&windows, now);
+        self.tick_snap_preview(now);
     }
 
     /// Advance every window's open/close transition: start opens that were

@@ -330,6 +330,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(elem) = self.window_for_x11(window) else {
             return;
         };
+        // Maximizing supersedes any snap; the floating geometry would be stale.
+        elem.decoration_state().header_bar.snap_restore = None;
 
         let old_geo = match self.space.element_bbox(&elem) {
             Some(geo) => geo,
@@ -387,6 +389,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(elem) = self.window_for_x11(window) else {
             return;
         };
+        // Fullscreen supersedes any snap; the floating geometry would be stale.
+        elem.decoration_state().header_bar.snap_restore = None;
 
         let outputs_for_window = self.space.outputs_for_element(&elem);
         let output = outputs_for_window
@@ -458,14 +462,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let element = self
                     .space
                     .elements()
-                    .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window));
+                    .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
+                    .cloned();
 
                 if let Some(element) = element {
-                    let Some(mut initial_window_location) = self.space.element_location(element) else {
+                    let Some(mut initial_window_location) = self.space.element_location(&element) else {
                         return;
                     };
 
                     // If surface is maximized then unmaximize it
+                    let mut restore_size = None;
                     if window.is_maximized() {
                         if let Err(err) = window.set_maximized(false) {
                             tracing::warn!(?err, "Failed to unset X11 maximized");
@@ -476,17 +482,36 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             .user_data()
                             .get::<OldGeometry>()
                             .and_then(|data| data.restore())
-                            && let Err(err) =
-                                window.configure(Rectangle::new(initial_window_location, old_geo.size))
                         {
-                            tracing::warn!(?err, "Failed to configure X11 window");
+                            restore_size = Some(old_geo.size);
+                            if let Err(err) =
+                                window.configure(Rectangle::new(initial_window_location, old_geo.size))
+                            {
+                                tracing::warn!(?err, "Failed to configure X11 window");
+                            }
                         }
+                    }
+
+                    // The grab drives the position, so restore/unmaximize
+                    // transitions only animate the window's size.
+                    self.dragging_window = Some(element.clone());
+
+                    // A snapped window restores to its floating size.
+                    if let Some(restored) =
+                        self.take_snap_restore_for_drag(&element, start_data.location)
+                    {
+                        initial_window_location = restored;
+                    }
+
+                    if let Some(size) = restore_size {
+                        self.animate_window(&element, size, initial_window_location);
                     }
 
                     let grab = TouchMoveSurfaceGrab {
                         start_data,
                         window: element.clone(),
                         initial_window_location,
+                        snap_target: None,
                     };
 
                     touch.set_grab(self, grab, SERIAL_COUNTER.next_serial());
@@ -504,15 +529,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .space
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
+            .cloned()
         else {
             return;
         };
 
-        let Some(mut initial_window_location) = self.space.element_location(element) else {
+        let Some(mut initial_window_location) = self.space.element_location(&element) else {
             return;
         };
 
         // If surface is maximized then unmaximize it
+        let mut restore_size = None;
         if window.is_maximized() {
             if let Err(err) = window.set_maximized(false) {
                 tracing::warn!(?err, "Failed to unset X11 maximized");
@@ -523,16 +550,35 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .user_data()
                 .get::<OldGeometry>()
                 .and_then(|data| data.restore())
-                && let Err(err) = window.configure(Rectangle::new(initial_window_location, old_geo.size))
             {
-                tracing::warn!(?err, "Failed to configure X11 window");
+                restore_size = Some(old_geo.size);
+                if let Err(err) = window.configure(Rectangle::new(initial_window_location, old_geo.size))
+                {
+                    tracing::warn!(?err, "Failed to configure X11 window");
+                }
             }
+        }
+
+        // The grab drives the position, so restore/unmaximize transitions only
+        // animate the window's size.
+        self.dragging_window = Some(element.clone());
+
+        // A snapped window restores to its floating size.
+        if let Some(restored) =
+            self.take_snap_restore_for_drag(&element, self.pointer.current_location())
+        {
+            initial_window_location = restored;
+        }
+
+        if let Some(size) = restore_size {
+            self.animate_window(&element, size, initial_window_location);
         }
 
         let grab = PointerMoveSurfaceGrab {
             start_data,
             window: element.clone(),
             initial_window_location,
+            snap_target: None,
         };
 
         let pointer = self.pointer.clone();

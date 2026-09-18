@@ -22,7 +22,7 @@ use smithay::{
 #[cfg(feature = "xwayland")]
 use smithay::{utils::Rectangle, xwayland::xwm::ResizeEdge as X11ResizeEdge};
 
-use super::{SurfaceData, WindowElement};
+use super::{SnapTarget, SurfaceData, WindowElement};
 use crate::{
     focus::PointerFocusTarget,
     state::{AnvilState, Backend},
@@ -32,6 +32,9 @@ pub struct PointerMoveSurfaceGrab<BackendData: Backend + 'static> {
     pub start_data: PointerGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
+    /// Snap target under the pointer, resolved on each motion and applied when
+    /// the grab is released.
+    pub snap_target: Option<SnapTarget>,
 }
 
 impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveSurfaceGrab<BackendData> {
@@ -51,6 +54,10 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
             super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
         data.space
             .map_element(self.window.clone(), new_location, true);
+
+        let target = data.snap_zone_at(event.location, Some(&self.window));
+        data.note_snap_target(target.clone());
+        self.snap_target = target;
     }
 
     fn relative_motion(
@@ -71,7 +78,15 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     ) {
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
-            // No more buttons are pressed, release the grab.
+            // No more buttons are pressed: keep any in-flight restore
+            // transition at the drop position, then hand the window back to the
+            // animation before tiling.
+            data.pin_window_animation(&self.window);
+            data.dragging_window = None;
+            data.clear_snap_preview();
+            if let Some(target) = self.snap_target.take() {
+                data.apply_snap(&self.window, &target);
+            }
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -169,13 +184,19 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
+    fn unset(&mut self, data: &mut AnvilState<BackendData>) {
+        data.dragging_window = None;
+        data.clear_snap_preview();
+    }
 }
 
 pub struct TouchMoveSurfaceGrab<BackendData: Backend + 'static> {
     pub start_data: TouchGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
+    /// Snap target under the finger, resolved on each motion and applied when
+    /// the touch is released.
+    pub snap_target: Option<SnapTarget>,
 }
 
 impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfaceGrab<BackendData> {
@@ -201,6 +222,14 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             return;
         }
 
+        // Keep any in-flight restore transition at the drop position, then hand
+        // the window back to the animation before tiling.
+        data.pin_window_animation(&self.window);
+        data.dragging_window = None;
+        data.clear_snap_preview();
+        if let Some(target) = self.snap_target.take() {
+            data.apply_snap(&self.window, &target);
+        }
         handle.up(data, event);
         handle.unset_grab(self, data);
     }
@@ -225,6 +254,10 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
         data.space
             .map_element(self.window.clone(), new_location, true);
+
+        let target = data.snap_zone_at(event.location, Some(&self.window));
+        data.note_snap_target(target.clone());
+        self.snap_target = target;
     }
 
     fn frame(
@@ -265,7 +298,10 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
+    fn unset(&mut self, data: &mut AnvilState<BackendData>) {
+        data.dragging_window = None;
+        data.clear_snap_preview();
+    }
 }
 
 bitflags::bitflags! {

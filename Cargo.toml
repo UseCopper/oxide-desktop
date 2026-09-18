@@ -11,6 +11,7 @@ codegen-units = 1
 
 [dependencies]
 bitflags = "2.2.1"
+cosmic-text = "0.19"
 profiling = { version = "1.0" }
 rand = "0.8"
 thiserror = "1"

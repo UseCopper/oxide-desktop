@@ -41,12 +41,17 @@ use smithay::{
     utils::{
         IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, user_data::UserDataMap,
     },
-    wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
+    wayland::{
+        compositor::{SurfaceData as WlSurfaceData, with_states},
+        dmabuf::DmabufFeedback,
+        seat::WaylandFocus,
+        shell::xdg::XdgToplevelSurfaceData,
+    },
 };
 
 use super::ssd::{
-    BTN_LEFT, BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, RESIZE_MARGIN, icon_offset,
-    content_offset, fullscreen_content_offset, resize_cursor,
+    BTN_LEFT, BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, RESIZE_MARGIN, TITLE_PADDING,
+    icon_offset, content_offset, fullscreen_content_offset, resize_cursor,
 };
 use crate::{AnvilState, focus::PointerFocusTarget, state::Backend};
 
@@ -174,6 +179,27 @@ impl WindowElement {
             return None;
         }
         self.0.wl_surface()
+    }
+
+    /// The window's title, if the client set one.
+    pub fn title(&self) -> Option<String> {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(_) => {
+                let surface = self.wl_surface()?;
+                with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|data| data.lock().ok()?.title.clone())
+                        .filter(|title| !title.is_empty())
+                })
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => {
+                let title = surface.title();
+                (!title.is_empty()).then_some(title)
+            }
+        }
     }
 
     #[inline]
@@ -772,22 +798,28 @@ where
                 .unwrap_or(content_size);
 
             // Computed before borrowing the decoration state: the maximize
-            // button shows "restore" while the window is maximized, and the
-            // decorations are tinted while the window is focused.
+            // button shows "restore" while the window is maximized or snapped,
+            // and the decorations are tinted while the window is focused.
             let maximized = self.is_maximized();
             let focused = self.is_activated();
+            // `None` (no title set) becomes an empty title so clearing a title
+            // actually clears it; the ghost path passes `None` to retain it.
+            let title = self.title().unwrap_or_default();
             let mut state = self.decoration_state();
             let fullscreen = state.header_bar.fullscreen;
+            // A snapped (tiled) window is "restorable" too, so it shows the
+            // restore icon and un-snaps when the button is pressed.
+            let tiled = state.header_bar.snap_restore.is_some();
             let width = display_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
             state
                 .header_bar
-                .redraw(width.max(0) as u32, display_size, focused);
+                .redraw(width.max(0) as u32, display_size, focused, Some(title.as_str()));
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
 
             let icon_off = icon_offset();
             let base = state.header_bar.width as i32;
-            let maximize_icon = if fullscreen || maximized {
+            let maximize_icon = if fullscreen || maximized || tiled {
                 &state.header_bar.restore_icon
             } else {
                 &state.header_bar.maximize_icon
@@ -811,6 +843,26 @@ where
                         Kind::Unspecified,
                     )
                     .expect("failed to import window icon")
+                    .into(),
+                );
+            }
+
+            // The title sits behind the icons but in front of the bar's
+            // background, so push it before the header bar's own elements.
+            if state.header_bar.title_width > 0 {
+                let title_pos: Point<i32, Logical> = Point::from((TITLE_PADDING, 0));
+                let title_physical = (location + title_pos.to_physical_precise_round(scale)).to_f64();
+                vec.push(
+                    MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        title_physical,
+                        &state.header_bar.title_buffer,
+                        Some(alpha),
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .expect("failed to import window title")
                     .into(),
                 );
             }
@@ -936,9 +988,10 @@ where
         let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
         // No hover state on a closing window.
         state.header_bar.pointer_loc = None;
+        // Keep the title the live window last showed.
         state
             .header_bar
-            .redraw(width.max(0) as u32, content_size, false);
+            .redraw(width.max(0) as u32, content_size, false, None);
 
         let icon_off = icon_offset();
         let base = state.header_bar.width as i32;
@@ -970,6 +1023,24 @@ where
                     Kind::Unspecified,
                 )
                 .expect("failed to import window icon")
+                .into(),
+            );
+        }
+
+        if state.header_bar.title_width > 0 {
+            let title_pos: Point<i32, Logical> = Point::from((TITLE_PADDING, 0));
+            let title_physical = (location + title_pos.to_physical_precise_round(scale)).to_f64();
+            vec.push(
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    title_physical,
+                    &state.header_bar.title_buffer,
+                    Some(alpha),
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )
+                .expect("failed to import window title")
                 .into(),
             );
         }

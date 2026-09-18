@@ -18,6 +18,7 @@ pub mod panel;
 pub mod render;
 pub mod shell;
 pub mod state;
+pub mod text;
 #[cfg(feature = "udev")]
 pub mod udev;
 #[cfg(feature = "winit")]
