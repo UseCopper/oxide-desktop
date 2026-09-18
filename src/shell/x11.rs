@@ -346,19 +346,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(geometry) = self.space.output_geometry(output) else {
             return;
         };
+        // Respect layer-shell exclusive zones (e.g. a top panel).
+        let work_area = crate::shell::output_work_area(&self.space, output).unwrap_or(geometry);
 
         if let Err(err) = window.set_maximized(true) {
             tracing::warn!(?err, "Failed to set X11 maximized");
             return;
         }
-        if let Err(err) = window.configure(geometry) {
+        if let Err(err) = window.configure(work_area) {
             tracing::warn!(?err, "Failed to configure maximized X11 window");
         }
         window.user_data().insert_if_missing(OldGeometry::default);
         if let Some(data) = window.user_data().get::<OldGeometry>() {
             data.save(old_geo);
         }
-        self.animate_window(&elem, geometry.size, geometry.loc);
+        self.animate_window(&elem, work_area.size, work_area.loc);
     }
 
     pub fn unmaximize_request_x11(&mut self, window: &X11Surface) {
@@ -397,13 +399,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(geometry) = self.space.output_geometry(output) else {
             return;
         };
+        // Respect layer-shell exclusive zones (e.g. a top panel).
+        let work_area = crate::shell::output_work_area(&self.space, output).unwrap_or(geometry);
 
         if let Err(err) = window.set_fullscreen(true) {
             tracing::warn!(?err, "Failed to set X11 fullscreen");
             return;
         }
         elem.set_ssd(false);
-        if let Err(err) = window.configure(geometry) {
+        if let Err(err) = window.configure(work_area) {
             tracing::warn!(?err, "Failed to configure fullscreen X11 window");
         }
         output.user_data().insert_if_missing(FullscreenSurface::default);

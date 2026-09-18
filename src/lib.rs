@@ -13,6 +13,8 @@ pub mod focus;
 pub mod input_handler;
 #[cfg(feature = "libei")]
 pub mod libei;
+#[cfg(feature = "panel")]
+pub mod panel;
 pub mod render;
 pub mod shell;
 pub mod state;

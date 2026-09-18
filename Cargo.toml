@@ -35,6 +35,8 @@ wayland-egl = { version = "0.31", optional = true }
 x11rb = { version = "0.10", optional = true }
 puffin = { version = "0.3", optional = true }
 tracy-client = { version = "0.19", optional = true }
+gtk4 = { version = "0.11", optional = true }
+gtk4-layer-shell = { version = "0.8", features = ["v1_3"], optional = true }
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
@@ -56,7 +58,7 @@ features = [
 ]
 
 [features]
-default = ["winit", "xwayland"]
+default = ["winit", "xwayland", "panel"]
 winit = ["smithay/backend_winit", "smithay/backend_egl", "smithay/renderer_gl", "egl"]
 udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_udev", "smithay/backend_libinput", "smithay/backend_session_libseat", "smithay/renderer_multi", "smithay/input", "smithay/drm", "smithay/gbm", "smithay/backend_egl", "smithay/renderer_gl", "egl", "nix", "libinput-rs", "drm-fourcc", "gbm", "smithay-drm-extras", "wayland-backend", "wayland-client", "wayland-server", "wayland-protocols", "wayland-egl"]
 x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
@@ -64,6 +66,7 @@ xwayland = ["smithay/xwayland", "smithay/backend_libei"]
 libei = []
 renderer_sync = []
 debug = ["image", "fps_ticker", "renderdoc"]
+panel = ["dep:gtk4", "dep:gtk4-layer-shell"]
 egl = ["smithay/backend_egl", "smithay/renderer_gl", "wayland-egl"]
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client"]
 profile-with-tracy-mem = ["profile-with-tracy"]

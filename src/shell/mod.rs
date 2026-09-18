@@ -922,9 +922,13 @@ fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool 
 
 /// The area of an output that floating windows are laid out within, i.e. its
 /// geometry minus any layer-shell exclusive zones (panels, docks, ...).
-fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
+pub fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
     let geo = space.output_geometry(output)?;
-    let zone = layer_map_for_output(output).non_exclusive_zone();
+    // Refresh the exclusive zones: a layer surface may have changed its
+    // reserved edge since the last arrange.
+    let mut map = layer_map_for_output(output);
+    map.arrange();
+    let zone = map.non_exclusive_zone();
     let area = Rectangle::new(geo.loc + zone.loc, zone.size);
     (area.size.w > 0 && area.size.h > 0).then_some(area)
 }
@@ -1044,6 +1048,7 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
     let Some(output_geo) = space.output_geometry(output) else {
         return;
     };
+    let work_area = output_work_area(space, output).unwrap_or(output_geo);
 
     let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
     for window in windows {
@@ -1056,23 +1061,23 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
         if let Some(toplevel) = window.0.toplevel() {
             let fullscreen = window.decoration_state().header_bar.fullscreen;
             if fullscreen {
-                let size = self::xdg::fullscreen_content_size(output_geo.size, window.is_ssd());
+                let size = self::xdg::fullscreen_content_size(work_area.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                     state.size = Some(size);
                 });
                 toplevel.send_configure();
-                space.map_element(window, output_geo.loc, false);
+                space.map_element(window, work_area.loc, false);
                 continue;
             }
             if window.is_maximized() {
-                let size = self::xdg::maximize_content_size(output_geo.size, window.is_ssd());
+                let size = self::xdg::maximize_content_size(work_area.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);
                     state.size = Some(size);
                 });
                 toplevel.send_configure();
-                space.map_element(window, output_geo.loc, false);
+                space.map_element(window, work_area.loc, false);
                 continue;
             }
         }

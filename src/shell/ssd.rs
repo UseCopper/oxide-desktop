@@ -430,7 +430,10 @@ impl HeaderBar {
                 });
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
-                state.minimize_request(window.clone());
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `minimize_request` mutates it.
+                let window = window.clone();
+                state.handle.insert_idle(move |data| data.minimize_request(window));
             }
             Some(_) => {
                 match window.0.underlying_surface() {
@@ -516,7 +519,10 @@ impl HeaderBar {
                 });
             }
             Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
-                state.minimize_request(window.clone());
+                // Deferred: the caller holds the decoration state borrowed, and
+                // `minimize_request` mutates it.
+                let window = window.clone();
+                state.handle.insert_idle(move |data| data.minimize_request(window));
             }
             _ => {}
         };

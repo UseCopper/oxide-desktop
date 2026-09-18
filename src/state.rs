@@ -784,7 +784,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         #[cfg(feature = "xwayland")]
         XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
-        AnvilState {
+        let state = AnvilState {
             backend_data,
             display_handle: dh,
             socket_name,
@@ -836,6 +836,43 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             show_window_preview: false,
             minimized: Vec::new(),
             ssd_drag: None,
+        };
+
+        #[cfg(feature = "panel")]
+        state.spawn_panel();
+
+        state
+    }
+
+    /// Start our own GTK4 layer-shell panel as a child process, pointed at this
+    /// compositor's Wayland socket. Same binary, `--panel` mode.
+    #[cfg(feature = "panel")]
+    pub fn spawn_panel(&self) {
+        use std::{process::Command, process::Stdio};
+
+        if std::env::var_os("OXIDE_NO_PANEL").is_some() {
+            return;
+        }
+        let Some(socket_name) = self.socket_name.as_deref() else {
+            return;
+        };
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                warn!("Failed to locate the panel executable: {}", err);
+                return;
+            }
+        };
+
+        match Command::new(exe)
+            .arg("--panel")
+            .env("WAYLAND_DISPLAY", socket_name)
+            .env("GDK_BACKEND", "wayland")
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => info!("Started the panel on {}", socket_name),
+            Err(err) => warn!("Failed to start the panel: {}", err),
         }
     }
 

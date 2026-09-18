@@ -15,7 +15,8 @@ use smithay::{
         ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements, constrain_space_element,
     },
     output::Output,
-    utils::{Point, Rectangle, Size},
+    utils::{Point, Rectangle, Scale, Size},
+    wayland::shell::wlr_layer::Layer,
 };
 
 #[cfg(feature = "debug")]
@@ -155,19 +156,68 @@ where
         .get::<FullscreenSurface>()
         .and_then(|f| f.get())
     {
-        let scale = output.current_scale().fractional_scale().into();
-        let window_render_elements: Vec<WindowRenderElement<R>> =
-            AsRenderElements::<R>::render_elements(&window, renderer, (0, 0).into(), scale, 1.0);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let layer_map = smithay::desktop::layer_map_for_output(output);
+        let (lower, upper): (Vec<_>, Vec<_>) = layer_map
+            .layers()
+            .rev()
+            .partition(|surface| matches!(surface.layer(), Layer::Background | Layer::Bottom));
 
-        let elements = custom_elements
+        let mut elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
-            .chain(
-                window_render_elements
-                    .into_iter()
-                    .map(|e| OutputRenderElements::Window(Wrap::from(e))),
-            )
             .collect::<Vec<_>>();
+
+        // Layer-shell surfaces (e.g. a top panel) stay visible above the
+        // fullscreen window, so draw the upper layers first.
+        for surface in upper {
+            let Some(geo) = layer_map.layer_geometry(surface) else {
+                continue;
+            };
+            elements.extend(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
+                    renderer,
+                    geo.loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
+            );
+        }
+
+        // The fullscreen window is offset by the layer-shell exclusive zone so
+        // it doesn't sit under the panel.
+        let location = layer_map
+            .non_exclusive_zone()
+            .loc
+            .to_physical_precise_round(scale);
+        let window_render_elements: Vec<WindowRenderElement<R>> =
+            AsRenderElements::<R>::render_elements(&window, renderer, location, scale, 1.0);
+        elements.extend(
+            window_render_elements
+                .into_iter()
+                .map(|e| OutputRenderElements::Window(Wrap::from(e))),
+        );
+
+        for surface in lower {
+            let Some(geo) = layer_map.layer_geometry(surface) else {
+                continue;
+            };
+            elements.extend(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
+                    renderer,
+                    geo.loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
+            );
+        }
+
         (elements, CLEAR_COLOR_FULLSCREEN)
     } else {
         let mut output_render_elements = custom_elements

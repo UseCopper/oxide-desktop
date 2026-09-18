@@ -343,7 +343,8 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     && let Some(geometry) = self.space.output_geometry(&output)
                     && let Some(toplevel) = window.0.toplevel()
                 {
-                    let desired = fullscreen_content_size(geometry.size, is_ssd);
+                    let area = super::output_work_area(&self.space, &output).unwrap_or(geometry);
+                    let desired = fullscreen_content_size(area.size, is_ssd);
                     if toplevel.with_pending_state(|state| state.size != Some(desired)) {
                         toplevel.with_pending_state(|state| state.size = Some(desired));
                         toplevel.send_configure();
@@ -541,7 +542,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
         }
 
-        let target = output.and_then(|output| self.space.output_geometry(output));
+        let target = output.and_then(|output| super::output_work_area(&self.space, output));
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = target.map(|geo| maximize_content_size(geo.size, window.is_ssd()));
@@ -611,9 +612,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(output) = output else {
             return;
         };
-        let Some(geometry) = self.space.output_geometry(&output) else {
+        let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
+        // Respect layer-shell exclusive zones (e.g. a top panel).
+        let work_area = super::output_work_area(&self.space, &output).unwrap_or(output_geo);
 
         let Ok(client) = self.display_handle.get_client(wl_surface.id()) else {
             return;
@@ -637,7 +640,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let is_ssd = window.is_ssd();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
-            state.size = Some(fullscreen_content_size(geometry.size, is_ssd));
+            state.size = Some(fullscreen_content_size(work_area.size, is_ssd));
             state.fullscreen_output = wl_output;
         });
         output.user_data().insert_if_missing(FullscreenSurface::default);
