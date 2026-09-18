@@ -36,7 +36,7 @@ use crate::{
 use super::{
     FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge,
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
-    fullscreen_output_geometry, place_new_window,
+    place_new_window,
 };
 use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT};
 
@@ -101,7 +101,21 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // of a xdg_surface has to be sent during the commit if
         // the surface is not already configured
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
+        window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // The client is gone (or closing itself); play its close transition from
+        // the cached frame.
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.0.toplevel().is_some_and(|t| t == &surface))
+            .cloned();
+        if let Some(window) = window {
+            self.begin_window_ghost(&window);
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -421,6 +435,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         self.minimized.push((window.clone(), location));
         self.space.unmap_elem(&window);
+        // While minimized the window isn't rendered, so don't keep holding the
+        // client's buffers (and let it recycle them).
+        window.decoration_state().last_frame = None;
         if let Some(keyboard) = self.seat.get_keyboard() {
             if matches!(
                 keyboard.current_focus(),
@@ -451,6 +468,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     // button click always have the exact same effect.
 
     pub fn close_window(&mut self, window: WindowElement) {
+        if window.is_closing() {
+            return;
+        }
+        // Play the close transition first; the client is told to close once it
+        // has finished (see `tick_animations`).
+        window.begin_close();
+        // The window is no longer interactive, so move focus off it.
+        self.clear_window_focus(&window);
+    }
+
+    /// Deliver a close request to the client without any transition.
+    pub fn send_close(&mut self, window: &WindowElement) {
         match window.0.underlying_surface() {
             WindowSurface::Wayland(w) => w.send_close(),
             #[cfg(feature = "xwayland")]
@@ -512,16 +541,22 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
         }
 
+        let target = output.and_then(|output| self.space.output_geometry(output));
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = output
-                .and_then(|output| self.space.output_geometry(output))
-                .map(|geo| maximize_content_size(geo.size, window.is_ssd()));
+            state.size = target.map(|geo| maximize_content_size(geo.size, window.is_ssd()));
         });
-        if let Some(output) = output {
-            if let Some(geometry) = self.space.output_geometry(output) {
-                self.space.map_element(window, geometry.loc, true);
-            }
+        if let Some(geometry) = target {
+            // Animate from the floating geometry to the maximized one instead of
+            // snapping, even though the client is configured immediately.
+            let start_loc = self.space.element_location(&window).unwrap_or(geometry.loc);
+            self.animate_window(
+                &window,
+                maximize_content_size(geometry.size, window.is_ssd()),
+                geometry.loc,
+            );
+            // Raise/focus the window without moving it off its start position.
+            self.space.map_element(window, start_loc, true);
         }
 
         // The protocol demands us to always reply with a configure,
@@ -544,8 +579,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             state.states.unset(xdg_toplevel::State::Maximized);
             state.size = geometry.map(|(_, size)| size);
         });
-        if let Some((location, _)) = geometry {
-            self.space.map_element(window, location, false);
+        if let Some((location, size)) = geometry {
+            self.animate_window(&window, size, location);
         }
 
         // The protocol demands us to always reply with a configure,
@@ -563,53 +598,59 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // independently from its buffer size
         let wl_surface = surface.wl_surface();
 
-        let output_geometry = fullscreen_output_geometry(wl_surface, wl_output.as_ref(), &mut self.space);
+        let Some(window) = self.window_for_surface(wl_surface) else {
+            return;
+        };
+        // A specific output may be requested; otherwise use the output the window
+        // is actually on, not `Space`'s arbitrary first output.
+        let output = wl_output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| super::output_for_window(&self.space, &window))
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(output) = output else {
+            return;
+        };
+        let Some(geometry) = self.space.output_geometry(&output) else {
+            return;
+        };
 
-        if let Some(geometry) = output_geometry {
-            let output = wl_output
-                .as_ref()
-                .and_then(Output::from_resource)
-                .or_else(|| self.space.outputs().next().cloned());
-            let Some(output) = output else {
-                return;
-            };
-            let Ok(client) = self.display_handle.get_client(wl_surface.id()) else {
-                return;
-            };
-            for output in output.client_outputs(&client) {
-                wl_output = Some(output);
-            }
-            let Some(window) = self.window_for_surface(wl_surface) else {
-                return;
-            };
-
-            let restore = super::relative_geometry_of(&self.space, &window);
-            let mut state = window.decoration_state();
-            state.header_bar.fullscreen = true;
-            state.header_bar.pointer_loc = None;
-            if state.fullscreen_restore.is_none() {
-                state.fullscreen_restore = restore;
-            }
-            drop(state);
-
-            let is_ssd = window.is_ssd();
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(fullscreen_content_size(geometry.size, is_ssd));
-                state.fullscreen_output = wl_output;
-            });
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            if let Some(fs) = output.user_data().get::<FullscreenSurface>() {
-                // Don't leak a previous fullscreen window if a second one takes over.
-                if let Some(prev) = fs.get()
-                    && prev.wl_surface().as_deref() != Some(wl_surface)
-                {
-                    tracing::debug!("Replacing previous fullscreen window");
-                }
-                fs.set(window.clone());
-            }
-            trace!("Fullscreening: {:?}", window);
+        let Ok(client) = self.display_handle.get_client(wl_surface.id()) else {
+            return;
+        };
+        for client_output in output.client_outputs(&client) {
+            wl_output = Some(client_output);
         }
+
+        // Remember where the window was, relative to the output it is being
+        // fullscreened on, so unfullscreening can put it back on the same
+        // monitor.
+        let restore = super::relative_geometry_of_output(&self.space, &output, &window);
+        let mut state = window.decoration_state();
+        state.header_bar.fullscreen = true;
+        state.header_bar.pointer_loc = None;
+        if state.fullscreen_restore.is_none() {
+            state.fullscreen_restore = restore.map(|rel| (output.downgrade(), rel));
+        }
+        drop(state);
+
+        let is_ssd = window.is_ssd();
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.size = Some(fullscreen_content_size(geometry.size, is_ssd));
+            state.fullscreen_output = wl_output;
+        });
+        output.user_data().insert_if_missing(FullscreenSurface::default);
+        if let Some(fs) = output.user_data().get::<FullscreenSurface>() {
+            // Don't leak a previous fullscreen window if a second one takes over.
+            if let Some(prev) = fs.get()
+                && prev.wl_surface().as_deref() != Some(wl_surface)
+            {
+                tracing::debug!("Replacing previous fullscreen window");
+            }
+            fs.set(window.clone());
+        }
+        trace!("Fullscreening: {:?}", window);
 
         // The protocol demands us to always reply with a configure,
         // regardless of we fulfilled the request or not
@@ -630,19 +671,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let mut state = window.decoration_state();
                 state.header_bar.fullscreen = false;
                 state.header_bar.pointer_loc = None;
-                state.fullscreen_restore.take().map(|rel| (window.clone(), rel))
+                state
+                    .fullscreen_restore
+                    .take()
+                    .map(|(output, rel)| (window.clone(), output, rel))
             });
 
-        let geometry = restore
-            .as_ref()
-            .and_then(|(window, rel)| super::absolute_geometry(&self.space, window, *rel));
+        let geometry = restore.as_ref().and_then(|(window, output, rel)| {
+            // The output the window was fullscreened on may have been removed.
+            let output = output
+                .upgrade()
+                .filter(|output| self.space.outputs().any(|o| o == output))
+                .or_else(|| super::output_for_window(&self.space, window))?;
+            super::absolute_geometry_for_output(&self.space, &output, *rel, window.is_ssd())
+        });
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
             state.size = geometry.map(|(_, size)| size);
             state.fullscreen_output.take()
         });
         if let Some((location, _)) = geometry
-            && let Some((window, _)) = restore
+            && let Some((window, _, _)) = restore
         {
             self.space.map_element(window, location, false);
         }

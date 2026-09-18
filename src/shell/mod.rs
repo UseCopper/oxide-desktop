@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::time::Instant;
 
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::XWaylandClientData;
@@ -7,7 +8,18 @@ use smithay::xwayland::XWaylandClientData;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
+            damage::OutputDamageTracker,
+            element::{
+                AsRenderElements, memory::MemoryRenderBuffer, surface::WaylandSurfaceRenderElement,
+            },
+            gles::GlesTexture,
+            utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
+        },
+    },
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, WindowSurfaceType, layer_map_for_output,
         space::SpaceElement,
@@ -21,13 +33,13 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{IsAlive, Logical, Point, Rectangle, Size},
+    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             TraversalAction, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
-            with_surface_tree_upward,
+            with_surface_tree_downward, with_surface_tree_upward,
         },
         dmabuf::get_dmabuf,
         shell::{
@@ -35,16 +47,18 @@ use smithay::{
                 Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::XdgToplevelSurfaceData,
+            xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
         },
     },
 };
 
 use crate::{
     ClientState,
+    focus::KeyboardFocusTarget,
     state::{AnvilState, Backend},
 };
 
+mod animation;
 mod element;
 mod grabs;
 pub(crate) mod ssd;
@@ -52,31 +66,16 @@ pub(crate) mod ssd;
 mod x11;
 mod xdg;
 
+pub use self::animation::*;
 pub use self::element::*;
 pub use self::grabs::*;
 
-use self::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, RelativeGeometry};
+use self::ssd::{
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, SurfaceFrame,
+    VisibilityState,
+};
 
 use self::xdg::handle_toplevel_commit;
-
-fn fullscreen_output_geometry(
-    wl_surface: &WlSurface,
-    wl_output: Option<&wl_output::WlOutput>,
-    space: &mut Space<WindowElement>,
-) -> Option<Rectangle<i32, Logical>> {
-    // First test if a specific output has been requested
-    // if the requested output is not found ignore the request
-    wl_output
-        .and_then(Output::from_resource)
-        .or_else(|| {
-            let w = space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false));
-            w.and_then(|w| space.outputs_for_element(w).first().cloned())
-        })
-        .as_ref()
-        .and_then(|o| space.output_geometry(o))
-}
 
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
@@ -187,8 +186,18 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             }
             if let Some(window) = self.window_for_surface(&root) {
                 window.0.on_commit();
+                // Keep the buffers the client just committed alive, so an
+                // app-triggered close can be drawn from them after the surface
+                // is gone. This is a cheap `Arc` clone per surface, not a GPU
+                // copy. Done for any surface in the window so subsurface content
+                // (e.g. Firefox) is captured too.
+                if let Some(frame) = capture_surface_tree(&root) {
+                    window.set_last_frame(frame);
+                }
 
-                if &root == surface {
+                // X11 windows have no Wayland resize pipeline: only refresh
+                // their frame cache (done above) and skip the toplevel path.
+                if &root == surface && window.is_wayland() {
                     // Snapshot the resize state here, after
                     // `on_commit_buffer_handler`/`Window::on_commit` have refreshed
                     // the render surface size and bounding box. Post-commit hooks
@@ -302,9 +311,393 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
         self.space
             .elements()
-            .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+            .find(|window| {
+                window.wl_surface().map(|s| &*s == surface).unwrap_or(false)
+                    || window_is_x11_surface(window, surface)
+            })
             .cloned()
     }
+
+    /// Start an ease-out transition of `window` from its current geometry to
+    /// the given content size and location. The client keeps drawing at its own
+    /// pace; the frame and content are stretched to the animated rect until it
+    /// catches up.
+    pub fn animate_window(
+        &mut self,
+        window: &WindowElement,
+        target_content: Size<i32, Logical>,
+        target_loc: Point<i32, Logical>,
+    ) {
+        let Some(start_loc) = self.space.element_location(window) else {
+            return;
+        };
+        let start = WindowRect::from_geometry(start_loc, window.resize_content_size());
+        let end = WindowRect::from_geometry(target_loc, target_content);
+        if start.loc == end.loc && start.content == end.content {
+            return;
+        }
+        window.decoration_state().animation =
+            Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
+    }
+
+    /// Advance every in-flight window animation. Called once per frame before
+    /// rendering: updates where the window is mapped and retires animations
+    /// whose client has caught up with the configured size.
+    pub fn tick_animations(&mut self) {
+        let now = Instant::now();
+        let windows: Vec<WindowElement> = self.space.elements().cloned().collect();
+        let mut retire_ghosts = Vec::new();
+        for window in &windows {
+            // Ghosts have no live surface: just retire them when their close
+            // transition has finished.
+            if window.is_ghosting() {
+                let finished = window
+                    .decoration_state()
+                    .visibility
+                    .animation
+                    .as_ref()
+                    .map(|animation| animation.finished(now))
+                    .unwrap_or(true);
+                if finished {
+                    retire_ghosts.push(window.clone());
+                }
+                continue;
+            }
+
+            // Clone the animation out before touching the window again: sampling
+            // it and asking for the committed size both borrow the window state.
+            let Some(animation) = window.decoration_state().animation.clone() else {
+                continue;
+            };
+            let (rect, progress) = animation.sample(now);
+            let loc = Point::<i32, Logical>::from((
+                rect.loc.x.round() as i32,
+                rect.loc.y.round() as i32,
+            ));
+            if self.space.element_location(window) != Some(loc) {
+                self.space.relocate_element(window, loc);
+            }
+            // Once the curve is done, keep the animation (which holds the window
+            // at its target geometry) until the client has adopted the new size,
+            // so a slow client doesn't snap back to its old geometry.
+            if progress >= 1.0 {
+                let target: Size<i32, Logical> = rect.content.to_i32_round();
+                let committed = window.resize_content_size();
+                if (committed.w - target.w).abs() <= 1 && (committed.h - target.h).abs() <= 1 {
+                    window.decoration_state().animation = None;
+                }
+            }
+        }
+
+        for window in retire_ghosts {
+            // Unmap while still marked as a ghost so the guarded surface paths
+            // are skipped, then release the ghost flag.
+            self.space.unmap_elem(&window);
+            window.end_ghost();
+        }
+
+        self.tick_visibility_animations(&windows, now);
+    }
+
+    /// Advance every window's open/close transition: start opens that were
+    /// waiting for their first buffer, retire finished opens, and deliver the
+    /// close request once a close transition has played out.
+    fn tick_visibility_animations(&mut self, windows: &[WindowElement], now: Instant) {
+        let mut to_close = Vec::new();
+        for window in windows {
+            if window.is_ghosting() {
+                continue;
+            }
+            // Resolve the committed size before borrowing the decoration state:
+            // it reads that same state on the SSD path.
+            let content = window.resize_content_size();
+            let mut send_close = false;
+            {
+                let mut state = window.decoration_state();
+
+                if state.visibility.open_pending
+                    && state.visibility.animation.is_none()
+                    && !state.visibility.closing
+                    && content.w > 0
+                    && content.h > 0
+                {
+                    state.visibility.open_pending = false;
+                    state.visibility.animation = Some(VisibilityAnimation::open());
+                }
+
+                let finished = state
+                    .visibility
+                    .animation
+                    .as_ref()
+                    .map(|animation| (animation.kind(), animation.finished(now)));
+                match finished {
+                    Some((VisibilityKind::Open, true)) => {
+                        state.visibility.animation = None;
+                    }
+                    Some((VisibilityKind::Close, true)) => {
+                        if state.visibility.close_sent_at.is_none() {
+                            state.visibility.close_sent_at = Some(now);
+                            send_close = true;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // A client that ignores the close request should not stay hidden
+                // forever: after a grace period, un-hide it.
+                if let Some(sent_at) = state.visibility.close_sent_at
+                    && now.saturating_duration_since(sent_at) > CLOSE_TIMEOUT
+                {
+                    state.visibility = VisibilityState::default();
+                }
+            }
+            if send_close {
+                to_close.push(window.clone());
+            }
+        }
+        for window in to_close {
+            self.send_close(&window);
+        }
+    }
+
+    /// Move the keyboard focus off `window` if it currently holds it. Used when
+    /// a window stops being interactive.
+    pub fn clear_window_focus(&mut self, window: &WindowElement) {
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && matches!(
+                keyboard.current_focus(),
+                Some(KeyboardFocusTarget::Window(w)) if w == window.0
+            )
+        {
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// Turn any window whose client is already gone into a closing ghost. Run
+    /// this *before* `Space::refresh` removes dead elements, so an abrupt client
+    /// exit (crash, SIGINT/disconnect) still animates from the kept buffers.
+    pub fn reap_closing_windows(&mut self) {
+        let dead: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|window| !window.0.alive() && !window.is_ghosting())
+            .cloned()
+            .collect();
+        for window in dead {
+            self.begin_window_ghost(&window);
+        }
+
+        // Minimized windows are out of the space and never animate, so a
+        // minimized window whose client exited would otherwise be kept (with
+        // its buffers) forever.
+        self.minimized.retain(|(window, _)| window.0.alive());
+    }
+
+    /// Start the close transition for a window whose client is already gone,
+    /// drawing it from its cached frame. Returns without effect when there is no
+    /// cached frame or the close already played out.
+    pub fn begin_window_ghost(&mut self, window: &WindowElement) {        // The window is gone or going; make sure the keyboard isn't left
+        // pointing at its dead surface.
+        self.clear_window_focus(window);
+
+        let now = Instant::now();
+        let mut state = window.decoration_state();
+        let Some(content) = state
+            .last_frame
+            .as_ref()
+            .map(|frame| frame.geometry.size)
+        else {
+            return;
+        };
+        // A ghost reserves room for the SSD chrome it will redraw, so its
+        // geometry matches the decorated window.
+        let is_ssd = state.is_ssd;
+        let fullscreen = state.header_bar.fullscreen;
+        let ghost_size: Size<i32, Logical> = if is_ssd {
+            if fullscreen {
+                Size::from((content.w, (HEADER_BAR_HEIGHT + content.h).max(0)))
+            } else {
+                Size::from((
+                    content.w + 2 * BORDER_WIDTH,
+                    content.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
+                ))
+            }
+        } else {
+            content
+        };
+        let animation = match state.visibility.animation.as_ref() {
+            Some(animation) if animation.kind() == VisibilityKind::Close => {
+                if animation.finished(now) {
+                    return;
+                }
+                animation.clone()
+            }
+            _ => VisibilityAnimation::close(),
+        };
+        state.visibility.closing = true;
+        state.visibility.open_pending = false;
+        state.visibility.animation = Some(animation);
+        drop(state);
+        window.begin_ghost(ghost_size);
+    }
+}
+
+/// Capture the pre-transition pixels of every window that is waiting for a
+/// snapshot, so its animation can crossfade from it. Must be called with the
+/// output framebuffer unbound, before rendering the frame.
+pub fn capture_window_snapshots<R>(space: &Space<WindowElement>, renderer: &mut R)
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let windows: Vec<WindowElement> = space.elements().cloned().collect();
+    for window in windows {
+        if window.is_ghosting() {
+            continue;
+        }
+
+        let pending = window
+            .decoration_state()
+            .animation
+            .as_ref()
+            .map(|animation| animation.needs_snapshot())
+            .unwrap_or(false);
+        if pending {
+            let content = window.resize_content_size();
+            if content.w > 0 && content.h > 0 {
+                let size = Size::<i32, Buffer>::from((content.w, content.h));
+                if let Some(buffer) = capture_window_content(renderer, &window, size) {
+                    window
+                        .decoration_state()
+                        .animation
+                        .as_mut()
+                        .unwrap()
+                        .set_snapshot(buffer, content);
+                } else {
+                    window
+                        .decoration_state()
+                        .animation
+                        .as_mut()
+                        .unwrap()
+                        .set_snapshot_unavailable();
+                }
+            } else {
+                window
+                    .decoration_state()
+                    .animation
+                    .as_mut()
+                    .unwrap()
+                    .set_snapshot_unavailable();
+            }
+        }
+    }
+}
+
+/// Walk a window's surface tree and keep every mapped surface's buffer, with its
+/// position relative to the window's top-left. Holding the buffers keeps the
+/// pixels alive after the client is gone, so an app-triggered close can render
+/// the whole window (content and subsurfaces).
+fn capture_surface_tree(root: &WlSurface) -> Option<LastFrame> {
+    let mut surfaces: Vec<SurfaceFrame> = Vec::new();
+
+    with_surface_tree_downward(
+        root,
+        Point::<f64, Logical>::from((0.0, 0.0)),
+        |_, states, location| {
+            let mut location = *location;
+            if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                if let Some(view) = data.lock().unwrap().view() {
+                    location += view.offset.to_f64();
+                    TraversalAction::DoChildren(location)
+                } else {
+                    TraversalAction::SkipChildren
+                }
+            } else {
+                TraversalAction::SkipChildren
+            }
+        },
+        |_, states, location| {
+            let mut location = *location;
+            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+                return;
+            };
+            let data = data.lock().unwrap();
+            let Some(view) = data.view() else {
+                return;
+            };
+            location += view.offset.to_f64();
+            if let Some(buffer) = data.buffer() {
+                surfaces.push(SurfaceFrame {
+                    buffer: buffer.clone(),
+                    location: Point::from((
+                        location.x.round() as i32,
+                        location.y.round() as i32,
+                    )),
+                    size: view.dst,
+                    scale: data.buffer_scale(),
+                    transform: data.buffer_transform(),
+                    src: Some(view.src),
+                });
+            }
+        },
+        |_, _, _| true,
+    );
+
+    (!surfaces.is_empty()).then_some(LastFrame {
+        geometry: with_states(root, |states| {
+            states.cached_state.get::<SurfaceCachedState>().current().geometry
+        })
+        .unwrap_or_else(|| {
+            Rectangle::from_size(surfaces.first().map(|s| s.size).unwrap_or_default())
+        }),
+        surfaces,
+    })
+}
+
+/// Render a window's client content into an offscreen buffer and read it back
+/// as a [`MemoryRenderBuffer`]. Returns `None` if the renderer cannot provide
+/// a readable offscreen target.
+fn capture_window_content<R>(
+    renderer: &mut R,
+    window: &WindowElement,
+    size: Size<i32, Buffer>,
+) -> Option<MemoryRenderBuffer>
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let mut target = renderer.create_buffer(Fourcc::Abgr8888, size).ok()?;
+    let mut framebuffer = renderer.bind(&mut target).ok()?;
+
+    let elements: Vec<WaylandSurfaceRenderElement<R>> = AsRenderElements::render_elements(
+        &window.0,
+        renderer,
+        Point::from((0, 0)),
+        Scale::from(1.0),
+        1.0,
+    );
+
+    let physical_size = Size::<i32, Physical>::from((size.w, size.h));
+    let mut tracker = OutputDamageTracker::new(physical_size, 1.0, Transform::Normal);
+    tracker
+        .render_output(renderer, &mut framebuffer, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+        .ok()?;
+
+    let region = Rectangle::<i32, Buffer>::from_size(size);
+    let mapping = renderer
+        .copy_framebuffer(&framebuffer, region, Fourcc::Abgr8888)
+        .ok()?;
+    let data = renderer.map_texture(&mapping).ok()?;
+    // Smithay's GL renderer flips y while drawing into a `Normal` target, so the
+    // readback already comes out top-down: no extra transform is needed.
+    Some(MemoryRenderBuffer::from_slice(
+        data,
+        Fourcc::Abgr8888,
+        size,
+        1,
+        Transform::Normal,
+        None,
+    ))
 }
 
 #[derive(Default)]
@@ -493,6 +886,9 @@ pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point
         })
         .collect::<Vec<_>>();
     for window in space.elements() {
+        if window.is_ghosting() {
+            continue;
+        }
         let window_location = match space.element_location(window) {
             Some(loc) => loc,
             None => continue,
@@ -508,6 +904,22 @@ pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point
     }
 }
 
+/// Whether `window` is an X11 window whose Wayland surface is `surface`.
+#[cfg(feature = "xwayland")]
+fn window_is_x11_surface(window: &WindowElement, surface: &WlSurface) -> bool {
+    window
+        .0
+        .x11_surface()
+        .and_then(|x11| x11.wl_surface())
+        .as_ref()
+        == Some(surface)
+}
+
+#[cfg(not(feature = "xwayland"))]
+fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool {
+    false
+}
+
 /// The area of an output that floating windows are laid out within, i.e. its
 /// geometry minus any layer-shell exclusive zones (panels, docks, ...).
 fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
@@ -517,13 +929,38 @@ fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rec
     (area.size.w > 0 && area.size.h > 0).then_some(area)
 }
 
-/// Compute a window's geometry as fractions of its output's work area.
-pub fn relative_geometry_of(
+/// The output a window belongs to.
+///
+/// [`Space::outputs_for_element`] returns its outputs in an unspecified order
+/// (they are kept in a `HashMap`), which is wrong when a window overlaps more
+/// than one output — e.g. a fullscreen window on a secondary monitor. Prefer
+/// the output under the window's top-left corner and only fall back to the
+/// arbitrary order/primary output when nothing contains it.
+pub fn output_for_window(space: &Space<WindowElement>, window: &WindowElement) -> Option<Output> {
+    let outputs = space.outputs_for_element(window);
+    if let Some(loc) = space.element_location(window)
+        && let Some(output) = outputs.iter().find(|output| {
+            space
+                .output_geometry(output)
+                .map(|geo| geo.contains(loc))
+                .unwrap_or(false)
+        })
+    {
+        return Some(output.clone());
+    }
+    outputs
+        .first()
+        .cloned()
+        .or_else(|| space.outputs().next().cloned())
+}
+
+/// Compute a window's geometry as fractions of a specific output's work area.
+pub fn relative_geometry_of_output(
     space: &Space<WindowElement>,
+    output: &Output,
     window: &WindowElement,
 ) -> Option<RelativeGeometry> {
-    let output = space.outputs_for_element(window).first().cloned()?;
-    let area = output_work_area(space, &output)?;
+    let area = output_work_area(space, output)?;
     let loc = space.element_location(window)?;
     let size = window.geometry().size;
     Some(RelativeGeometry {
@@ -534,20 +971,30 @@ pub fn relative_geometry_of(
     })
 }
 
-/// Turn a fractional geometry back into an absolute location and the
-/// (undecorated) content size to configure the client with.
-pub fn absolute_geometry(
+/// Compute a window's geometry as fractions of its output's work area.
+pub fn relative_geometry_of(
     space: &Space<WindowElement>,
     window: &WindowElement,
+) -> Option<RelativeGeometry> {
+    let output = output_for_window(space, window)?;
+    relative_geometry_of_output(space, &output, window)
+}
+
+/// Turn a fractional geometry back into an absolute location and the
+/// (undecorated) content size to configure the client with, against a specific
+/// output's work area.
+pub fn absolute_geometry_for_output(
+    space: &Space<WindowElement>,
+    output: &Output,
     rel: RelativeGeometry,
+    is_ssd: bool,
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
-    let output = space.outputs_for_element(window).first().cloned()?;
-    let area = output_work_area(space, &output)?;
+    let area = output_work_area(space, output)?;
     let loc = Point::from((
         area.loc.x + (rel.x * area.size.w as f64).round() as i32,
         area.loc.y + (rel.y * area.size.h as f64).round() as i32,
     ));
-    let decoration: Size<i32, Logical> = if window.is_ssd() {
+    let decoration: Size<i32, Logical> = if is_ssd {
         Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
     } else {
         Size::from((0, 0))
@@ -559,10 +1006,24 @@ pub fn absolute_geometry(
     Some((loc, size))
 }
 
+/// Turn a fractional geometry back into an absolute location and the
+/// (undecorated) content size to configure the client with.
+pub fn absolute_geometry(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    rel: RelativeGeometry,
+) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
+    let output = output_for_window(space, window)?;
+    absolute_geometry_for_output(space, &output, rel, window.is_ssd())
+}
+
 /// Snapshot every floating window's position and size as a fraction of its
 /// output's work area. Call this *before* changing the output's mode.
 pub fn capture_relative_geometries(space: &Space<WindowElement>, output: &Output) {
     for window in space.elements_for_output(output) {
+        if window.is_ghosting() {
+            continue;
+        }
         // Fullscreen and maximized windows are re-configured to the output
         // rather than scaled, so they don't need a snapshot.
         if window.decoration_state().header_bar.fullscreen || window.is_maximized() {
@@ -586,6 +1047,12 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
 
     let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
     for window in windows {
+        if window.is_ghosting() {
+            continue;
+        }
+        // An output mode change re-lays out every window, so any in-flight
+        // transition is superseded by the new geometry.
+        window.decoration_state().animation = None;
         if let Some(toplevel) = window.0.toplevel() {
             let fullscreen = window.decoration_state().header_bar.fullscreen;
             if fullscreen {

@@ -116,6 +116,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
             KeyAction::ToggleDecorations => {
                 for element in self.space.elements() {
+                    // A closing ghost has no live toplevel to reconfigure.
+                    if element.is_ghosting() {
+                        continue;
+                    }
                     #[allow(irrefutable_let_patterns)]
                     if let Some(toplevel) = element.0.toplevel() {
                         let mode_changed = toplevel.with_pending_state(|state| {

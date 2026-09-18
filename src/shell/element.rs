@@ -1,4 +1,7 @@
-use std::{borrow::Cow, time::Duration};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::{
@@ -6,8 +9,12 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
-                AsRenderElements, Kind, memory::MemoryRenderBufferRenderElement,
-                solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::SolidColorRenderElement,
+                surface::WaylandSurfaceRenderElement,
+                texture::{TextureBuffer, TextureRenderElement},
+                utils::RescaleRenderElement,
             },
         },
     },
@@ -31,7 +38,9 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     render_elements,
-    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, user_data::UserDataMap},
+    utils::{
+        IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, user_data::UserDataMap,
+    },
     wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
 };
 
@@ -50,6 +59,9 @@ impl WindowElement {
         location: Point<f64, Logical>,
         window_type: WindowSurfaceType,
     ) -> Option<(PointerFocusTarget, Point<i32, Logical>)> {
+        if self.is_ghosting() {
+            return None;
+        }
         let is_ssd = self.decoration_state().is_ssd;
         if is_ssd {
             let size = self.geometry().size;
@@ -88,6 +100,9 @@ impl WindowElement {
     where
         F: FnMut(&WlSurface, &WlSurfaceData),
     {
+        if self.is_ghosting() {
+            return;
+        }
         self.0.with_surfaces(processor);
     }
 
@@ -101,6 +116,9 @@ impl WindowElement {
         T: Into<Duration>,
         F: FnMut(&WlSurface, &WlSurfaceData) -> Option<Output> + Copy,
     {
+        if self.is_ghosting() {
+            return;
+        }
         self.0.send_frame(output, time, throttle, primary_scan_out_output)
     }
 
@@ -113,6 +131,9 @@ impl WindowElement {
         P: FnMut(&WlSurface, &WlSurfaceData) -> Option<Output> + Copy,
         F: Fn(&WlSurface, &WlSurfaceData) -> &'a DmabufFeedback + Copy,
     {
+        if self.is_ghosting() {
+            return;
+        }
         self.0
             .send_dmabuf_feedback(output, primary_scan_out_output, select_dmabuf_feedback)
     }
@@ -126,6 +147,9 @@ impl WindowElement {
         F1: FnMut(&WlSurface, &WlSurfaceData) -> Option<Output> + Copy,
         F2: FnMut(&WlSurface, &WlSurfaceData) -> wp_presentation_feedback::Kind + Copy,
     {
+        if self.is_ghosting() {
+            return;
+        }
         self.0.take_presentation_feedback(
             output_feedback,
             primary_scan_out_output,
@@ -146,6 +170,9 @@ impl WindowElement {
 
     #[inline]
     pub fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        if self.is_ghosting() {
+            return None;
+        }
         self.0.wl_surface()
     }
 
@@ -158,7 +185,9 @@ impl WindowElement {
 impl IsAlive for WindowElement {
     #[inline]
     fn alive(&self) -> bool {
-        self.0.alive()
+        // A ghost outlives its client so `Space` keeps it while the close
+        // transition plays from its cached frame.
+        self.is_ghosting() || self.0.alive()
     }
 }
 
@@ -539,8 +568,25 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
 
 impl SpaceElement for WindowElement {
     fn geometry(&self) -> Rectangle<i32, Logical> {
+        // A ghost has no live surface; report the cached decorated size.
+        if let Some(size) = self.ghost_size() {
+            return Rectangle::from_size(size);
+        }
         let mut geo = SpaceElement::geometry(&self.0);
-        if self.decoration_state().is_ssd {
+        let (is_ssd, animation) = {
+            let state = self.decoration_state();
+            (
+                state.is_ssd,
+                state.animation.as_ref().map(|anim| anim.sample(Instant::now()).0),
+            )
+        };
+        // While animating, report the interpolated (decorated) size so damage
+        // tracking and hit testing follow the visual window.
+        if let Some(rect) = animation {
+            geo.size = rect.decorated(is_ssd).to_i32_round();
+            return geo;
+        }
+        if is_ssd {
             // Match the size used for rendering and resize math.
             geo.size = self.resize_content_size();
             geo.size.w += 2 * BORDER_WIDTH;
@@ -549,19 +595,39 @@ impl SpaceElement for WindowElement {
         geo
     }
     fn bbox(&self) -> Rectangle<i32, Logical> {
+        if let Some(size) = self.ghost_size() {
+            return Rectangle::from_size(size);
+        }
+        let (is_ssd, animation) = {
+            let state = self.decoration_state();
+            (
+                state.is_ssd,
+                state.animation.as_ref().map(|anim| anim.sample(Instant::now()).0),
+            )
+        };
         let mut bbox = SpaceElement::bbox(&self.0);
-        if self.decoration_state().is_ssd {
-            bbox.size.w += 2 * BORDER_WIDTH;
-            bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
+        if is_ssd {
+            if let Some(rect) = animation {
+                bbox.size = rect.decorated(true).to_i32_round();
+            } else {
+                bbox.size.w += 2 * BORDER_WIDTH;
+                bbox.size.h += HEADER_BAR_HEIGHT + BORDER_WIDTH;
+            }
             // Include the outside resize band so `Space` hit testing considers
             // points just beyond the decorated window.
             bbox.loc -= Point::from((RESIZE_MARGIN, RESIZE_MARGIN));
             bbox.size.w += 2 * RESIZE_MARGIN;
             bbox.size.h += 2 * RESIZE_MARGIN;
+        } else if let Some(rect) = animation {
+            bbox.size = rect.decorated(false).to_i32_round();
         }
         bbox
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
+        // A ghost (and any window fading out) no longer accepts input.
+        if self.is_ghosting() || self.is_closing() {
+            return false;
+        }
         if self.decoration_state().is_ssd {
             let size = self.geometry().size;
             let edge = self.resize_edge_at(*point);
@@ -592,16 +658,28 @@ impl SpaceElement for WindowElement {
     }
 
     fn set_activate(&self, activated: bool) {
+        if self.is_ghosting() {
+            return;
+        }
         SpaceElement::set_activate(&self.0, activated);
     }
     fn output_enter(&self, output: &Output, overlap: Rectangle<i32, Logical>) {
+        if self.is_ghosting() {
+            return;
+        }
         SpaceElement::output_enter(&self.0, output, overlap);
     }
     fn output_leave(&self, output: &Output) {
+        if self.is_ghosting() {
+            return;
+        }
         SpaceElement::output_leave(&self.0, output);
     }
     #[profiling::function]
     fn refresh(&self) {
+        if self.is_ghosting() {
+            return;
+        }
         SpaceElement::refresh(&self.0);
     }
 }
@@ -611,6 +689,13 @@ render_elements!(
     Window=WaylandSurfaceRenderElement<R>,
     Decoration=SolidColorRenderElement,
     Icon=MemoryRenderBufferRenderElement<R>,
+    Scaled=RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
+    Snapshot=RescaleRenderElement<MemoryRenderBufferRenderElement<R>>,
+    ScaledDecoration=RescaleRenderElement<SolidColorRenderElement>,
+    ScaledScaled=RescaleRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>,
+    ScaledSnapshot=RescaleRenderElement<RescaleRenderElement<MemoryRenderBufferRenderElement<R>>>,
+    Texture=TextureRenderElement<R::TextureId>,
+    ScaledTexture=RescaleRenderElement<TextureRenderElement<R::TextureId>>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -619,6 +704,13 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Decoration(arg0) => f.debug_tuple("Decoration").field(arg0).finish(),
             Self::Icon(arg0) => f.debug_tuple("Icon").field(arg0).finish(),
+            Self::Scaled(arg0) => f.debug_tuple("Scaled").field(arg0).finish(),
+            Self::Snapshot(arg0) => f.debug_tuple("Snapshot").field(arg0).finish(),
+            Self::ScaledDecoration(arg0) => f.debug_tuple("ScaledDecoration").field(arg0).finish(),
+            Self::ScaledScaled(arg0) => f.debug_tuple("ScaledScaled").field(arg0).finish(),
+            Self::ScaledSnapshot(arg0) => f.debug_tuple("ScaledSnapshot").field(arg0).finish(),
+            Self::Texture(arg0) => f.debug_tuple("Texture").field(arg0).finish(),
+            Self::ScaledTexture(arg0) => f.debug_tuple("ScaledTexture").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -638,12 +730,46 @@ where
         scale: Scale<f64>,
         alpha: f32,
     ) -> Vec<C> {
+        // A ghost's client is gone; draw its frozen frame instead of a surface
+        // that no longer exists.
+        if self.is_ghosting() {
+            return ghost_render_elements(self, renderer, location, scale, alpha);
+        }
+
         let window_bbox = SpaceElement::bbox(&self.0);
+        // The window's undecorated top-left, before `location` is advanced past
+        // the header bar; used as the pivot for the open/close scale.
+        let window_origin = location;
+
+        // A window opening or closing fades and scales as one piece. The alpha
+        // is folded into every sub-element; the scale is applied to the finished
+        // list, about the center of the decorated window.
+        let (visibility_alpha, visibility_scale) = self.visibility().unwrap_or((1.0, 1.0));
+        let alpha = alpha * visibility_alpha;
+
+        // While a maximize/unmaximize transition is running the window is drawn
+        // at the interpolated (animated) size. The client's content is
+        // crossfaded from a frozen snapshot of its pre-transition pixels to the
+        // live content, while the SSD frame is re-laid out at the new size.
+        let (animation_rect, progress, snapshot) = {
+            let state = self.decoration_state();
+            let animation = state.animation.as_ref();
+            let sample = animation.map(|anim| anim.sample(Instant::now()));
+            (
+                sample.map(|(rect, _)| rect),
+                sample.map(|(_, progress)| progress as f32).unwrap_or(1.0),
+                animation.and_then(|anim| anim.snapshot()).map(|(b, s)| (b.clone(), s)),
+            )
+        };
 
         if self.decoration_state().is_ssd && !window_bbox.is_empty() {
-            // Use the same content size as the resize/position math so the
-            // frame and its location update on the same commit.
+            // The size of the buffer we can actually draw right now.
             let content_size = self.resize_content_size();
+            // The size the frame should occupy on screen (the animation may
+            // stretch the buffer into this while the client catches up).
+            let display_size = animation_rect
+                .map(|rect| rect.content.to_i32_round())
+                .unwrap_or(content_size);
 
             // Computed before borrowing the decoration state: the maximize
             // button shows "restore" while the window is maximized, and the
@@ -652,10 +778,10 @@ where
             let focused = self.is_activated();
             let mut state = self.decoration_state();
             let fullscreen = state.header_bar.fullscreen;
-            let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
+            let width = display_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
             state
                 .header_bar
-                .redraw(width.max(0) as u32, content_size, focused);
+                .redraw(width.max(0) as u32, display_size, focused);
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
 
@@ -714,16 +840,326 @@ where
             }
             .to_physical_precise_round(scale);
 
-            let window_elements =
+            // Elements are ordered front-to-back and drawn back-to-front, so the
+            // snapshot must be pushed *before* the live content to land on top
+            // of it. It is stretched to the same animated content rect as the
+            // live content, so both frames crossfade in place.
+            push_crossfade_snapshot(
+                &mut vec,
+                renderer,
+                &snapshot,
+                location,
+                display_size,
+                alpha,
+                progress,
+            );
+            let window_elements: Vec<WaylandSurfaceRenderElement<R>> =
                 AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
-            vec.extend(window_elements);
+            extend_scaled(&mut vec, window_elements, location, content_size, display_size);
 
+            let decorated_size: Size<i32, Logical> = if fullscreen {
+                Size::from((display_size.w, HEADER_BAR_HEIGHT + display_size.h))
+            } else {
+                Size::from((
+                    display_size.w + 2 * BORDER_WIDTH,
+                    display_size.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
+                ))
+            };
+            let center = window_origin + decorated_center(decorated_size, scale);
+            vec = scale_elements_about(vec, center, visibility_scale);
             vec.into_iter().map(C::from).collect()
         } else {
-            AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha)
-                .into_iter()
-                .map(C::from)
-                .collect()
+            let content_size = self.resize_content_size();
+            let display_size = animation_rect
+                .map(|rect| rect.content.to_i32_round())
+                .unwrap_or(content_size);
+
+            let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
+            push_crossfade_snapshot(
+                &mut vec,
+                renderer,
+                &snapshot,
+                location,
+                display_size,
+                alpha,
+                progress,
+            );
+            let window_elements: Vec<WaylandSurfaceRenderElement<R>> =
+                AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
+            extend_scaled(&mut vec, window_elements, location, content_size, display_size);
+            let center = window_origin + decorated_center(display_size, scale);
+            vec = scale_elements_about(vec, center, visibility_scale);
+            vec.into_iter().map(C::from).collect()
         }
     }
+}
+
+/// Draw the frozen frame of a window whose client is gone, faded and scaled by
+/// its close transition.
+fn ghost_render_elements<R, C>(
+    window: &WindowElement,
+    renderer: &mut R,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<C>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+    C: From<WindowRenderElement<R>>,
+{
+    let state = window.decoration_state();
+    let Some(frame) = state.last_frame.as_ref() else {
+        return Vec::new();
+    };
+    let (visibility_alpha, visibility_scale) = state
+        .visibility
+        .animation
+        .as_ref()
+        .map(|animation| animation.sample(Instant::now()))
+        .unwrap_or((1.0, 1.0));
+    let surfaces = frame.surfaces.clone();
+    let geometry = frame.geometry;
+    let content_size = geometry.size;
+    let is_ssd = state.is_ssd;
+    let fullscreen = state.header_bar.fullscreen;
+    drop(state);
+
+    let alpha = alpha * visibility_alpha;
+
+    let window_origin = location;
+    let mut location = location;
+    let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
+
+    if is_ssd {
+        let mut state = window.decoration_state();
+        let width = content_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
+        // No hover state on a closing window.
+        state.header_bar.pointer_loc = None;
+        state
+            .header_bar
+            .redraw(width.max(0) as u32, content_size, false);
+
+        let icon_off = icon_offset();
+        let base = state.header_bar.width as i32;
+        let icon_locations = [
+            (
+                base - BUTTON_WIDTH as i32 + icon_off.x,
+                &state.header_bar.close_icon,
+            ),
+            (
+                base - BUTTON_WIDTH as i32 * 2 + icon_off.x,
+                &state.header_bar.maximize_icon,
+            ),
+            (
+                base - BUTTON_WIDTH as i32 * 3 + icon_off.x,
+                &state.header_bar.minimize_icon,
+            ),
+        ];
+        for (icon_x, icon) in icon_locations {
+            let icon_pos: Point<i32, Logical> = Point::from((icon_x, icon_off.y));
+            let icon_physical = (location + icon_pos.to_physical_precise_round(scale)).to_f64();
+            vec.push(
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    icon_physical,
+                    icon,
+                    Some(alpha),
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )
+                .expect("failed to import window icon")
+                .into(),
+            );
+        }
+
+        vec.extend(AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
+            &state.header_bar,
+            renderer,
+            location,
+            scale,
+            alpha,
+        ));
+        if !fullscreen {
+            vec.extend(AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
+                &state.header_bar.borders,
+                renderer,
+                location,
+                scale,
+                alpha,
+            ));
+        }
+
+        location += if fullscreen {
+            fullscreen_content_offset()
+        } else {
+            content_offset()
+        }
+        .to_physical_precise_round(scale);
+    }
+
+    // Draw every held surface (root plus subsurfaces) at its offset within the
+    // window, so e.g. Firefox's content subsurface is included. For a
+    // client-decorated window the buffer has a shadow margin, so shift it up by
+    // the window geometry offset to line the content up with the window.
+    let surface_origin = if is_ssd {
+        location
+    } else {
+        window_origin - geometry.loc.to_physical_precise_round(scale)
+    };
+    for surface in &surfaces {
+        let Some(Ok(texture)) = renderer.import_buffer(&surface.buffer, None, &[]) else {
+            continue;
+        };
+        let texture_buffer =
+            TextureBuffer::from_texture(renderer, texture, surface.scale, surface.transform, None);
+        let surface_location = surface_origin + surface.location.to_physical_precise_round(scale);
+        vec.push(WindowRenderElement::Texture(
+            TextureRenderElement::from_texture_buffer(
+                surface_location.to_f64(),
+                &texture_buffer,
+                Some(alpha),
+                surface.src,
+                Some(surface.size),
+                Kind::Unspecified,
+            ),
+        ));
+    }
+
+    let decorated_size: Size<i32, Logical> = if is_ssd {
+        if fullscreen {
+            Size::from((content_size.w, HEADER_BAR_HEIGHT + content_size.h))
+        } else {
+            Size::from((
+                content_size.w + 2 * BORDER_WIDTH,
+                content_size.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
+            ))
+        }
+    } else {
+        content_size
+    };
+    let center = window_origin + decorated_center(decorated_size, scale);
+    scale_elements_about(vec, center, visibility_scale)
+        .into_iter()
+        .map(C::from)
+        .collect()
+}
+
+/// The offset from a window's top-left to the center of its `decorated_size`,
+/// in physical pixels.
+fn decorated_center(decorated_size: Size<i32, Logical>, scale: Scale<f64>) -> Point<i32, Physical> {
+    Point::<f64, Physical>::from((
+        decorated_size.w as f64 / 2.0 * scale.x,
+        decorated_size.h as f64 / 2.0 * scale.y,
+    ))
+    .to_i32_round()
+}
+
+/// Re-scale every element of a window about `origin` by `scale`, used for the
+/// open/close transition. Already-scaled elements are wrapped one level deeper
+/// so the transforms compose.
+fn scale_elements_about<R>(
+    elements: Vec<WindowRenderElement<R>>,
+    origin: Point<i32, Physical>,
+    scale: f64,
+) -> Vec<WindowRenderElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return elements;
+    }
+    elements
+        .into_iter()
+        .map(|element| match element {
+            WindowRenderElement::Window(e) => WindowRenderElement::Scaled(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Decoration(e) => WindowRenderElement::ScaledDecoration(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Icon(e) => WindowRenderElement::Snapshot(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Scaled(e) => WindowRenderElement::ScaledScaled(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Snapshot(e) => WindowRenderElement::ScaledSnapshot(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            WindowRenderElement::Texture(e) => WindowRenderElement::ScaledTexture(
+                RescaleRenderElement::from_element(e, origin, scale),
+            ),
+            other => other,
+        })
+        .collect()
+}
+
+/// Draw the frozen pre-transition frame stretched into the animated content
+/// area, fading out as the live frame shows through. No-op without a snapshot.
+/// Pushed *before* the live content, since elements are front-to-back.
+#[allow(clippy::too_many_arguments)]
+fn push_crossfade_snapshot<R>(
+    out: &mut Vec<WindowRenderElement<R>>,
+    renderer: &mut R,
+    snapshot: &Option<(MemoryRenderBuffer, Size<i32, Logical>)>,
+    origin: Point<i32, Physical>,
+    display_size: Size<i32, Logical>,
+    alpha: f32,
+    progress: f32,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let Some((buffer, native)) = snapshot else {
+        return;
+    };
+    // Let the element use the buffer's native size as its source, then stretch
+    // it to the animated size. Overriding `from_buffer`'s `size` instead would
+    // make it sample a source rect larger than the captured texture.
+    let element = MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        origin.to_f64(),
+        buffer,
+        Some(alpha * (1.0 - progress)),
+        None,
+        None,
+        Kind::Unspecified,
+    )
+    .expect("failed to import window snapshot");
+    let scale = Scale::from((
+        display_size.w as f64 / native.w.max(1) as f64,
+        display_size.h as f64 / native.h.max(1) as f64,
+    ));
+    out.push(WindowRenderElement::Snapshot(RescaleRenderElement::from_element(
+        element, origin, scale,
+    )));
+}
+
+/// Append the client content, stretching it from the committed size to the
+/// displayed (animated) size when they differ. `origin` is the physical
+/// top-left the content is anchored to.
+fn extend_scaled<R>(
+    out: &mut Vec<WindowRenderElement<R>>,
+    elements: Vec<WaylandSurfaceRenderElement<R>>,
+    origin: Point<i32, Physical>,
+    committed: Size<i32, Logical>,
+    display: Size<i32, Logical>,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    if display == committed || committed.w <= 0 || committed.h <= 0 {
+        out.extend(elements.into_iter().map(WindowRenderElement::from));
+        return;
+    }
+    let scale = Scale::from((
+        display.w as f64 / committed.w as f64,
+        display.h as f64 / committed.h as f64,
+    ));
+    out.extend(elements.into_iter().map(|element| {
+        WindowRenderElement::Scaled(RescaleRenderElement::from_element(element, origin, scale))
+    }));
 }
