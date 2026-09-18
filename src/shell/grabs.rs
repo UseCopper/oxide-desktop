@@ -47,9 +47,10 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-
+        let new_location =
+            super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
         data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+            .map_element(self.window.clone(), new_location, true);
     }
 
     fn relative_motion(
@@ -220,8 +221,10 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
+        let new_location =
+            super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
         data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+            .map_element(self.window.clone(), new_location, true);
     }
 
     fn frame(

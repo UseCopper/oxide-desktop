@@ -1028,6 +1028,8 @@ impl<B: Backend> AnvilState<B> {
         }
         let delta = global - drag.start_global;
         let new_origin = drag.start_origin + delta.to_i32_round();
+        let new_origin =
+            super::clamp_window_position(&self.space, &drag.window, global, new_origin);
         self.space.map_element(drag.window, new_origin, true);
         tracing::trace!(?global, ?new_origin, "SSD drag moved window");
     }

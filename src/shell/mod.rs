@@ -933,6 +933,26 @@ pub fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option
     (area.size.w > 0 && area.size.h > 0).then_some(area)
 }
 
+/// Clamp a dragged window's proposed top-left so its titlebar can't be moved
+/// under a layer-shell exclusive zone (e.g. a top panel), keeping it grabbable.
+/// The output under `pointer` decides which work area applies.
+pub fn clamp_window_position(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    pointer: Point<f64, Logical>,
+    proposed: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    let output = space
+        .output_under(pointer)
+        .next()
+        .cloned()
+        .or_else(|| output_for_window(space, window));
+    let Some(area) = output.and_then(|output| output_work_area(space, &output)) else {
+        return proposed;
+    };
+    Point::from((proposed.x, proposed.y.max(area.loc.y)))
+}
+
 /// The output a window belongs to.
 ///
 /// [`Space::outputs_for_element`] returns its outputs in an unspecified order
