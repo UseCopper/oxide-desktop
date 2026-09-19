@@ -15,7 +15,7 @@ use smithay::{
 
 use super::{
     SnapGrid, WindowElement,
-    ssd::{RelativeGeometry, RestoreTarget},
+    ssd::{Decoration, RelativeGeometry, RestoreTarget},
     xdg::{fullscreen_content_size, maximize_content_size, undecorated_content_size},
 };
 
@@ -139,7 +139,7 @@ pub fn absolute_geometry(
     rel: RelativeGeometry,
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
     let output = output_for_window(space, window)?;
-    absolute_geometry_for_output(space, &output, rel, window.is_ssd())
+    absolute_geometry_for_output(space, &output, rel, Decoration::of(window).is_server())
 }
 
 /// Resolve where `window` should return to for the given floating geometry.
@@ -153,15 +153,15 @@ pub fn restore_target(
 ) -> Option<RestoreTarget> {
     let output = output_for_window(space, window)?;
     let area = output_work_area(space, &output)?;
-    let is_ssd = window.is_ssd();
+    let server = Decoration::of(window).is_server();
     // A server-decorated window with no real geometry recorded (it maximized
     // before committing) has nothing to restore; the client picks the size.
-    if is_ssd && (rel.w <= 0.0 || rel.h <= 0.0) {
+    if server && (rel.w <= 0.0 || rel.h <= 0.0) {
         return None;
     }
     Some(RestoreTarget {
         loc: rel.location(area),
-        content: is_ssd.then(|| rel.content_size(area, true)),
+        content: server.then(|| rel.content_size(area, true)),
     })
 }
 

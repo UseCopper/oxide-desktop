@@ -50,7 +50,7 @@ use smithay::{
 };
 
 use super::ssd::{
-    BTN_LEFT, BUTTON_WIDTH, BORDER_WIDTH, HEADER_BAR_HEIGHT, RESIZE_MARGIN, TITLE_PADDING,
+    BTN_LEFT, BUTTON_WIDTH, BORDER_WIDTH, Decoration, HEADER_BAR_HEIGHT, RESIZE_MARGIN, TITLE_PADDING,
     icon_offset, content_offset, fullscreen_content_offset, resize_cursor,
 };
 use crate::{AnvilState, focus::PointerFocusTarget, state::Backend};
@@ -806,7 +806,7 @@ where
         // at the interpolated (animated) size. The client's content is
         // crossfaded from a frozen snapshot of its pre-transition pixels to the
         // live content, while the SSD frame is re-laid out at the new size.
-        let (animation_rect, progress, snapshot) = {
+        let (animation_rect, progress, snapshot, decoration) = {
             let state = self.decoration_state();
             let animation = state.animation.as_ref();
             let sample = animation.map(|anim| anim.sample(Instant::now()));
@@ -814,10 +814,11 @@ where
                 sample.map(|(rect, _)| rect),
                 sample.map(|(_, progress)| progress as f32).unwrap_or(1.0),
                 animation.and_then(|anim| anim.snapshot()).map(|(b, s)| (b.clone(), s)),
+                Decoration::of_is_ssd(state.is_ssd),
             )
         };
 
-        if self.decoration_state().is_ssd && !window_bbox.is_empty() {
+        if decoration.is_server() && !window_bbox.is_empty() {
             // The size of the buffer we can actually draw right now.
             let content_size = self.resize_content_size();
             // The size the frame should occupy on screen (the animation may
@@ -941,10 +942,7 @@ where
             let decorated_size: Size<i32, Logical> = if fullscreen {
                 Size::from((display_size.w, HEADER_BAR_HEIGHT + display_size.h))
             } else {
-                Size::from((
-                    display_size.w + 2 * BORDER_WIDTH,
-                    display_size.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
-                ))
+                decoration.decorate(display_size)
             };
             let center = window_origin + decorated_center(decorated_size, scale);
             vec = scale_elements_about(vec, center, visibility_scale);

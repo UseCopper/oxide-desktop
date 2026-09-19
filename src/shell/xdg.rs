@@ -38,7 +38,7 @@ use super::{
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
     place_new_window,
 };
-use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor, Restore, RestoreTarget};
+use super::ssd::{Decoration, DragAnchor, Restore, RestoreTarget};
 
 /// Size a toplevel should use while fullscreen.
 ///
@@ -46,25 +46,14 @@ use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor, Restore, RestoreTa
 /// Client-decorated windows have to fill the whole output, otherwise the
 /// undecorated strip they leave behind is never painted (black).
 pub(crate) fn fullscreen_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
-    if is_ssd {
-        Size::from((output.w, (output.h - HEADER_BAR_HEIGHT).max(0)))
-    } else {
-        output
-    }
+    Decoration::of_is_ssd(is_ssd).fullscreen_content(output)
 }
 
 /// Size a toplevel should use while maximized, leaving room for the SSD frame
 /// (borders + header bar) so the decorated window fits inside the output
 /// instead of hanging off the right/bottom edge.
 pub(crate) fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
-    if is_ssd {
-        Size::from((
-            (output.w - 2 * BORDER_WIDTH).max(0),
-            (output.h - HEADER_BAR_HEIGHT - BORDER_WIDTH).max(0),
-        ))
-    } else {
-        output
-    }
+    Decoration::of_is_ssd(is_ssd).maximize_content(output)
 }
 
 /// Grow an undecorated content size into the full decorated size the SSD frame
@@ -74,14 +63,7 @@ pub(crate) fn decorated_content_size(
     content: Size<i32, Logical>,
     is_ssd: bool,
 ) -> Size<i32, Logical> {
-    if is_ssd {
-        Size::from((
-            content.w + 2 * BORDER_WIDTH,
-            content.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
-        ))
-    } else {
-        content
-    }
+    Decoration::of_is_ssd(is_ssd).decorate(content)
 }
 
 /// Shrink a decorated rectangle's size back to the client's undecorated content
@@ -90,14 +72,7 @@ pub(crate) fn undecorated_content_size(
     decorated: Size<i32, Logical>,
     is_ssd: bool,
 ) -> Size<i32, Logical> {
-    if is_ssd {
-        Size::from((
-            (decorated.w - 2 * BORDER_WIDTH).max(1),
-            (decorated.h - HEADER_BAR_HEIGHT - BORDER_WIDTH).max(1),
-        ))
-    } else {
-        decorated
-    }
+    Decoration::of_is_ssd(is_ssd).undecorate(decorated)
 }
 
 /// Where to anchor a window being dragged out of the maximized state so the
@@ -112,7 +87,7 @@ pub(crate) fn restore_drag_location(
 ) -> Point<i32, Logical> {
     let rel_x = grab.x - window_loc.x as f64;
     let rel_y = grab.y - window_loc.y as f64;
-    let border = if is_ssd { 2 * BORDER_WIDTH } else { 0 };
+    let border = Decoration::of_is_ssd(is_ssd).chrome().w;
     let old_w = decorated_size.w as f64;
     let new_w = restore
         .map(|size| (size.w + border) as f64)

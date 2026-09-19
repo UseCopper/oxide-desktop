@@ -300,14 +300,78 @@ impl RelativeGeometry {
     }
 }
 
+/// Whether a window's decorations are drawn by the compositor (SSD) or by the
+/// client (CSD). Holds the geometry conversions that depend on it, so the
+/// answer to "how much chrome does this window have?" lives in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decoration {
+    Server,
+    Client,
+}
+
+impl Decoration {
+    pub fn of(window: &WindowElement) -> Self {
+        if window.is_ssd() { Self::Server } else { Self::Client }
+    }
+
+    pub fn of_is_ssd(is_ssd: bool) -> Self {
+        if is_ssd { Self::Server } else { Self::Client }
+    }
+
+    pub fn is_server(self) -> bool {
+        matches!(self, Self::Server)
+    }
+
+    /// The chrome (borders + header bar) around a window's content. Zero for
+    /// client-decorated windows.
+    pub fn chrome(self) -> Size<i32, Logical> {
+        match self {
+            Self::Server => Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH)),
+            Self::Client => Size::from((0, 0)),
+        }
+    }
+
+    /// Grow an undecorated content size into the full decorated size.
+    pub fn decorate(self, content: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from((content.w + chrome.w, content.h + chrome.h))
+    }
+
+    /// Shrink a decorated size back to the client's undecorated content size.
+    pub fn undecorate(self, decorated: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from(
+            (
+                (decorated.w - chrome.w).max(1),
+                (decorated.h - chrome.h).max(1),
+            ),
+        )
+    }
+
+    /// Content size for a maximized window: the chrome is reserved so the
+    /// decorated frame fits inside the work area.
+    pub fn maximize_content(self, area: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from(
+            ((area.w - chrome.w).max(0), (area.h - chrome.h).max(0)),
+        )
+    }
+
+    /// Content size for a fullscreen window. Client-decorated windows fill the
+    /// whole output (an undecorated strip would otherwise be painted black);
+    /// server-decorated ones reserve the header bar.
+    pub fn fullscreen_content(self, area: Size<i32, Logical>) -> Size<i32, Logical> {
+        match self {
+            Self::Server => Size::from((area.w, (area.h - HEADER_BAR_HEIGHT).max(0))),
+            Self::Client => area,
+        }
+    }
+}
+
 /// The SSD chrome (borders + header bar) around a window's content. Zero for
 /// client-decorated windows.
 pub fn decoration_size(is_ssd: bool) -> Size<i32, Logical> {
-    if is_ssd {
-        Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
-    } else {
-        Size::from((0, 0))
-    }
+    Decoration::of_is_ssd(is_ssd).chrome()
 }
 
 /// Where a window should return to, and whether the client keeps its own size.
