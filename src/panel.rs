@@ -311,13 +311,19 @@ fn app_button(app_id: &str, windows: &[&WindowInfo], stream: &Rc<UnixStream>) ->
     column.append(&dots);
     button.set_child(Some(&column));
 
-    // Repeated clicks cycle through the app's windows.
+    // Repeated clicks cycle through the app's windows. Use a click gesture on
+    // press rather than `clicked`: the panel's layer surface never becomes the
+    // active GTK window, so the first `clicked` on an inactive window can be
+    // swallowed as an activation attempt and only the second click registers.
     let target = next_window_id(windows);
     let stream = stream.clone();
-    button.connect_clicked(move |_| {
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    gesture.connect_pressed(move |_, _, _, _| {
         let message = format!("focus\t{target}\n");
         let _ = (&*stream).write_all(message.as_bytes());
     });
+    button.add_controller(gesture);
 
     button
 }

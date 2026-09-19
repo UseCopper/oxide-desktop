@@ -511,6 +511,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         start_data,
                         window: element.clone(),
                         initial_window_location,
+                        anchor: None,
                         snap_target: None,
                     };
 
@@ -578,6 +579,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             start_data,
             window: element.clone(),
             initial_window_location,
+            anchor: None,
             snap_target: None,
         };
 

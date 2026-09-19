@@ -10,6 +10,10 @@ use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT};
 /// How long the maximize/unmaximize transition takes.
 pub const WINDOW_ANIMATION_DURATION: Duration = Duration::from_millis(270);
 
+/// How long an unmaximize transition waits for a client-decorated window to
+/// commit the size it chose before falling back to its last committed size.
+pub const CONTENT_PENDING_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// How long a window takes to fade/scale in when it opens, or out when it
 /// closes.
 pub const WINDOW_VISIBILITY_DURATION: Duration = Duration::from_millis(150);
@@ -142,6 +146,11 @@ pub struct WindowAnimation {
     start_time: Instant,
     duration: Duration,
     snapshot: SnapshotState,
+    /// While set, the transition is frozen at its start geometry waiting for the
+    /// final content size to be known. Used when a client-decorated window
+    /// chooses its own size after unmaximizing; the commit handler fills it in
+    /// with [`WindowAnimation::resolve_content`].
+    content_pending: bool,
 }
 
 /// The pre-transition pixels of the window, captured once so the transition can
@@ -167,7 +176,39 @@ impl WindowAnimation {
             start_time: Instant::now(),
             duration,
             snapshot: SnapshotState::Pending,
+            content_pending: false,
         }
+    }
+
+    /// Freeze the transition at its start geometry until the window's final
+    /// content size is known. The pre-transition frame is still captured for the
+    /// crossfade; [`WindowAnimation::resolve_content`] starts the transition.
+    pub fn wait_for_content(&mut self) {
+        self.content_pending = true;
+    }
+
+    /// Whether the transition is still waiting for its final content size.
+    pub fn content_pending(&self) -> bool {
+        self.content_pending
+    }
+
+    /// The content size the transition starts from, used to tell when a client
+    /// has actually committed its restored size.
+    pub fn start_content(&self) -> Size<i32, Logical> {
+        self.start.content.to_i32_round()
+    }
+
+    /// When the transition started (or was last (re)started).
+    pub fn started_at(&self) -> Instant {
+        self.start_time
+    }
+
+    /// Supply the content size the window settled on and start the transition
+    /// for real, from the frozen start geometry.
+    pub fn resolve_content(&mut self, size: Size<i32, Logical>) {
+        self.content_pending = false;
+        self.end.content = size.to_f64();
+        self.start_time = Instant::now();
     }
 
     /// Whether a renderer still needs to capture the pre-transition pixels.
@@ -212,6 +253,11 @@ impl WindowAnimation {
     /// `0.0..=1.0`. The same eased value drives the crossfade so the fade and
     /// the geometry move at the same rate.
     pub fn sample(&self, now: Instant) -> (WindowRect, f64) {
+        // Stay frozen at the start until the client has picked its size, so the
+        // pre-transition frame stays valid for the crossfade.
+        if self.content_pending {
+            return (self.start, 0.0);
+        }
         let progress = self.progress(now);
         let eased = ease_out_cubic(progress);
         let rect = WindowRect {
@@ -287,6 +333,29 @@ mod tests {
         let (rect, _) = animation.sample(Instant::now());
         assert_eq!(rect.loc, Point::from((10.0, 20.0)));
         assert!(rect.content.w <= 100.0 && rect.content.w >= 50.0);
+    }
+
+    #[test]
+    fn content_pending_freezes_until_resolved() {
+        let start = WindowRect::from_geometry((100, 100).into(), (400, 300).into());
+        let end = WindowRect::from_geometry((200, 150).into(), (400, 300).into());
+        let mut animation = WindowAnimation::new(start, end, Duration::from_millis(100));
+        animation.wait_for_content();
+
+        // Frozen at the start no matter how much time passes.
+        let (rect, progress) = animation.sample(Instant::now() + Duration::from_secs(1));
+        assert_eq!(rect.loc, start.loc);
+        assert_eq!(rect.content, start.content);
+        assert_eq!(progress, 0.0);
+
+        // Resolving starts the transition from the frozen start geometry.
+        animation.resolve_content((250, 200).into());
+        let (rect, progress) = animation.sample(Instant::now());
+        assert!((rect.loc.x - start.loc.x).abs() < 1.0);
+        assert!(progress < 0.1);
+        let (rect, _) = animation.sample(Instant::now() + Duration::from_secs(1));
+        assert_eq!(rect.loc, end.loc);
+        assert_eq!(rect.content, Size::from((250.0, 200.0)));
     }
 
     #[test]

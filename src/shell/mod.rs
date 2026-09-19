@@ -361,6 +361,30 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
     }
 
+    /// Start an unmaximize transition for a client-decorated window, whose
+    /// restored size is chosen by the client and so isn't known yet. The window
+    /// is frozen at its current (maximized) geometry, keeping the pre-maximize
+    /// frame for the crossfade, and the commit handler fills in the final size
+    /// with [`WindowAnimation::resolve_content`] once the client commits it.
+    pub fn animate_client_unmaximize(
+        &mut self,
+        window: &WindowElement,
+        target_loc: Point<i32, Logical>,
+    ) {
+        let Some(start_loc) = self.space.element_location(window) else {
+            return;
+        };
+        let content = window.resize_content_size();
+        let start = WindowRect::from_geometry(start_loc, content);
+        let end = WindowRect::from_geometry(target_loc, content);
+        let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
+        animation.wait_for_content();
+        // Raise/activate without moving: the animation drives the location once
+        // the client has chosen its size.
+        self.space.map_element(window.clone(), start_loc, true);
+        window.decoration_state().animation = Some(animation);
+    }
+
     /// Pin any in-flight transition of `window` to its current location. Called
     /// when an interactive drag ends so the window stays where it was dropped
     /// while the size transition finishes.
@@ -711,6 +735,45 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
     }
 
+    /// Re-tile the members left in `window`'s snap group after it leaves it, on
+    /// a fresh centered grid over the output's work area. Their old grid may
+    /// have had driven dividers, so resetting keeps the remaining group aligned
+    /// now that one member is gone. Each member is reconfigured and animated
+    /// into its new cell.
+    pub fn recenter_snap_group(&mut self, window: &WindowElement) {
+        let Some(area) = self.snap_area_for(window).or_else(|| {
+            let output = output_for_window(&self.space, window)?;
+            output_work_area(&self.space, &output)
+        }) else {
+            return;
+        };
+        let grid = SnapGrid::centered(area);
+        let members: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|other| {
+                *other != window
+                    && !other.is_ghosting()
+                    && other.decoration_state().snap_grid.is_some()
+                    && other.decoration_state().snap_zone.is_some()
+            })
+            .cloned()
+            .collect();
+
+        for other in members {
+            if other.decoration_state().header_bar.fullscreen {
+                continue;
+            }
+            let Some(zone) = other.decoration_state().snap_zone else {
+                continue;
+            };
+            other.decoration_state().snap_grid = Some(grid);
+            let rect = grid.rect(zone, area);
+            let content = self.configure_snapped(&other, rect, true);
+            self.animate_window(&other, content, rect.loc);
+        }
+    }
+
     /// Finalize every sibling that was driven along with `window`'s resize, so
     /// they leave the special `Resizing` state and settle on their final size.
     pub fn finish_group_resizes(&mut self, window: &WindowElement, serial: Serial) {
@@ -820,6 +883,26 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 continue;
             }
 
+            // A client-decorated unmaximize waits for the client to commit the
+            // size it chose. If that never arrives, settle on the last committed
+            // size so the transition can finish instead of hanging.
+            let pending_timed_out = window
+                .decoration_state()
+                .animation
+                .as_ref()
+                .map(|animation| {
+                    animation.content_pending()
+                        && now.saturating_duration_since(animation.started_at())
+                            >= CONTENT_PENDING_TIMEOUT
+                })
+                .unwrap_or(false);
+            if pending_timed_out {
+                let committed = window.resize_content_size();
+                if let Some(animation) = window.decoration_state().animation.as_mut() {
+                    animation.resolve_content(committed);
+                }
+            }
+
             // Clone the animation out before touching the window again: sampling
             // it and asking for the committed size both borrow the window state.
             let Some(animation) = window.decoration_state().animation.clone() else {
@@ -839,7 +922,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // Once the curve is done, keep the animation (which holds the window
             // at its target geometry) until the client has adopted the new size,
             // so a slow client doesn't snap back to its old geometry.
-            if progress >= 1.0 {
+            if progress >= 1.0 && !animation.content_pending() {
                 let target: Size<i32, Logical> = rect.content.to_i32_round();
                 let committed = window.resize_content_size();
                 if (committed.w - target.w).abs() <= 1 && (committed.h - target.h).abs() <= 1 {
@@ -1463,6 +1546,31 @@ pub fn relative_geometry_of(
     relative_geometry_of_output(space, &output, window)
 }
 
+/// Turn a fractional geometry's position back into an absolute location against
+/// a specific output's work area, without needing a committed size. Used by
+/// client-decorated windows, which restore their own size after unmaximizing.
+pub fn absolute_location_for_output(
+    space: &Space<WindowElement>,
+    output: &Output,
+    rel: RelativeGeometry,
+) -> Option<Point<i32, Logical>> {
+    let area = output_work_area(space, output)?;
+    Some(Point::from((
+        area.loc.x + (rel.x * area.size.w as f64).round() as i32,
+        area.loc.y + (rel.y * area.size.h as f64).round() as i32,
+    )))
+}
+
+/// Turn a fractional geometry's position back into an absolute location.
+pub fn absolute_location(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    rel: RelativeGeometry,
+) -> Option<Point<i32, Logical>> {
+    let output = output_for_window(space, window)?;
+    absolute_location_for_output(space, &output, rel)
+}
+
 /// Turn a fractional geometry back into an absolute location and the
 /// (undecorated) content size to configure the client with, against a specific
 /// output's work area.
@@ -1473,10 +1581,7 @@ pub fn absolute_geometry_for_output(
     is_ssd: bool,
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
     let area = output_work_area(space, output)?;
-    let loc = Point::from((
-        area.loc.x + (rel.x * area.size.w as f64).round() as i32,
-        area.loc.y + (rel.y * area.size.h as f64).round() as i32,
-    ));
+    let loc = absolute_location_for_output(space, output, rel)?;
     let decoration: Size<i32, Logical> = if is_ssd {
         Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
     } else {

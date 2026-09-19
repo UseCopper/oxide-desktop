@@ -74,6 +74,51 @@ pub struct WindowState {
     pub header_bar: HeaderBar,
 }
 
+/// How the pointer is anchored to a window during a client-initiated move, so
+/// the window can be re-placed under the pointer for any committed size: the
+/// horizontal fraction of the width and the vertical offset from the top stay
+/// fixed, matching [`super::restore_drag_location`].
+#[derive(Debug, Clone, Copy)]
+pub struct DragAnchor {
+    /// Horizontal fraction of the window width the pointer grabbed at.
+    pub fraction: f64,
+    /// Vertical offset (from the window top) the pointer grabbed at.
+    pub rel_y: f64,
+}
+
+impl DragAnchor {
+    /// Capture the anchor from a grab on a window of `decorated_size` at
+    /// `window_loc`.
+    pub fn capture(
+        window_loc: Point<i32, Logical>,
+        decorated_size: Size<i32, Logical>,
+        grab: Point<f64, Logical>,
+    ) -> Self {
+        let rel_x = grab.x - window_loc.x as f64;
+        let rel_y = grab.y - window_loc.y as f64;
+        let width = decorated_size.w as f64;
+        Self {
+            fraction: if width > 0.0 { rel_x / width } else { 0.5 },
+            rel_y,
+        }
+    }
+
+    /// The window origin that keeps the anchored titlebar spot under the
+    /// pointer for a window of `decorated` size. `pointer` is the current
+    /// pointer position, so the window follows it while adapting to any size
+    /// the client committed.
+    pub fn locate(
+        &self,
+        pointer: Point<f64, Logical>,
+        decorated: Size<i32, Logical>,
+    ) -> Point<i32, Logical> {
+        Point::from((
+            (pointer.x - self.fraction * decorated.w as f64).round() as i32,
+            (pointer.y - self.rel_y).round() as i32,
+        ))
+    }
+}
+
 /// The last committed frame of a window: every mapped surface in its tree, so
 /// both the client content and any subsurfaces (e.g. Firefox's content) are
 /// kept. Holding Smithay's `Buffer` (an `Arc`) keeps the pixels alive after the
@@ -1314,5 +1359,44 @@ impl<B: Backend> AnvilState<B> {
                 touch.set_grab(data, grab, serial);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_anchor_adapts_to_committed_size() {
+        // Grabbing the titlebar at 1/4 of a 1000px-wide maximized window, 15px
+        // down from the top.
+        let loc = Point::from((100, 50));
+        let size = Size::from((1000, 600));
+        let grab = Point::from((350.0, 65.0));
+        let anchor = DragAnchor::capture(loc, size, grab);
+        assert!((anchor.fraction - 0.25).abs() < 1e-9);
+        assert!((anchor.rel_y - 15.0).abs() < 1e-9);
+
+        // The client chose half the width; the pointer must stay at 25% of it.
+        let located = anchor.locate(grab, Size::from((500, 400)));
+        assert_eq!(located, Point::from((225, 50)));
+        assert!((grab.x - (located.x as f64 + 0.25 * 500.0)).abs() < 1.0);
+        assert!((grab.y - (located.y as f64 + 15.0)).abs() < 1.0);
+
+        // The window keeps following the pointer, so the anchored spot stays
+        // under it as it moves.
+        let moved = Point::from((450.0, 165.0));
+        let located = anchor.locate(moved, Size::from((500, 400)));
+        assert_eq!(located, Point::from((325, 150)));
+    }
+
+    #[test]
+    fn drag_anchor_zero_width_falls_back_to_center() {
+        let anchor = DragAnchor::capture(
+            Point::from((0, 0)),
+            Size::from((0, 0)),
+            Point::from((10.0, 10.0)),
+        );
+        assert!((anchor.fraction - 0.5).abs() < 1e-9);
     }
 }
