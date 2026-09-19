@@ -38,7 +38,7 @@ use super::{
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
     place_new_window,
 };
-use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor, Restore};
+use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor, Restore, RestoreTarget};
 
 /// Size a toplevel should use while fullscreen.
 ///
@@ -540,6 +540,41 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
     }
 
+    /// Move `window` back to `target`, configuring the client and animating the
+    /// transition. When the target carries a compositor-owned content size
+    /// (server-decorated windows) the frame animates straight to it; when it
+    /// doesn't (client-decorated) the client chooses its own size and the
+    /// transition waits for the commit.
+    fn restore_window(&mut self, window: &WindowElement, target: RestoreTarget) {
+        let is_ssd = window.is_ssd();
+        match (window.0.underlying_surface(), target.content) {
+            (WindowSurface::Wayland(toplevel), content) => {
+                let content = content.filter(|_| is_ssd);
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                    state.size = content;
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            (WindowSurface::X11(surface), Some(content)) => {
+                let rect = Rectangle::new(target.loc, decorated_content_size(content, is_ssd));
+                if let Err(err) = surface.configure(rect) {
+                    tracing::warn!(?err, "Failed to configure restored X11 window");
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            (WindowSurface::X11(_), None) => {}
+        }
+
+        match target.content.filter(|_| is_ssd) {
+            Some(size) => self.animate_window(window, size, target.loc),
+            None => self.animate_client_unmaximize(window, target.loc),
+        }
+    }
+
     /// The titlebar maximize button's behaviour: toggle the window between
     /// maximized and floating. A snapped (tiled) window un-snaps, and a client
     /// that put itself fullscreen exits that instead, so the user is never
@@ -569,40 +604,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(snap) = window.decoration_state().snap.take() else {
             return;
         };
-        let rel = snap.floating;
-        let is_ssd = window.is_ssd();
         // Raise the window above the rest of the snap group without moving it,
-        // so the transition is visible and its position can animate to `loc`
-        // rather than jumping there.
+        // so the transition is visible and its position can animate to the
+        // target rather than jumping there.
         if let Some(current) = self.space.element_location(&window) {
             self.space.map_element(window.clone(), current, true);
         }
 
-        let location = super::absolute_location(&self.space, &window, rel);
-        if is_ssd {
-            // Server-decorated windows restore the compositor-owned size.
-            if let Some((loc, content)) = super::absolute_geometry(&self.space, &window, rel) {
-                let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
-                self.configure_snapped(&window, rect, false);
-                self.animate_window(&window, content, loc);
-            }
-        } else {
-            // Client-decorated windows pick their own size again: configure
-            // without a size, restore only the position, and animate once the
-            // client commits, like the titlebar button's unmaximize.
-            if let Some(toplevel) = window.0.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Maximized);
-                    state.size = None;
-                });
-                if toplevel.is_initial_configure_sent() {
-                    toplevel.send_configure();
-                }
-            }
-            if let Some(loc) = location {
-                self.animate_client_unmaximize(&window, loc);
-            }
-        }
+        let Some(target) = super::restore_target(&self.space, &window, snap.floating) else {
+            self.recenter_snap_group(&window);
+            return;
+        };
+        self.restore_window(&window, target);
 
         // The members left behind re-tile onto a fresh centered grid.
         self.recenter_snap_group(&window);
@@ -690,40 +703,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             self.unsnap_window(window);
             return;
         }
-        let restore = window.decoration_state().take_maximize_restore();
-        let is_ssd = window.is_ssd();
+        let target = window
+            .decoration_state()
+            .take_maximize_restore()
+            .and_then(|restore| super::restore_target(&self.space, &window, restore));
 
-        // Client-decorated windows choose their own size again: they get a
-        // configure without a size, and only the remembered position is
-        // restored. Server-decorated windows restore the compositor-owned size
-        // too, but only when a real one was recorded.
-        let size = restore
-            .filter(|rel| is_ssd && rel.w > 0.0 && rel.h > 0.0)
-            .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
-            .map(|(_, size)| size);
-        let location = restore.and_then(|rel| super::absolute_location(&self.space, &window, rel));
-
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = size;
-        });
-        match (location, size) {
-            (Some(location), Some(size)) => self.animate_window(&window, size, location),
-            (Some(location), None) => {
-                // A client-decorated window picks its own restored size, so the
-                // transition waits at the maximized geometry until the client
-                // commits that size (see `handle_toplevel_commit`).
-                self.animate_client_unmaximize(&window, location);
+        match target {
+            // `restore_window` sends the configure that answers the request.
+            Some(target) => self.restore_window(&window, target),
+            None => {
+                // No floating geometry recorded; still answer the request by
+                // clearing the maximized state.
+                surface.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                });
+                if surface.is_initial_configure_sent() {
+                    surface.send_configure();
+                }
             }
-            _ => {}
-        }
-
-        // The protocol demands us to always reply with a configure,
-        // regardless of we fulfilled the request or not
-        if surface.is_initial_configure_sent() {
-            surface.send_configure();
-        } else {
-            // Will be sent during initial configure
         }
     }
 

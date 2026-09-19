@@ -270,6 +270,55 @@ pub struct RelativeGeometry {
     pub h: f64,
 }
 
+impl RelativeGeometry {
+    /// Capture a window's current geometry as fractions of `area`.
+    pub fn capture(loc: Point<i32, Logical>, size: Size<i32, Logical>, area: Rectangle<i32, Logical>) -> Self {
+        Self {
+            x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
+            y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
+            w: size.w as f64 / area.size.w as f64,
+            h: size.h as f64 / area.size.h as f64,
+        }
+    }
+
+    /// The absolute window origin within `area`.
+    pub fn location(self, area: Rectangle<i32, Logical>) -> Point<i32, Logical> {
+        Point::from((
+            area.loc.x + (self.x * area.size.w as f64).round() as i32,
+            area.loc.y + (self.y * area.size.h as f64).round() as i32,
+        ))
+    }
+
+    /// The undecorated content size the client should be configured with to
+    /// occupy this geometry, given whether the window is server-decorated.
+    pub fn content_size(self, area: Rectangle<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+        let deco = decoration_size(is_ssd);
+        Size::from((
+            ((self.w * area.size.w as f64).round() as i32 - deco.w).max(1),
+            ((self.h * area.size.h as f64).round() as i32 - deco.h).max(1),
+        ))
+    }
+}
+
+/// The SSD chrome (borders + header bar) around a window's content. Zero for
+/// client-decorated windows.
+pub fn decoration_size(is_ssd: bool) -> Size<i32, Logical> {
+    if is_ssd {
+        Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
+    } else {
+        Size::from((0, 0))
+    }
+}
+
+/// Where a window should return to, and whether the client keeps its own size.
+/// `content: None` means the client picks (client-decorated); `Some` is the
+/// compositor-owned content size to configure (server-decorated).
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreTarget {
+    pub loc: Point<i32, Logical>,
+    pub content: Option<Size<i32, Logical>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SSDDrag {
     /// The window being dragged

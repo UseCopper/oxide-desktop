@@ -74,8 +74,8 @@ pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, Snap, SurfaceFrame,
-    VisibilityState,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, RestoreTarget,
+    Snap, SurfaceFrame, VisibilityState,
 };
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
@@ -1524,13 +1524,7 @@ pub fn relative_geometry_of_output(
 ) -> Option<RelativeGeometry> {
     let area = output_work_area(space, output)?;
     let loc = space.element_location(window)?;
-    let size = window.geometry().size;
-    Some(RelativeGeometry {
-        x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
-        y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
-        w: size.w as f64 / area.size.w as f64,
-        h: size.h as f64 / area.size.h as f64,
-    })
+    Some(RelativeGeometry::capture(loc, window.geometry().size, area))
 }
 
 /// Compute a window's geometry as fractions of its output's work area.
@@ -1550,11 +1544,7 @@ pub fn absolute_location_for_output(
     output: &Output,
     rel: RelativeGeometry,
 ) -> Option<Point<i32, Logical>> {
-    let area = output_work_area(space, output)?;
-    Some(Point::from((
-        area.loc.x + (rel.x * area.size.w as f64).round() as i32,
-        area.loc.y + (rel.y * area.size.h as f64).round() as i32,
-    )))
+    Some(rel.location(output_work_area(space, output)?))
 }
 
 /// Turn a fractional geometry's position back into an absolute location.
@@ -1577,17 +1567,7 @@ pub fn absolute_geometry_for_output(
     is_ssd: bool,
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
     let area = output_work_area(space, output)?;
-    let loc = absolute_location_for_output(space, output, rel)?;
-    let decoration: Size<i32, Logical> = if is_ssd {
-        Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
-    } else {
-        Size::from((0, 0))
-    };
-    let size = Size::from((
-        ((rel.w * area.size.w as f64).round() as i32 - decoration.w).max(1),
-        ((rel.h * area.size.h as f64).round() as i32 - decoration.h).max(1),
-    ));
-    Some((loc, size))
+    Some((rel.location(area), rel.content_size(area, is_ssd)))
 }
 
 /// Turn a fractional geometry back into an absolute location and the
@@ -1599,6 +1579,29 @@ pub fn absolute_geometry(
 ) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
     let output = output_for_window(space, window)?;
     absolute_geometry_for_output(space, &output, rel, window.is_ssd())
+}
+
+/// Resolve where `window` should return to for the given floating geometry.
+/// Server-decorated windows restore the compositor-owned content size;
+/// client-decorated windows keep their own size (`content: None`), so only the
+/// position is restored.
+pub fn restore_target(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    rel: RelativeGeometry,
+) -> Option<RestoreTarget> {
+    let output = output_for_window(space, window)?;
+    let area = output_work_area(space, &output)?;
+    let is_ssd = window.is_ssd();
+    // A server-decorated window with no real geometry recorded (it maximized
+    // before committing) has nothing to restore; the client picks the size.
+    if is_ssd && (rel.w <= 0.0 || rel.h <= 0.0) {
+        return None;
+    }
+    Some(RestoreTarget {
+        loc: rel.location(area),
+        content: is_ssd.then(|| rel.content_size(area, true)),
+    })
 }
 
 /// Snapshot every floating window's position and size as a fraction of its
