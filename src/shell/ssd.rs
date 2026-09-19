@@ -42,12 +42,15 @@ use super::{
 
 pub struct WindowState {
     pub is_ssd: bool,
-    /// Where to restore the window after fullscreen, as a fraction of the work
-    /// area of the output it was fullscreened on. A *weak* output handle is
-    /// stored so the window and the output's fullscreen state can't keep each
-    /// other alive (and because the output may be unplugged while fullscreen).
-    pub fullscreen_restore: Option<(WeakOutput, RelativeGeometry)>,
-    pub maximize_restore: Option<RelativeGeometry>,
+    /// Where to return the window when it leaves fullscreen or the maximized
+    /// state. Exactly one of these is active at a time, so the "which geometry
+    /// wins" question is answered by the enum variant rather than by four
+    /// fields that must be kept mutually exclusive by hand.
+    pub restore: Option<Restore>,
+    /// The snap group this window is currently tiled into, if any. Bundles the
+    /// zone with the shared divider grid so a snapped window can never have one
+    /// without the other.
+    pub snap: Option<Snap>,
     /// Position and size of the window as fractions of its output's work area
     /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
     /// resize and reapplied against the new work area so floating windows keep
@@ -66,12 +69,118 @@ pub struct WindowState {
     /// Stable identifier used by the panel to refer to this window. Assigned
     /// lazily the first time the window list is published.
     pub panel_id: Option<u64>,
-    /// The snap zone this window is tiled into, while it remains snapped.
-    pub snap_zone: Option<SnapZone>,
-    /// The divider grid this window's snap group is laid out on. Shared by the
-    /// group, updated when a resize moves a divider.
-    pub snap_grid: Option<SnapGrid>,
     pub header_bar: HeaderBar,
+}
+
+/// Where a window returns to when it stops being fullscreen or maximized.
+/// Stored as fractions of the relevant output's work area so it survives
+/// resolution changes.
+#[derive(Debug, Clone)]
+pub enum Restore {
+    /// The floating geometry to return to when unmaximizing.
+    Maximize(RelativeGeometry),
+    /// Fullscreen, remembering the output it covered (as a weak handle, so the
+    /// window and the output can't keep each other alive) and the floating
+    /// geometry it should return to.
+    Fullscreen {
+        output: WeakOutput,
+        floating: RelativeGeometry,
+    },
+}
+
+/// A window's membership in a snap group: the zone it occupies, the divider
+/// grid shared by the group, and the floating geometry it returns to when it
+/// leaves the group.
+#[derive(Debug, Clone, Copy)]
+pub struct Snap {
+    pub zone: SnapZone,
+    pub grid: SnapGrid,
+    pub floating: RelativeGeometry,
+}
+
+impl WindowState {
+    /// Whether the window is currently tiled into a snap zone.
+    pub fn is_snapped(&self) -> bool {
+        self.snap.is_some()
+    }
+
+    /// The zone the window is tiled into, if any.
+    pub fn snap_zone(&self) -> Option<SnapZone> {
+        self.snap.map(|snap| snap.zone)
+    }
+
+    /// Leave the snap group: forget both the zone and the shared grid.
+    pub fn clear_snap(&mut self) {
+        self.snap = None;
+    }
+
+    /// Take the floating geometry recorded for an unmaximize, if the window is
+    /// currently in the maximized state.
+    pub fn take_maximize_restore(&mut self) -> Option<RelativeGeometry> {
+        match self.restore.take() {
+            Some(Restore::Maximize(rel)) => Some(rel),
+            other => {
+                self.restore = other;
+                None
+            }
+        }
+    }
+
+    /// Take the fullscreen restore (output and floating geometry), if any.
+    pub fn take_fullscreen_restore(&mut self) -> Option<(WeakOutput, RelativeGeometry)> {
+        match self.restore.take() {
+            Some(Restore::Fullscreen { output, floating }) => Some((output, floating)),
+            other => {
+                self.restore = other;
+                None
+            }
+        }
+    }
+}
+
+/// How the pointer is anchored to a window during a client-initiated move, so
+/// the window can be re-placed under the pointer for any committed size: the
+/// horizontal fraction of the width and the vertical offset from the top stay
+/// fixed, matching [`super::restore_drag_location`].
+#[derive(Debug, Clone, Copy)]
+pub struct DragAnchor {
+    /// Horizontal fraction of the window width the pointer grabbed at.
+    pub fraction: f64,
+    /// Vertical offset (from the window top) the pointer grabbed at.
+    pub rel_y: f64,
+}
+
+impl DragAnchor {
+    /// Capture the anchor from a grab on a window of `decorated_size` at
+    /// `window_loc`.
+    pub fn capture(
+        window_loc: Point<i32, Logical>,
+        decorated_size: Size<i32, Logical>,
+        grab: Point<f64, Logical>,
+    ) -> Self {
+        let rel_x = grab.x - window_loc.x as f64;
+        let rel_y = grab.y - window_loc.y as f64;
+        let width = decorated_size.w as f64;
+        Self {
+            fraction: if width > 0.0 { rel_x / width } else { 0.5 },
+            rel_y,
+        }
+    }
+
+    /// The window origin that keeps the anchored titlebar spot under the
+    /// pointer for a window of `decorated` size. `pointer` is the current
+    /// pointer position, so the window follows it while adapting to any size
+    /// the client committed.
+    pub fn locate(
+        &self,
+        pointer: Point<f64, Logical>,
+        decorated: Size<i32, Logical>,
+    ) -> Point<i32, Logical> {
+        Point::from((
+            (pointer.x - self.fraction * decorated.w as f64).round() as i32,
+            (pointer.y - self.rel_y).round() as i32,
+        ))
+    }
 }
 
 /// The last committed frame of a window: every mapped surface in its tree, so
@@ -161,6 +270,119 @@ pub struct RelativeGeometry {
     pub h: f64,
 }
 
+impl RelativeGeometry {
+    /// Capture a window's current geometry as fractions of `area`.
+    pub fn capture(loc: Point<i32, Logical>, size: Size<i32, Logical>, area: Rectangle<i32, Logical>) -> Self {
+        Self {
+            x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
+            y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
+            w: size.w as f64 / area.size.w as f64,
+            h: size.h as f64 / area.size.h as f64,
+        }
+    }
+
+    /// The absolute window origin within `area`.
+    pub fn location(self, area: Rectangle<i32, Logical>) -> Point<i32, Logical> {
+        Point::from((
+            area.loc.x + (self.x * area.size.w as f64).round() as i32,
+            area.loc.y + (self.y * area.size.h as f64).round() as i32,
+        ))
+    }
+
+    /// The undecorated content size the client should be configured with to
+    /// occupy this geometry, given whether the window is server-decorated.
+    pub fn content_size(self, area: Rectangle<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+        let deco = decoration_size(is_ssd);
+        Size::from((
+            ((self.w * area.size.w as f64).round() as i32 - deco.w).max(1),
+            ((self.h * area.size.h as f64).round() as i32 - deco.h).max(1),
+        ))
+    }
+}
+
+/// Whether a window's decorations are drawn by the compositor (SSD) or by the
+/// client (CSD). Holds the geometry conversions that depend on it, so the
+/// answer to "how much chrome does this window have?" lives in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decoration {
+    Server,
+    Client,
+}
+
+impl Decoration {
+    pub fn of(window: &WindowElement) -> Self {
+        if window.is_ssd() { Self::Server } else { Self::Client }
+    }
+
+    pub fn of_is_ssd(is_ssd: bool) -> Self {
+        if is_ssd { Self::Server } else { Self::Client }
+    }
+
+    pub fn is_server(self) -> bool {
+        matches!(self, Self::Server)
+    }
+
+    /// The chrome (borders + header bar) around a window's content. Zero for
+    /// client-decorated windows.
+    pub fn chrome(self) -> Size<i32, Logical> {
+        match self {
+            Self::Server => Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH)),
+            Self::Client => Size::from((0, 0)),
+        }
+    }
+
+    /// Grow an undecorated content size into the full decorated size.
+    pub fn decorate(self, content: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from((content.w + chrome.w, content.h + chrome.h))
+    }
+
+    /// Shrink a decorated size back to the client's undecorated content size.
+    pub fn undecorate(self, decorated: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from(
+            (
+                (decorated.w - chrome.w).max(1),
+                (decorated.h - chrome.h).max(1),
+            ),
+        )
+    }
+
+    /// Content size for a maximized window: the chrome is reserved so the
+    /// decorated frame fits inside the work area.
+    pub fn maximize_content(self, area: Size<i32, Logical>) -> Size<i32, Logical> {
+        let chrome = self.chrome();
+        Size::from(
+            ((area.w - chrome.w).max(0), (area.h - chrome.h).max(0)),
+        )
+    }
+
+    /// Content size for a fullscreen window. Client-decorated windows fill the
+    /// whole output (an undecorated strip would otherwise be painted black);
+    /// server-decorated ones reserve the header bar.
+    pub fn fullscreen_content(self, area: Size<i32, Logical>) -> Size<i32, Logical> {
+        match self {
+            Self::Server => Size::from((area.w, (area.h - HEADER_BAR_HEIGHT).max(0))),
+            Self::Client => area,
+        }
+    }
+}
+
+/// The SSD chrome (borders + header bar) around a window's content. Zero for
+/// client-decorated windows.
+pub fn decoration_size(is_ssd: bool) -> Size<i32, Logical> {
+    Decoration::of_is_ssd(is_ssd).chrome()
+}
+
+/// Where a window should return to, and whether the client keeps its own size.
+/// `content: None` means the client picks (client-decorated); `Some` is the
+/// compositor-owned content size to configure (server-decorated).
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreTarget {
+    pub loc: Point<i32, Logical>,
+    pub content: Option<Size<i32, Logical>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SSDDrag {
     /// The window being dragged
@@ -179,11 +401,6 @@ pub struct HeaderBar {
     pub pointer_loc: Option<Point<f64, Logical>>,
     pub width: u32,
     pub fullscreen: bool,
-    /// The floating geometry to restore when a snapped window is dragged back
-    /// out of its zone. Set when a snap is applied and taken on drag start.
-    /// Lives here (rather than on [`WindowState`]) so `start_drag` can take it
-    /// while the decoration state is already borrowed.
-    pub snap_restore: Option<RelativeGeometry>,
     pub focused: bool,
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
@@ -834,20 +1051,17 @@ impl WindowElement {
         self.user_data().insert_if_missing(|| {
             RefCell::new(WindowState {
                 is_ssd: false,
-                fullscreen_restore: None,
-                maximize_restore: None,
+                restore: None,
+                snap: None,
                 relative: None,
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,
                 panel_id: None,
-                snap_zone: None,
-                snap_grid: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
                     fullscreen: false,
-                    snap_restore: None,
                     focused: false,
                     close_button_hover: false,
                     maximize_button_hover: false,
@@ -1087,7 +1301,7 @@ impl WindowElement {
         // A plain maximized window (not part of a snap group) has no grip. A
         // snapped window keeps its grip, because dragging it is what drives the
         // compositor-owned group resize.
-        if maximized && state.snap_zone.is_none() {
+        if maximized && !state.is_snapped() {
             return None;
         }
         if is_ssd {
@@ -1096,7 +1310,7 @@ impl WindowElement {
             // CSD windows in a snap group get an invisible compositor edge band
             // so a drag on their border starts the unified group resize (the
             // client, told it is maximized, won't resize itself).
-            state.snap_zone?;
+            state.snap_zone()?;
             resize_edge_band(point, size)
         }
     }
@@ -1139,9 +1353,9 @@ impl<B: Backend> AnvilState<B> {
         // A tiled window pops back to its floating size as soon as the drag
         // actually moves. Done here (not at drag start) because `start_drag`
         // runs while the window's decoration state is already borrowed.
-        let snap_restore = drag.window.decoration_state().header_bar.snap_restore.take();
-        if let Some(rel) = snap_restore
-            && let Some((_, content)) = super::absolute_geometry(&self.space, &drag.window, rel)
+        let snap_restore = drag.window.decoration_state().snap.take();
+        if let Some(snap) = snap_restore
+            && let Some((_, content)) = super::absolute_geometry(&self.space, &drag.window, snap.floating)
         {
             let decorated_size = self
                 .space
@@ -1314,5 +1528,44 @@ impl<B: Backend> AnvilState<B> {
                 touch.set_grab(data, grab, serial);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_anchor_adapts_to_committed_size() {
+        // Grabbing the titlebar at 1/4 of a 1000px-wide maximized window, 15px
+        // down from the top.
+        let loc = Point::from((100, 50));
+        let size = Size::from((1000, 600));
+        let grab = Point::from((350.0, 65.0));
+        let anchor = DragAnchor::capture(loc, size, grab);
+        assert!((anchor.fraction - 0.25).abs() < 1e-9);
+        assert!((anchor.rel_y - 15.0).abs() < 1e-9);
+
+        // The client chose half the width; the pointer must stay at 25% of it.
+        let located = anchor.locate(grab, Size::from((500, 400)));
+        assert_eq!(located, Point::from((225, 50)));
+        assert!((grab.x - (located.x as f64 + 0.25 * 500.0)).abs() < 1.0);
+        assert!((grab.y - (located.y as f64 + 15.0)).abs() < 1.0);
+
+        // The window keeps following the pointer, so the anchored spot stays
+        // under it as it moves.
+        let moved = Point::from((450.0, 165.0));
+        let located = anchor.locate(moved, Size::from((500, 400)));
+        assert_eq!(located, Point::from((325, 150)));
+    }
+
+    #[test]
+    fn drag_anchor_zero_width_falls_back_to_center() {
+        let anchor = DragAnchor::capture(
+            Point::from((0, 0)),
+            Size::from((0, 0)),
+            Point::from((10.0, 10.0)),
+        );
+        assert!((anchor.fraction - 0.5).abs() < 1e-9);
     }
 }

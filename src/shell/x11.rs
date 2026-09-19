@@ -332,7 +332,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         // Maximizing supersedes any snap; the floating geometry would be stale.
-        elem.decoration_state().header_bar.snap_restore = None;
+        elem.decoration_state().clear_snap();
 
         let old_geo = match self.space.element_bbox(&elem) {
             Some(geo) => geo,
@@ -391,7 +391,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         // Fullscreen supersedes any snap; the floating geometry would be stale.
-        elem.decoration_state().header_bar.snap_restore = None;
+        elem.decoration_state().clear_snap();
 
         let outputs_for_window = self.space.outputs_for_element(&elem);
         let output = outputs_for_window
@@ -511,6 +511,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         start_data,
                         window: element.clone(),
                         initial_window_location,
+                        anchor: None,
                         snap_target: None,
                     };
 
@@ -578,6 +579,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             start_data,
             window: element.clone(),
             initial_window_location,
+            anchor: None,
             snap_target: None,
         };
 

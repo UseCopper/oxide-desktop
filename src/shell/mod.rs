@@ -8,18 +8,7 @@ use smithay::xwayland::XWaylandClientData;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 
 use smithay::{
-    backend::{
-        allocator::Fourcc,
-        renderer::{
-            ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
-            damage::OutputDamageTracker,
-            element::{
-                AsRenderElements, memory::MemoryRenderBuffer, surface::WaylandSurfaceRenderElement,
-            },
-            gles::GlesTexture,
-            utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
-        },
-    },
+    backend::renderer::utils::on_commit_buffer_handler,
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, WindowSurface, WindowSurfaceType,
         layer_map_for_output, space::SpaceElement,
@@ -34,13 +23,13 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size, Transform},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             TraversalAction, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
-            with_surface_tree_downward, with_surface_tree_upward,
+            with_surface_tree_upward,
         },
         dmabuf::get_dmabuf,
         shell::{
@@ -48,7 +37,7 @@ use smithay::{
                 Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
+            xdg::{XdgToplevelSurfaceData},
         },
     },
 };
@@ -60,7 +49,9 @@ use crate::{
 };
 
 mod animation;
+mod capture;
 mod element;
+mod geometry;
 mod grabs;
 mod snap;
 pub(crate) mod ssd;
@@ -69,13 +60,14 @@ mod x11;
 mod xdg;
 
 pub use self::animation::*;
+pub use self::capture::*;
 pub use self::element::*;
+pub use self::geometry::*;
 pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, SurfaceFrame,
-    VisibilityState,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, Snap, VisibilityState,
 };
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
@@ -361,6 +353,30 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
     }
 
+    /// Start an unmaximize transition for a client-decorated window, whose
+    /// restored size is chosen by the client and so isn't known yet. The window
+    /// is frozen at its current (maximized) geometry, keeping the pre-maximize
+    /// frame for the crossfade, and the commit handler fills in the final size
+    /// with [`WindowAnimation::resolve_content`] once the client commits it.
+    pub fn animate_client_unmaximize(
+        &mut self,
+        window: &WindowElement,
+        target_loc: Point<i32, Logical>,
+    ) {
+        let Some(start_loc) = self.space.element_location(window) else {
+            return;
+        };
+        let content = window.resize_content_size();
+        let start = WindowRect::from_geometry(start_loc, content);
+        let end = WindowRect::from_geometry(target_loc, content);
+        let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
+        animation.wait_for_content();
+        // Raise/activate without moving: the animation drives the location once
+        // the client has chosen its size.
+        self.space.map_element(window.clone(), start_loc, true);
+        window.decoration_state().animation = Some(animation);
+    }
+
     /// Pin any in-flight transition of `window` to its current location. Called
     /// when an interactive drag ends so the window stays where it was dropped
     /// while the size transition finishes.
@@ -505,12 +521,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
-        if window.decoration_state().header_bar.snap_restore.is_none() {
-            window.decoration_state().header_bar.snap_restore =
-                relative_geometry_of_output(&self.space, &target.output, window);
+        let floating = window
+            .decoration_state()
+            .snap
+            .map(|snap| snap.floating)
+            .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
+        if let Some(floating) = floating {
+            window.decoration_state().snap = Some(Snap {
+                zone: target.zone,
+                grid,
+                floating,
+            });
         }
-        window.decoration_state().snap_zone = Some(target.zone);
-        window.decoration_state().snap_grid = Some(grid);
         let animated = self.configure_snapped(window, rect, true);
         self.animate_window(window, animated, rect.loc);
     }
@@ -519,7 +541,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     fn group_grid(&self, output: &Output) -> Option<SnapGrid> {
         self.space
             .elements_for_output(output)
-            .find_map(|window| window.decoration_state().snap_grid)
+            .find_map(|window| window.decoration_state().snap.map(|snap| snap.grid))
     }
 
     /// Restore a snapped window to its floating geometry at `loc`, animating
@@ -532,8 +554,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         content: Size<i32, Logical>,
     ) {
         // Restoring supersedes the snap, so stop treating it as tiled.
-        window.decoration_state().snap_zone = None;
-        window.decoration_state().snap_grid = None;
+        window.decoration_state().clear_snap();
         let is_ssd = window.is_ssd();
         let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
         self.configure_snapped(window, rect, false);
@@ -543,7 +564,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     /// The work area `window` is snapped into, or `None` when it floats.
     pub fn snap_area_for(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
-        if window.decoration_state().header_bar.snap_restore.is_none() {
+        if !window.decoration_state().is_snapped() {
             return None;
         }
         let output = output_for_window(&self.space, window)?;
@@ -561,12 +582,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         edges: ResizeEdge,
         intended_size: Size<i32, Logical>,
     ) {
-        let Some(zone) = window.decoration_state().snap_zone else {
+        let Some(snap) = window.decoration_state().snap else {
             return;
         };
-        let Some(grid) = window.decoration_state().snap_grid else {
-            return;
-        };
+        let zone = snap.zone;
+        let grid = snap.grid;
         if zone == SnapZone::Maximize {
             return;
         }
@@ -586,7 +606,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // cell: clamp the divider so every present member stays at or above its
         // minimum size.
         let grid = self.clamp_grid_to_minimums(grid, area, window);
-        window.decoration_state().snap_grid = Some(grid);
+        if let Some(snap) = window.decoration_state().snap.as_mut() {
+            snap.grid = grid;
+        }
         self.reflow_group(window, grid, area);
     }
 
@@ -602,13 +624,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<(WindowElement, SnapZone)> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_zone.is_some()
-                    && other.decoration_state().snap_grid.is_some()
-            })
+            .filter(|other| !other.is_ghosting())
             .filter_map(|other| {
-                let zone = other.decoration_state().snap_zone?;
+                let zone = other.decoration_state().snap_zone()?;
                 Some((other.clone(), zone))
             })
             .collect();
@@ -686,11 +704,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<WindowElement> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_grid.is_some()
-                    && other.decoration_state().snap_zone.is_some()
-            })
+            .filter(|other| !other.is_ghosting() && other.decoration_state().is_snapped())
             .cloned()
             .collect();
 
@@ -701,13 +715,53 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if other.decoration_state().header_bar.fullscreen {
                 continue;
             }
-            let Some(zone) = other.decoration_state().snap_zone else {
+            let Some(zone) = other.decoration_state().snap_zone() else {
                 continue;
             };
             let rect = grid.rect(zone, area);
-            other.decoration_state().snap_grid = Some(grid);
+            if let Some(snap) = other.decoration_state().snap.as_mut() {
+                snap.grid = grid;
+            }
             let edges = Self::sibling_edges(zone);
             self::grabs::drive_sibling_resize(&other, &mut self.space, edges, rect);
+        }
+    }
+
+    /// Re-tile the members left in `window`'s snap group after it leaves it, on
+    /// a fresh centered grid over the output's work area. Their old grid may
+    /// have had driven dividers, so resetting keeps the remaining group aligned
+    /// now that one member is gone. Each member is reconfigured and animated
+    /// into its new cell.
+    pub fn recenter_snap_group(&mut self, window: &WindowElement) {
+        let Some(area) = self.snap_area_for(window).or_else(|| {
+            let output = output_for_window(&self.space, window)?;
+            output_work_area(&self.space, &output)
+        }) else {
+            return;
+        };
+        let grid = SnapGrid::centered(area);
+        let members: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|other| {
+                *other != window && !other.is_ghosting() && other.decoration_state().is_snapped()
+            })
+            .cloned()
+            .collect();
+
+        for other in members {
+            if other.decoration_state().header_bar.fullscreen {
+                continue;
+            }
+            let Some(zone) = other.decoration_state().snap_zone() else {
+                continue;
+            };
+            if let Some(snap) = other.decoration_state().snap.as_mut() {
+                snap.grid = grid;
+            }
+            let rect = grid.rect(zone, area);
+            let content = self.configure_snapped(&other, rect, true);
+            self.animate_window(&other, content, rect.loc);
         }
     }
 
@@ -717,11 +771,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<WindowElement> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_grid.is_some()
-                    && other.decoration_state().snap_zone.is_some()
-            })
+            .filter(|other| !other.is_ghosting() && other.decoration_state().is_snapped())
             .cloned()
             .collect();
         for other in members {
@@ -739,7 +789,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         window: &WindowElement,
         pointer_global: Point<f64, Logical>,
     ) -> Option<Point<i32, Logical>> {
-        let rel = window.decoration_state().header_bar.snap_restore.take()?;
+        let snap = window.decoration_state().snap.take()?;
+        let rel = snap.floating;
         let current_loc = self.space.element_location(window)?;
         let decorated_size = self
             .space
@@ -820,6 +871,26 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 continue;
             }
 
+            // A client-decorated unmaximize waits for the client to commit the
+            // size it chose. If that never arrives, settle on the last committed
+            // size so the transition can finish instead of hanging.
+            let pending_timed_out = window
+                .decoration_state()
+                .animation
+                .as_ref()
+                .map(|animation| {
+                    animation.content_pending()
+                        && now.saturating_duration_since(animation.started_at())
+                            >= CONTENT_PENDING_TIMEOUT
+                })
+                .unwrap_or(false);
+            if pending_timed_out {
+                let committed = window.resize_content_size();
+                if let Some(animation) = window.decoration_state().animation.as_mut() {
+                    animation.resolve_content(committed);
+                }
+            }
+
             // Clone the animation out before touching the window again: sampling
             // it and asking for the committed size both borrow the window state.
             let Some(animation) = window.decoration_state().animation.clone() else {
@@ -839,7 +910,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // Once the curve is done, keep the animation (which holds the window
             // at its target geometry) until the client has adopted the new size,
             // so a slow client doesn't snap back to its old geometry.
-            if progress >= 1.0 {
+            if progress >= 1.0 && !animation.content_pending() {
                 let target: Size<i32, Logical> = rect.content.to_i32_round();
                 let committed = window.resize_content_size();
                 if (committed.w - target.w).abs() <= 1 && (committed.h - target.h).abs() <= 1 {
@@ -1004,163 +1075,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 }
 
-/// Capture the pre-transition pixels of every window that is waiting for a
-/// snapshot, so its animation can crossfade from it. Must be called with the
-/// output framebuffer unbound, before rendering the frame.
-pub fn capture_window_snapshots<R>(space: &Space<WindowElement>, renderer: &mut R)
-where
-    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
-    R::TextureId: Clone + Texture + Send + 'static,
-{
-    let windows: Vec<WindowElement> = space.elements().cloned().collect();
-    for window in windows {
-        if window.is_ghosting() {
-            continue;
-        }
-
-        let pending = window
-            .decoration_state()
-            .animation
-            .as_ref()
-            .map(|animation| animation.needs_snapshot())
-            .unwrap_or(false);
-        if pending {
-            let content = window.resize_content_size();
-            if content.w > 0 && content.h > 0 {
-                let size = Size::<i32, Buffer>::from((content.w, content.h));
-                if let Some(buffer) = capture_window_content(renderer, &window, size) {
-                    window
-                        .decoration_state()
-                        .animation
-                        .as_mut()
-                        .unwrap()
-                        .set_snapshot(buffer, content);
-                } else {
-                    window
-                        .decoration_state()
-                        .animation
-                        .as_mut()
-                        .unwrap()
-                        .set_snapshot_unavailable();
-                }
-            } else {
-                window
-                    .decoration_state()
-                    .animation
-                    .as_mut()
-                    .unwrap()
-                    .set_snapshot_unavailable();
-            }
-        }
-    }
-}
-
-/// Walk a window's surface tree and keep every mapped surface's buffer, with its
-/// position relative to the window's top-left. Holding the buffers keeps the
-/// pixels alive after the client is gone, so an app-triggered close can render
-/// the whole window (content and subsurfaces).
-fn capture_surface_tree(root: &WlSurface) -> Option<LastFrame> {
-    let mut surfaces: Vec<SurfaceFrame> = Vec::new();
-
-    with_surface_tree_downward(
-        root,
-        Point::<f64, Logical>::from((0.0, 0.0)),
-        |_, states, location| {
-            let mut location = *location;
-            if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
-                if let Some(view) = data.lock().unwrap().view() {
-                    location += view.offset.to_f64();
-                    TraversalAction::DoChildren(location)
-                } else {
-                    TraversalAction::SkipChildren
-                }
-            } else {
-                TraversalAction::SkipChildren
-            }
-        },
-        |_, states, location| {
-            let mut location = *location;
-            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
-                return;
-            };
-            let data = data.lock().unwrap();
-            let Some(view) = data.view() else {
-                return;
-            };
-            location += view.offset.to_f64();
-            if let Some(buffer) = data.buffer() {
-                surfaces.push(SurfaceFrame {
-                    buffer: buffer.clone(),
-                    location: Point::from((
-                        location.x.round() as i32,
-                        location.y.round() as i32,
-                    )),
-                    size: view.dst,
-                    scale: data.buffer_scale(),
-                    transform: data.buffer_transform(),
-                    src: Some(view.src),
-                });
-            }
-        },
-        |_, _, _| true,
-    );
-
-    (!surfaces.is_empty()).then_some(LastFrame {
-        geometry: with_states(root, |states| {
-            states.cached_state.get::<SurfaceCachedState>().current().geometry
-        })
-        .unwrap_or_else(|| {
-            Rectangle::from_size(surfaces.first().map(|s| s.size).unwrap_or_default())
-        }),
-        surfaces,
-    })
-}
-
-/// Render a window's client content into an offscreen buffer and read it back
-/// as a [`MemoryRenderBuffer`]. Returns `None` if the renderer cannot provide
-/// a readable offscreen target.
-fn capture_window_content<R>(
-    renderer: &mut R,
-    window: &WindowElement,
-    size: Size<i32, Buffer>,
-) -> Option<MemoryRenderBuffer>
-where
-    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture>,
-    R::TextureId: Clone + Texture + Send + 'static,
-{
-    let mut target = renderer.create_buffer(Fourcc::Abgr8888, size).ok()?;
-    let mut framebuffer = renderer.bind(&mut target).ok()?;
-
-    let elements: Vec<WaylandSurfaceRenderElement<R>> = AsRenderElements::render_elements(
-        &window.0,
-        renderer,
-        Point::from((0, 0)),
-        Scale::from(1.0),
-        1.0,
-    );
-
-    let physical_size = Size::<i32, Physical>::from((size.w, size.h));
-    let mut tracker = OutputDamageTracker::new(physical_size, 1.0, Transform::Normal);
-    tracker
-        .render_output(renderer, &mut framebuffer, 0, &elements, [0.0, 0.0, 0.0, 0.0])
-        .ok()?;
-
-    let region = Rectangle::<i32, Buffer>::from_size(size);
-    let mapping = renderer
-        .copy_framebuffer(&framebuffer, region, Fourcc::Abgr8888)
-        .ok()?;
-    let data = renderer.map_texture(&mapping).ok()?;
-    // Smithay's GL renderer flips y while drawing into a `Normal` target, so the
-    // readback already comes out top-down: no extra transform is needed.
-    Some(MemoryRenderBuffer::from_slice(
-        data,
-        Fourcc::Abgr8888,
-        size,
-        1,
-        Transform::Normal,
-        None,
-    ))
-}
 
 #[derive(Default)]
 pub struct SurfaceData {
@@ -1377,215 +1291,4 @@ fn window_is_x11_surface(window: &WindowElement, surface: &WlSurface) -> bool {
 #[cfg(not(feature = "xwayland"))]
 fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool {
     false
-}
-
-/// The area of an output that floating windows are laid out within, i.e. its
-/// geometry minus any layer-shell exclusive zones (panels, docks, ...).
-pub fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
-    let geo = space.output_geometry(output)?;
-    // Refresh the exclusive zones: a layer surface may have changed its
-    // reserved edge since the last arrange.
-    let mut map = layer_map_for_output(output);
-    map.arrange();
-    let zone = map.non_exclusive_zone();
-    let area = Rectangle::new(geo.loc + zone.loc, zone.size);
-    (area.size.w > 0 && area.size.h > 0).then_some(area)
-}
-
-/// Clamp a dragged window's proposed top-left so its titlebar can't be moved
-/// under a layer-shell exclusive zone (e.g. a top panel), keeping it grabbable.
-/// The output under `pointer` decides which work area applies.
-pub fn clamp_window_position(
-    space: &Space<WindowElement>,
-    window: &WindowElement,
-    pointer: Point<f64, Logical>,
-    proposed: Point<i32, Logical>,
-) -> Point<i32, Logical> {
-    let output = space
-        .output_under(pointer)
-        .next()
-        .cloned()
-        .or_else(|| output_for_window(space, window));
-    let Some(area) = output.and_then(|output| output_work_area(space, &output)) else {
-        return proposed;
-    };
-    Point::from((proposed.x, proposed.y.max(area.loc.y)))
-}
-
-/// The output a window belongs to.
-///
-/// [`Space::outputs_for_element`] returns its outputs in an unspecified order
-/// (they are kept in a `HashMap`), which is wrong when a window overlaps more
-/// than one output — e.g. a fullscreen window on a secondary monitor. Prefer
-/// the output under the window's top-left corner and only fall back to the
-/// arbitrary order/primary output when nothing contains it.
-pub fn output_for_window(space: &Space<WindowElement>, window: &WindowElement) -> Option<Output> {
-    let outputs = space.outputs_for_element(window);
-    if let Some(loc) = space.element_location(window)
-        && let Some(output) = outputs.iter().find(|output| {
-            space
-                .output_geometry(output)
-                .map(|geo| geo.contains(loc))
-                .unwrap_or(false)
-        })
-    {
-        return Some(output.clone());
-    }
-    outputs
-        .first()
-        .cloned()
-        .or_else(|| space.outputs().next().cloned())
-}
-
-/// Compute a window's geometry as fractions of a specific output's work area.
-pub fn relative_geometry_of_output(
-    space: &Space<WindowElement>,
-    output: &Output,
-    window: &WindowElement,
-) -> Option<RelativeGeometry> {
-    let area = output_work_area(space, output)?;
-    let loc = space.element_location(window)?;
-    let size = window.geometry().size;
-    Some(RelativeGeometry {
-        x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
-        y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
-        w: size.w as f64 / area.size.w as f64,
-        h: size.h as f64 / area.size.h as f64,
-    })
-}
-
-/// Compute a window's geometry as fractions of its output's work area.
-pub fn relative_geometry_of(
-    space: &Space<WindowElement>,
-    window: &WindowElement,
-) -> Option<RelativeGeometry> {
-    let output = output_for_window(space, window)?;
-    relative_geometry_of_output(space, &output, window)
-}
-
-/// Turn a fractional geometry back into an absolute location and the
-/// (undecorated) content size to configure the client with, against a specific
-/// output's work area.
-pub fn absolute_geometry_for_output(
-    space: &Space<WindowElement>,
-    output: &Output,
-    rel: RelativeGeometry,
-    is_ssd: bool,
-) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
-    let area = output_work_area(space, output)?;
-    let loc = Point::from((
-        area.loc.x + (rel.x * area.size.w as f64).round() as i32,
-        area.loc.y + (rel.y * area.size.h as f64).round() as i32,
-    ));
-    let decoration: Size<i32, Logical> = if is_ssd {
-        Size::from((2 * BORDER_WIDTH, HEADER_BAR_HEIGHT + BORDER_WIDTH))
-    } else {
-        Size::from((0, 0))
-    };
-    let size = Size::from((
-        ((rel.w * area.size.w as f64).round() as i32 - decoration.w).max(1),
-        ((rel.h * area.size.h as f64).round() as i32 - decoration.h).max(1),
-    ));
-    Some((loc, size))
-}
-
-/// Turn a fractional geometry back into an absolute location and the
-/// (undecorated) content size to configure the client with.
-pub fn absolute_geometry(
-    space: &Space<WindowElement>,
-    window: &WindowElement,
-    rel: RelativeGeometry,
-) -> Option<(Point<i32, Logical>, Size<i32, Logical>)> {
-    let output = output_for_window(space, window)?;
-    absolute_geometry_for_output(space, &output, rel, window.is_ssd())
-}
-
-/// Snapshot every floating window's position and size as a fraction of its
-/// output's work area. Call this *before* changing the output's mode.
-pub fn capture_relative_geometries(space: &Space<WindowElement>, output: &Output) {
-    for window in space.elements_for_output(output) {
-        if window.is_ghosting() {
-            continue;
-        }
-        // Fullscreen and maximized windows are re-configured to the output
-        // rather than scaled, so they don't need a snapshot.
-        if window.decoration_state().header_bar.fullscreen || window.is_maximized() {
-            continue;
-        }
-        if let Some(rel) = relative_geometry_of(space, window) {
-            window.decoration_state().relative = Some(rel);
-        }
-    }
-}
-
-/// Reapply fractional geometry against the output's (possibly new) work area,
-/// and refresh fullscreen/maximized windows to the new output size. Call this
-/// *after* the output's mode has changed.
-pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Output) {
-    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-
-    let Some(output_geo) = space.output_geometry(output) else {
-        return;
-    };
-    let work_area = output_work_area(space, output).unwrap_or(output_geo);
-
-    let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
-    for window in windows {
-        if window.is_ghosting() {
-            continue;
-        }
-        // An output mode change re-lays out every window, so any in-flight
-        // transition is superseded by the new geometry.
-        window.decoration_state().animation = None;
-        if let Some(toplevel) = window.0.toplevel() {
-            let fullscreen = window.decoration_state().header_bar.fullscreen;
-            if fullscreen {
-                let size = self::xdg::fullscreen_content_size(work_area.size, window.is_ssd());
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Fullscreen);
-                    state.size = Some(size);
-                });
-                toplevel.send_configure();
-                space.map_element(window, work_area.loc, false);
-                continue;
-            }
-            // A snapped window is reconfigured to its cell in the new work
-            // area, not maximized to the whole output.
-            let snap_zone = window.decoration_state().snap_zone;
-            if let Some(zone) = snap_zone {
-                let grid = SnapGrid::centered(work_area);
-                let rect = grid.rect(zone, work_area);
-                window.decoration_state().snap_grid = Some(grid);
-                let content = self::xdg::undecorated_content_size(rect.size, window.is_ssd());
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Maximized);
-                    state.size = Some(content);
-                });
-                toplevel.send_configure();
-                space.map_element(window, rect.loc, false);
-                continue;
-            }
-            if window.is_maximized() {
-                let size = self::xdg::maximize_content_size(work_area.size, window.is_ssd());
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Maximized);
-                    state.size = Some(size);
-                });
-                toplevel.send_configure();
-                space.map_element(window, work_area.loc, false);
-                continue;
-            }
-        }
-
-        let Some(rel) = window.decoration_state().relative else {
-            continue;
-        };
-        if let Some((loc, size)) = absolute_geometry(space, &window, rel) {
-            if let Some(toplevel) = window.0.toplevel() {
-                toplevel.with_pending_state(|state| state.size = Some(size));
-                toplevel.send_configure();
-            }
-            space.map_element(window, loc, false);
-        }
-    }
 }

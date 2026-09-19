@@ -22,7 +22,7 @@ use smithay::{
 #[cfg(feature = "xwayland")]
 use smithay::{utils::Rectangle, xwayland::xwm::ResizeEdge as X11ResizeEdge};
 
-use super::{SnapTarget, SurfaceData, WindowElement};
+use super::{SnapTarget, SurfaceData, WindowElement, ssd::DragAnchor};
 use crate::{
     focus::PointerFocusTarget,
     state::{AnvilState, Backend},
@@ -32,6 +32,11 @@ pub struct PointerMoveSurfaceGrab<BackendData: Backend + 'static> {
     pub start_data: PointerGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
+    /// When the window is being dragged out of a maximized state and will pick
+    /// its own restored size (client-decorated), the pointer anchor used to
+    /// place it for whatever size the client commits. `None` for an ordinary
+    /// move, which just follows the pointer delta.
+    pub anchor: Option<DragAnchor>,
     /// Snap target under the pointer, resolved on each motion and applied when
     /// the grab is released.
     pub snap_target: Option<SnapTarget>,
@@ -48,10 +53,20 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
-        let delta = event.location - self.start_data.location;
-        let new_location = self.initial_window_location.to_f64() + delta;
+        let new_location = match self.anchor {
+            // An unmaximize drag keeps the grabbed titlebar spot under the
+            // pointer, adapting to the size the client actually committed.
+            Some(anchor) => anchor.locate(
+                event.location,
+                data.space.element_geometry(&self.window).map(|g| g.size).unwrap_or_default(),
+            ),
+            None => {
+                let delta = event.location - self.start_data.location;
+                (self.initial_window_location.to_f64() + delta).to_i32_round()
+            }
+        };
         let new_location =
-            super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
+            super::clamp_window_position(&data.space, &self.window, event.location, new_location);
         data.space
             .map_element(self.window.clone(), new_location, true);
 
@@ -194,6 +209,8 @@ pub struct TouchMoveSurfaceGrab<BackendData: Backend + 'static> {
     pub start_data: TouchGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
+    /// See [`PointerMoveSurfaceGrab::anchor`].
+    pub anchor: Option<DragAnchor>,
     /// Snap target under the finger, resolved on each motion and applied when
     /// the touch is released.
     pub snap_target: Option<SnapTarget>,
@@ -248,10 +265,20 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             return;
         }
 
-        let delta = event.location - self.start_data.location;
-        let new_location = self.initial_window_location.to_f64() + delta;
+        let new_location = match self.anchor {
+            Some(anchor) => {
+                anchor.locate(
+                    event.location,
+                    data.space.element_geometry(&self.window).map(|g| g.size).unwrap_or_default(),
+                )
+            }
+            None => {
+                let delta = event.location - self.start_data.location;
+                (self.initial_window_location.to_f64() + delta).to_i32_round()
+            }
+        };
         let new_location =
-            super::clamp_window_position(&data.space, &self.window, event.location, new_location.to_i32_round());
+            super::clamp_window_position(&data.space, &self.window, event.location, new_location);
         data.space
             .map_element(self.window.clone(), new_location, true);
 
