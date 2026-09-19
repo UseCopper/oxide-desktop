@@ -79,6 +79,13 @@ use self::ssd::{
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
 
+thread_local! {
+    /// A freshly mapped window waiting for keyboard focus. `place_new_window`
+    /// runs with only a `Space`, so the actual focus is applied by
+    /// [`AnvilState::focus_new_windows`] right after.
+    static PENDING_FOCUS: RefCell<Option<WindowElement>> = const { RefCell::new(None) };
+}
+
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
 
@@ -310,6 +317,17 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
+    /// Give keyboard focus to any window `place_new_window` just mapped.
+    pub fn focus_new_windows(&mut self) {
+        let window = PENDING_FOCUS.with(|cell| cell.borrow_mut().take());
+        let Some(window) = window else {
+            return;
+        };
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, Some(window.into()), SERIAL_COUNTER.next_serial());
+        }
+    }
+
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
         self.space
             .elements()
@@ -618,6 +636,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         self.tick_visibility_animations(&windows, now);
         self.tick_snap_preview(now);
+        #[cfg(feature = "panel")]
+        self.tick_panel();
     }
 
     /// Advance every window's open/close transition: start opens that were
@@ -1038,48 +1058,45 @@ fn place_new_window(
     window: &WindowElement,
     activate: bool,
 ) {
-    // place the window at a random location on same output as pointer
-    // or if there is not output in a [0;800]x[0;800] square
-    use rand::distributions::{Distribution, Uniform};
-
+    // Center the window on the output under the pointer (the monitor the mouse
+    // is on), falling back to the first output, then a fixed area.
     let output = space
         .output_under(pointer_location)
         .next()
         .or_else(|| space.outputs().next())
         .cloned();
-    let output_geometry = output
-        .and_then(|o| {
-            let geo = space.output_geometry(&o)?;
-            let map = layer_map_for_output(&o);
-            let zone = map.non_exclusive_zone();
-            Some(Rectangle::new(geo.loc + zone.loc, zone.size))
-        })
+    let area = output
+        .as_ref()
+        .and_then(|output| output_work_area(space, output))
         .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
 
-    // set the initial toplevel bounds
+    // Set the initial toplevel bounds.
     #[allow(irrefutable_let_patterns)]
     if let Some(toplevel) = window.0.toplevel() {
         toplevel.with_pending_state(|state| {
-            state.bounds = Some(output_geometry.size);
+            state.bounds = Some(area.size);
         });
     }
 
-    // Guard against tiny outputs where the random range would be empty (panics in `Uniform::new`).
-    let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
-    let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let mut rng = rand::thread_rng();
-    let x = if max_x > output_geometry.loc.x {
-        Uniform::new(output_geometry.loc.x, max_x).sample(&mut rng)
-    } else {
-        output_geometry.loc.x
-    };
-    let y = if max_y > output_geometry.loc.y {
-        Uniform::new(output_geometry.loc.y, max_y).sample(&mut rng)
-    } else {
-        output_geometry.loc.y
-    };
+    // `geometry()` is the decorated size, so the whole frame ends up centered.
+    let size = window.geometry().size;
+    let location = Point::from((
+        area.loc.x + (area.size.w - size.w).max(0) / 2,
+        area.loc.y + (area.size.h - size.h).max(0) / 2,
+    ));
+    space.map_element(window.clone(), location, activate);
 
-    space.map_element(window.clone(), (x, y), activate);
+    // `map_element(.., true)` only sets the xdg activated state; give the
+    // window the actual keyboard focus too.
+    if activate {
+        state_focus(space, window);
+    }
+}
+
+/// Hand `window` to [`AnvilState::focus_new_windows`], which applies the real
+/// keyboard focus. `place_new_window` only has a `Space`, so it can't do it here.
+fn state_focus(_space: &Space<WindowElement>, window: &WindowElement) {
+    PENDING_FOCUS.with(|cell| *cell.borrow_mut() = Some(window.clone()));
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {

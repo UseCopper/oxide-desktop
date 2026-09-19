@@ -62,6 +62,9 @@ pub struct WindowState {
     /// app-triggered close can be rendered from it. Cheap: no GPU work until the
     /// ghost actually renders.
     pub last_frame: Option<LastFrame>,
+    /// Stable identifier used by the panel to refer to this window. Assigned
+    /// lazily the first time the window list is published.
+    pub panel_id: Option<u64>,
     pub header_bar: HeaderBar,
 }
 
@@ -802,6 +805,7 @@ impl WindowElement {
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,
+                panel_id: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
@@ -1135,10 +1139,10 @@ impl<B: Backend> AnvilState<B> {
         if !window.alive() || edges.is_empty() {
             return None;
         }
-        // An interactive resize takes over from any in-flight transition and
-        // makes the snapped floating geometry stale.
+        // An interactive resize takes over from any in-flight transition. A
+        // snapped window stays in its group while resized, so `snap_restore`
+        // (and the restore icon) is kept; only moving breaks the snap.
         window.decoration_state().animation = None;
-        window.decoration_state().header_bar.snap_restore = None;
         let initial_window_location = self.space.element_location(window)?;
         // Resizing works in surface (content) coordinates, so ignore the
         // decoration bounds that `SpaceElement::geometry` adds.

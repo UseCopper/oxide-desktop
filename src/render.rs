@@ -25,7 +25,7 @@ use crate::drawing::FpsElement;
 use crate::{
     drawing::{CLEAR_COLOR, CLEAR_COLOR_FULLSCREEN, PointerRenderElement},
     shell::{
-        FullscreenSurface, SNAP_PREVIEW_ALPHA, SNAP_PREVIEW_COLOR, SnapPreviewState, WindowElement,
+        FullscreenSurface, SNAP_PREVIEW_ALPHA, SnapPreviewState, WindowElement, preview_color,
         WindowRenderElement,
     },
 };
@@ -180,19 +180,21 @@ where
     {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let layer_map = smithay::desktop::layer_map_for_output(output);
-        let (lower, upper): (Vec<_>, Vec<_>) = layer_map
+        // A Top layer (e.g. the panel) is hidden while a window is fullscreen,
+        // like most compositors do. Overlay layers (notifications, OSDs) stay
+        // above the fullscreen window; everything else is drawn behind it.
+        let (overlay, below): (Vec<_>, Vec<_>) = layer_map
             .layers()
             .rev()
-            .partition(|surface| matches!(surface.layer(), Layer::Background | Layer::Bottom));
+            .filter(|surface| surface.layer() != Layer::Top)
+            .partition(|surface| surface.layer() == Layer::Overlay);
 
         let mut elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
 
-        // Layer-shell surfaces (e.g. a top panel) stay visible above the
-        // fullscreen window, so draw the upper layers first.
-        for surface in upper {
+        for surface in overlay {
             let Some(geo) = layer_map.layer_geometry(surface) else {
                 continue;
             };
@@ -209,21 +211,22 @@ where
             );
         }
 
-        // The fullscreen window is offset by the layer-shell exclusive zone so
-        // it doesn't sit under the panel.
-        let location = layer_map
-            .non_exclusive_zone()
-            .loc
-            .to_physical_precise_round(scale);
-        let window_render_elements: Vec<WindowRenderElement<R>> =
-            AsRenderElements::<R>::render_elements(&window, renderer, location, scale, 1.0);
+        // Draw the fullscreen window at the output origin so it covers the
+        // whole output; the client is configured to the full output size.
+        let window_render_elements: Vec<WindowRenderElement<R>> = AsRenderElements::<R>::render_elements(
+            &window,
+            renderer,
+            Point::from((0, 0)),
+            scale,
+            1.0,
+        );
         elements.extend(
             window_render_elements
                 .into_iter()
                 .map(|e| OutputRenderElements::Window(Wrap::from(e))),
         );
 
-        for surface in lower {
+        for surface in below {
             let Some(geo) = layer_map.layer_geometry(surface) else {
                 continue;
             };
@@ -251,7 +254,8 @@ where
         // so it highlights the target area without being hidden by them.
         if let Some((rect, alpha)) = snap_preview(output, space) {
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let buffer = SolidColorBuffer::new(rect.size, SNAP_PREVIEW_COLOR);
+            let [red, green, blue] = preview_color();
+            let buffer = SolidColorBuffer::new(rect.size, [red, green, blue, 1.0]);
             output_render_elements.push(OutputRenderElements::SnapPreview(
                 SolidColorRenderElement::from_buffer(
                     &buffer,

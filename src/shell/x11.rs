@@ -68,6 +68,7 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         let window = WindowElement(Window::new_x11_window(window));
         window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+        self.focus_new_windows();
         let Some(bbox) = self.space.element_bbox(&window) else {
             return;
         };
@@ -403,15 +404,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(geometry) = self.space.output_geometry(output) else {
             return;
         };
-        // Respect layer-shell exclusive zones (e.g. a top panel).
-        let work_area = crate::shell::output_work_area(&self.space, output).unwrap_or(geometry);
 
         if let Err(err) = window.set_fullscreen(true) {
             tracing::warn!(?err, "Failed to set X11 fullscreen");
             return;
         }
         elem.set_ssd(false);
-        if let Err(err) = window.configure(work_area) {
+        // Fullscreen covers the whole output, including the panel's zone.
+        if let Err(err) = window.configure(geometry) {
             tracing::warn!(?err, "Failed to configure fullscreen X11 window");
         }
         output.user_data().insert_if_missing(FullscreenSurface::default);

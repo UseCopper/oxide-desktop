@@ -136,6 +136,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
         window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+        self.focus_new_windows();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -692,8 +693,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
-        // Respect layer-shell exclusive zones (e.g. a top panel).
-        let work_area = super::output_work_area(&self.space, &output).unwrap_or(output_geo);
 
         let Ok(client) = self.display_handle.get_client(wl_surface.id()) else {
             return;
@@ -714,10 +713,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         drop(state);
 
+        // A fullscreen window covers the whole output, including any
+        // layer-shell exclusive zone: the panel is hidden while fullscreen.
         let is_ssd = window.is_ssd();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
-            state.size = Some(fullscreen_content_size(work_area.size, is_ssd));
+            state.size = Some(fullscreen_content_size(output_geo.size, is_ssd));
             state.fullscreen_output = wl_output;
         });
         output.user_data().insert_if_missing(FullscreenSurface::default);

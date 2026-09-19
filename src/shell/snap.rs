@@ -33,10 +33,25 @@ pub const SNAP_PREVIEW_DWELL: Duration = Duration::from_millis(100);
 /// How long the preview takes to fade in or out.
 pub const SNAP_PREVIEW_FADE: Duration = Duration::from_millis(150);
 
-/// The translucent fill of a snap preview.
-pub const SNAP_PREVIEW_COLOR: [f32; 4] = [0.42, 0.62, 0.95, 1.0];
+/// The default fill of a snap preview, used until the panel reports the
+/// desktop accent.
+pub const SNAP_PREVIEW_COLOR: [f32; 3] = [0.42, 0.62, 0.95];
 /// How opaque the preview is drawn at full fade-in.
 pub const SNAP_PREVIEW_ALPHA: f32 = 0.35;
+
+thread_local! {
+    static PREVIEW_COLOR: Cell<[f32; 3]> = const { Cell::new(SNAP_PREVIEW_COLOR) };
+}
+
+/// Set the accent the snap preview is tinted with.
+pub fn set_preview_color(rgb: [f32; 3]) {
+    PREVIEW_COLOR.with(|color| color.set(rgb));
+}
+
+/// The accent the snap preview is tinted with.
+pub fn preview_color() -> [f32; 3] {
+    PREVIEW_COLOR.with(Cell::get)
+}
 
 /// One of the tile targets a dragged window can snap to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

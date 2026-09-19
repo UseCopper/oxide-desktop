@@ -181,6 +181,28 @@ impl WindowElement {
         self.0.wl_surface()
     }
 
+    /// The window's app ID (Wayland) or WM_CLASS class (X11), used to pick an
+    /// icon in the panel.
+    pub fn app_id(&self) -> Option<String> {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(_) => {
+                let surface = self.wl_surface()?;
+                with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|data| data.lock().ok()?.app_id.clone())
+                        .filter(|app_id| !app_id.is_empty())
+                })
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => {
+                let class = surface.class();
+                (!class.is_empty()).then_some(class)
+            }
+        }
+    }
+
     /// The window's title, if the client set one.
     pub fn title(&self) -> Option<String> {
         match self.0.underlying_surface() {

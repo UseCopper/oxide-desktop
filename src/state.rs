@@ -205,6 +205,13 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// The preview is only shown once the pointer has dwelled here long enough.
     pub snap_candidate: Option<SnapTarget>,
     pub snap_candidate_since: Instant,
+    /// The panel connection, when the panel feature is enabled and it bound
+    /// successfully.
+    #[cfg(feature = "panel")]
+    pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
+    /// Counter for assigning stable panel ids to windows.
+    #[cfg(feature = "panel")]
+    pub next_panel_id: u64,
 }
 
 #[derive(Debug)]
@@ -792,7 +799,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         #[cfg(feature = "xwayland")]
         XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
-        let state = AnvilState {
+        let mut state = AnvilState {
             backend_data,
             display_handle: dh,
             socket_name,
@@ -847,44 +854,16 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             dragging_window: None,
             snap_candidate: None,
             snap_candidate_since: Instant::now(),
+            #[cfg(feature = "panel")]
+            panel_ipc: None,
+            #[cfg(feature = "panel")]
+            next_panel_id: 1,
         };
 
         #[cfg(feature = "panel")]
-        state.spawn_panel();
+        crate::panel_ipc::spawn_panel(&mut state);
 
         state
-    }
-
-    /// Start our own GTK4 layer-shell panel as a child process, pointed at this
-    /// compositor's Wayland socket. Same binary, `--panel` mode.
-    #[cfg(feature = "panel")]
-    pub fn spawn_panel(&self) {
-        use std::{process::Command, process::Stdio};
-
-        if std::env::var_os("OXIDE_NO_PANEL").is_some() {
-            return;
-        }
-        let Some(socket_name) = self.socket_name.as_deref() else {
-            return;
-        };
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(err) => {
-                warn!("Failed to locate the panel executable: {}", err);
-                return;
-            }
-        };
-
-        match Command::new(exe)
-            .arg("--panel")
-            .env("WAYLAND_DISPLAY", socket_name)
-            .env("GDK_BACKEND", "wayland")
-            .stdin(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => info!("Started the panel on {}", socket_name),
-            Err(err) => warn!("Failed to start the panel: {}", err),
-        }
     }
 
     #[cfg(feature = "xwayland")]
