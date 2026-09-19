@@ -544,9 +544,22 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             (WindowSurface::X11(_), None) => {}
         }
 
-        match target.content.filter(|_| is_ssd) {
-            Some(size) => self.animate_window(window, size, target.loc),
-            None => self.animate_client_unmaximize(window, target.loc),
+        self.animate_restore(window, target.loc, target.content.filter(|_| is_ssd));
+    }
+
+    /// Play the restore transition for `window` at `loc`. With a
+    /// compositor-owned `content` size (server-decorated) the frame animates
+    /// straight to it; without one (client-decorated) the client picks its own
+    /// size and the transition waits for the commit.
+    fn animate_restore(
+        &mut self,
+        window: &WindowElement,
+        loc: Point<i32, Logical>,
+        content: Option<Size<i32, Logical>>,
+    ) {
+        match content {
+            Some(size) => self.animate_window(window, size, loc),
+            None => self.animate_client_unmaximize(window, loc),
         }
     }
 
@@ -939,12 +952,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
-        if let Some(size) = restore_size {
-            self.animate_window(&window, size, initial_window_location);
-        } else if client_unmaximize {
-            // The client picks its own restored size; animate once it commits,
-            // like the titlebar button's unmaximize.
-            self.animate_client_unmaximize(&window, initial_window_location);
+        if client_unmaximize || restore_size.is_some() {
+            // Server-decorated: animate to the known size. Client-decorated:
+            // wait for the client to commit its own size first.
+            self.animate_restore(&window, initial_window_location, restore_size);
         }
 
         let grab = TouchMoveSurfaceGrab {
@@ -1049,12 +1060,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
-        if let Some(size) = restore_size {
-            self.animate_window(&window, size, initial_window_location);
-        } else if client_unmaximize {
-            // The client picks its own restored size; animate once it commits,
-            // like the titlebar button's unmaximize.
-            self.animate_client_unmaximize(&window, initial_window_location);
+        if client_unmaximize || restore_size.is_some() {
+            // Server-decorated: animate to the known size. Client-decorated:
+            // wait for the client to commit its own size first.
+            self.animate_restore(&window, initial_window_location, restore_size);
         }
 
         let grab = PointerMoveSurfaceGrab {
