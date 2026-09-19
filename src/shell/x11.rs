@@ -221,16 +221,16 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         }
 
         let start_location = start_data.location;
-        let grab = PointerResizeSurfaceGrab {
-            start_data,
-            resize: ResizeGrabState::new(
-                element,
-                edges.into(),
-                initial_window_location,
-                initial_window_size,
-                start_location,
-            ),
-        };
+        let snap_area = self.snap_area_for(&element);
+        let mut resize = ResizeGrabState::new(
+            element,
+            edges.into(),
+            initial_window_location,
+            initial_window_size,
+            start_location,
+        );
+        resize.set_snap_area(snap_area);
+        let grab = PointerResizeSurfaceGrab { start_data, resize };
 
         let pointer = self.pointer.clone();
         pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);

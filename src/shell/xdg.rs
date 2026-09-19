@@ -214,6 +214,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 let geometry = SpaceElement::geometry(&window.0);
                 let loc = self.space.element_location(&window).unwrap();
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
+                let snap_area = self.snap_area_for(&window);
 
                 with_states(surface.wl_surface(), move |states| {
                     states
@@ -229,16 +230,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 });
 
                 let start_location = start_data.location;
-                let grab = TouchResizeSurfaceGrab {
-                    start_data,
-                    resize: ResizeGrabState::new(
-                        window,
-                        edges.into(),
-                        initial_window_location,
-                        initial_window_size,
-                        start_location,
-                    ),
-                };
+                let mut resize = ResizeGrabState::new(
+                    window,
+                    edges.into(),
+                    initial_window_location,
+                    initial_window_size,
+                    start_location,
+                );
+                resize.set_snap_area(snap_area);
+                let grab = TouchResizeSurfaceGrab { start_data, resize };
 
                 touch.set_grab(self, grab, serial);
                 return;
@@ -279,6 +279,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             return;
         };
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
+        let snap_area = self.snap_area_for(&window);
 
         with_states(surface.wl_surface(), |states| {
             if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
@@ -291,16 +292,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         });
 
         let start_location = start_data.location;
-        let grab = PointerResizeSurfaceGrab {
-            start_data,
-            resize: ResizeGrabState::new(
-                window,
-                edges.into(),
-                initial_window_location,
-                initial_window_size,
-                start_location,
-            ),
-        };
+        let mut resize = ResizeGrabState::new(
+            window,
+            edges.into(),
+            initial_window_location,
+            initial_window_size,
+            start_location,
+        );
+        resize.set_snap_area(snap_area);
+        let grab = PointerResizeSurfaceGrab { start_data, resize };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }
@@ -575,7 +575,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             self.space.map_element(window.clone(), current, true);
         }
         let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
-        self.configure_snapped(&window, rect);
+        self.configure_snapped(&window, rect, false);
         self.animate_window(&window, content, loc);
     }
 
@@ -703,8 +703,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // Remember where the window was, relative to the output it is being
         // fullscreened on, so unfullscreening can put it back on the same
-        // monitor.
-        let restore = super::relative_geometry_of_output(&self.space, &output, &window);
+        // monitor. Skip storing a zero-sized restore (the window may not have
+        // committed a buffer yet — Firefox, for instance, starts fullscreen).
+        let restore = super::relative_geometry_of_output(&self.space, &output, &window)
+            .filter(|rel| rel.w > 0.0 && rel.h > 0.0);
         let mut state = window.decoration_state();
         state.header_bar.fullscreen = true;
         state.header_bar.pointer_loc = None;
@@ -766,6 +768,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .or_else(|| super::output_for_window(&self.space, window))?;
             super::absolute_geometry_for_output(&self.space, &output, *rel, window.is_ssd())
         });
+        // If there's no stored restore (window spawned fullscreen), fall back
+        // to the current output's work area so the client gets a real size
+        // instead of 0×0.
+        let geometry = geometry.or_else(|| {
+            let window = self
+                .space
+                .elements()
+                .find(|w| w.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+                .cloned()?;
+            let output = super::output_for_window(&self.space, &window)?;
+            let area = super::output_work_area(&self.space, &output)?;
+            let is_ssd = window.is_ssd();
+            let size = fullscreen_content_size(area.size, is_ssd);
+            Some((area.loc, size))
+        });
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
             state.size = geometry.map(|(_, size)| size);
@@ -776,7 +793,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             self.space.map_element(window, location, false);
         }
-        if let Some(output) = ret.and_then(|output| Output::from_resource(&output)) {
+
+        // Clear the output's fullscreen surface so rendering falls back to the
+        // normal space layout. This must happen even when the client did not
+        // name an output, otherwise the fullscreen render path keeps drawing
+        // the window (and hides the panel) with a stale size.
+        let client_output = ret.and_then(|output| Output::from_resource(&output));
+        let target = client_output
+            .clone()
+            .or_else(|| {
+                self.space.elements()
+                    .find(|w| w.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+                    .and_then(|window| super::output_for_window(&self.space, window))
+            });
+        if let Some(output) = target {
             if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
                 trace!("Unfullscreening: {:?}", fullscreen.get());
                 fullscreen.clear();

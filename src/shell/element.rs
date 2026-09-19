@@ -77,6 +77,11 @@ impl WindowElement {
             if in_header || edge.is_some() {
                 return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
             }
+        } else if self.resize_edge_at(location).is_some() {
+            // A client-decorated window in a snap group has an invisible
+            // compositor edge band; route it to the SSD path so a drag starts
+            // the unified group resize.
+            return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
         }
         let offset = if is_ssd {
             if self.decoration_state().header_bar.fullscreen {
@@ -272,9 +277,11 @@ impl SSD {
         location: Point<f64, Logical>,
     ) {
         let is_ssd = self.0.decoration_state().is_ssd;
+        let snapped = self.0.decoration_state().snap_zone.is_some();
         // Use the exact same hit test as pointer focus and button handling so
-        // the cursor, focus and click always agree.
-        let status = if is_ssd {
+        // the cursor, focus and click always agree. A CSD snapped window also
+        // has an (invisible) resize edge band, so it needs the resize cursor.
+        let status = if is_ssd || snapped {
             CursorImageStatus::Named(
                 self.0
                     .resize_edge_at(location)

@@ -84,29 +84,224 @@ impl SnapZone {
         RelativeGeometry { x, y, w, h }
     }
 
-    /// The absolute rectangle this zone covers within `area`. Odd work-area
-    /// sizes give the left/top half the extra pixel so the halves never
-    /// overlap.
+    /// Whether this zone includes the work area's left edge.
+    pub fn left_of_center(self) -> bool {
+        matches!(
+            self,
+            SnapZone::LeftHalf
+                | SnapZone::TopLeft
+                | SnapZone::BottomLeft
+                | SnapZone::TopHalf
+                | SnapZone::BottomHalf
+                | SnapZone::Maximize
+        )
+    }
+
+    /// Whether this zone includes the work area's right edge.
+    pub fn right_of_center(self) -> bool {
+        matches!(
+            self,
+            SnapZone::RightHalf
+                | SnapZone::TopRight
+                | SnapZone::BottomRight
+                | SnapZone::TopHalf
+                | SnapZone::BottomHalf
+                | SnapZone::Maximize
+        )
+    }
+
+    /// Whether this zone includes the work area's top edge.
+    pub fn above_center(self) -> bool {
+        matches!(
+            self,
+            SnapZone::TopHalf
+                | SnapZone::TopLeft
+                | SnapZone::TopRight
+                | SnapZone::LeftHalf
+                | SnapZone::RightHalf
+                | SnapZone::Maximize
+        )
+    }
+
+    /// Whether this zone includes the work area's bottom edge.
+    pub fn below_center(self) -> bool {
+        matches!(
+            self,
+            SnapZone::BottomHalf
+                | SnapZone::BottomLeft
+                | SnapZone::BottomRight
+                | SnapZone::LeftHalf
+                | SnapZone::RightHalf
+                | SnapZone::Maximize
+        )
+    }
+
+    /// Whether the zone spans the full width (a horizontal half or maximize).
+    pub fn spans_width(self) -> bool {
+        self.left_of_center() && self.right_of_center()
+    }
+
+    /// Whether the zone spans the full height (a vertical half or maximize).
+    pub fn spans_height(self) -> bool {
+        self.above_center() && self.below_center()
+    }
+
+    /// The absolute rectangle this zone covers within `area`.
+    ///
+    /// A zone that spans a full axis (a half or maximize) ignores that axis's
+    /// divider; quarters use both dividers.
     pub fn rect(self, area: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        SnapGrid::centered(area).rect(self, area)
+    }
+}
+
+/// The two dividers (column x, row y) a snapped layout is built from. Any zone
+/// is a region of the work area cut by these dividers; a zone spanning an axis
+/// ignores that axis's divider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapGrid {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl SnapGrid {
+    /// The default even grid for a work area.
+    pub fn centered(area: Rectangle<i32, Logical>) -> Self {
+        Self {
+            x: area.loc.x + area.size.w / 2,
+            y: area.loc.y + area.size.h / 2,
+        }
+    }
+
+    /// The rectangle `zone` occupies within `area` for this grid.
+    pub fn rect(self, zone: SnapZone, area: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        if zone == SnapZone::Maximize {
+            return area;
+        }
         let left = area.loc.x;
         let top = area.loc.y;
-        let half_w = area.size.w / 2;
-        let half_h = area.size.h / 2;
-        let right = left + half_w;
-        let bottom = top + half_h;
-        let right_w = area.size.w - half_w;
-        let bottom_h = area.size.h - half_h;
-        match self {
-            SnapZone::LeftHalf => Rectangle::new(Point::from((left, top)), Size::from((half_w, area.size.h))),
-            SnapZone::RightHalf => Rectangle::new(Point::from((right, top)), Size::from((right_w, area.size.h))),
-            SnapZone::TopHalf => Rectangle::new(Point::from((left, top)), Size::from((area.size.w, half_h))),
-            SnapZone::BottomHalf => Rectangle::new(Point::from((left, bottom)), Size::from((area.size.w, bottom_h))),
-            SnapZone::TopLeft => Rectangle::new(Point::from((left, top)), Size::from((half_w, half_h))),
-            SnapZone::TopRight => Rectangle::new(Point::from((right, top)), Size::from((right_w, half_h))),
-            SnapZone::BottomLeft => Rectangle::new(Point::from((left, bottom)), Size::from((half_w, bottom_h))),
-            SnapZone::BottomRight => Rectangle::new(Point::from((right, bottom)), Size::from((right_w, bottom_h))),
-            SnapZone::Maximize => area,
+        let right = area.loc.x + area.size.w;
+        let bottom = area.loc.y + area.size.h;
+
+        let (x0, x1) = if zone.spans_width() {
+            (left, right)
+        } else if zone.left_of_center() {
+            (left, self.x)
+        } else {
+            (self.x, right)
+        };
+        let (y0, y1) = if zone.spans_height() {
+            (top, bottom)
+        } else if zone.above_center() {
+            (top, self.y)
+        } else {
+            (self.y, bottom)
+        };
+
+        Rectangle::new(
+            Point::from((x0, y0)),
+            Size::from(((x1 - x0).max(1), (y1 - y0).max(1))),
+        )
+    }
+
+    /// Move the divider(s) the resized `zone` controls to match its `intended`
+    /// size, keeping the dividers inside the area.
+    ///
+    /// A left/above cell pushes the divider right/down as it grows; a
+    /// right/below cell pushes it left/up. A zone spanning an axis has no
+    /// divider to move on that axis.
+    pub fn with_dragged_edges(
+        mut self,
+        zone: SnapZone,
+        area: Rectangle<i32, Logical>,
+        dragged: Edges,
+        intended: Size<i32, Logical>,
+    ) -> Self {
+        let left = area.loc.x;
+        let top = area.loc.y;
+        let right = area.loc.x + area.size.w;
+        let bottom = area.loc.y + area.size.h;
+
+        if (dragged.left || dragged.right) && !zone.spans_width() {
+            let moved = if zone.left_of_center() {
+                left + intended.w
+            } else {
+                right - intended.w
+            };
+            self.x = moved.clamp(left + 1, right - 1);
         }
+        if (dragged.top || dragged.bottom) && !zone.spans_height() {
+            let moved = if zone.above_center() {
+                top + intended.h
+            } else {
+                bottom - intended.h
+            };
+            self.y = moved.clamp(top + 1, bottom - 1);
+        }
+
+        self
+    }
+}
+
+/// Which edges an interactive resize is dragging. A plain struct so the grid
+/// math can be tested without the compositor's `ResizeEdge`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Edges {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    fn area() -> Rectangle<i32, Logical> {
+        Rectangle::new(Point::from((0, 0)), Size::from((1000, 800)))
+    }
+
+    #[test]
+    fn default_grid_divides_evenly() {
+        let area = area();
+        let grid = SnapGrid::centered(area);
+        assert_eq!(grid.rect(SnapZone::TopLeft, area), Rectangle::new(Point::from((0, 0)), Size::from((500, 400))));
+        assert_eq!(grid.rect(SnapZone::LeftHalf, area).size, Size::from((500, 800)));
+        assert_eq!(grid.rect(SnapZone::TopHalf, area).size, Size::from((1000, 400)));
+    }
+
+    #[test]
+    fn growing_top_right_shrinks_every_other_cell() {
+        let area = area();
+        // Top-right grows from 500x400 to 700x500: divider moves left and down.
+        let grid = SnapGrid::centered(area).with_dragged_edges(
+            SnapZone::TopRight,
+            area,
+            Edges { left: true, bottom: true, ..Default::default() },
+            Size::from((700, 500)),
+        );
+        assert_eq!(grid, SnapGrid { x: 300, y: 500 });
+
+        assert_eq!(
+            grid.rect(SnapZone::TopRight, area),
+            Rectangle::new(Point::from((300, 0)), Size::from((700, 500)))
+        );
+        // Below loses height, left loses width, diagonal loses both.
+        assert_eq!(grid.rect(SnapZone::BottomRight, area).size, Size::from((700, 300)));
+        assert_eq!(grid.rect(SnapZone::TopLeft, area).size, Size::from((300, 500)));
+        assert_eq!(grid.rect(SnapZone::BottomLeft, area).size, Size::from((300, 300)));
+    }
+
+    #[test]
+    fn dragging_left_edge_of_right_cell_moves_divider() {
+        let area = area();
+        let grid = SnapGrid::centered(area).with_dragged_edges(
+            SnapZone::TopRight,
+            area,
+            Edges { left: true, ..Default::default() },
+            Size::from((600, 400)),
+        );
+        assert_eq!(grid.x, 400);
     }
 }
 

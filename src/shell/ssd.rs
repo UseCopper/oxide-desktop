@@ -32,7 +32,8 @@ use std::{
 use crate::{AnvilState, state::Backend};
 
 use super::{
-    SnapTarget, SurfaceData, VisibilityAnimation, WindowAnimation, WindowElement,
+    SnapGrid, SnapTarget, SnapZone, SurfaceData, VisibilityAnimation, WindowAnimation,
+    WindowElement,
     grabs::{
         PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeGrabState, ResizeState,
         TouchResizeSurfaceGrab,
@@ -65,6 +66,11 @@ pub struct WindowState {
     /// Stable identifier used by the panel to refer to this window. Assigned
     /// lazily the first time the window list is published.
     pub panel_id: Option<u64>,
+    /// The snap zone this window is tiled into, while it remains snapped.
+    pub snap_zone: Option<SnapZone>,
+    /// The divider grid this window's snap group is laid out on. Shared by the
+    /// group, updated when a resize moves a divider.
+    pub snap_grid: Option<SnapGrid>,
     pub header_bar: HeaderBar,
 }
 
@@ -375,7 +381,36 @@ impl HeaderBar {
 
         (!edges.is_empty()).then_some(edges)
     }
+}
 
+/// The resize edge for a point on a client-decorated window, using an invisible
+/// band just inside its outer bounds. `size` is the window's content size.
+fn resize_edge_band(point: Point<f64, Logical>, size: Size<i32, Logical>) -> Option<ResizeEdge> {
+    if size.w <= 0 || size.h <= 0 {
+        return None;
+    }
+    let band = RESIZE_MARGIN as f64;
+    let (w, h) = (size.w as f64, size.h as f64);
+    // Only accept points inside the window's bounds; the band is inside the
+    // edge so dragging the very border is still the app's, not ours.
+    if point.x < 0.0 || point.y < 0.0 || point.x > w || point.y > h {
+        return None;
+    }
+    let mut edges = ResizeEdge::NONE;
+    if point.x <= band {
+        edges |= ResizeEdge::LEFT;
+    } else if point.x >= w - band {
+        edges |= ResizeEdge::RIGHT;
+    }
+    if point.y <= band {
+        edges |= ResizeEdge::TOP;
+    } else if point.y >= h - band {
+        edges |= ResizeEdge::BOTTOM;
+    }
+    (!edges.is_empty()).then_some(edges)
+}
+
+impl HeaderBar {
     pub fn pointer_enter(&mut self, loc: Point<f64, Logical>) {
         self.pointer_loc = Some(loc);
     }
@@ -806,6 +841,8 @@ impl WindowElement {
                 visibility: VisibilityState::default(),
                 last_frame: None,
                 panel_id: None,
+                snap_zone: None,
+                snap_grid: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
@@ -1038,17 +1075,30 @@ impl WindowElement {
     /// Returns the resize edge for a window-relative point, if the window can be
     /// interactively resized there.
     pub fn resize_edge_at(&self, point: Point<f64, Logical>) -> Option<ResizeEdge> {
-        if !self.is_ssd() || self.is_maximized() {
-            return None;
-        }
-        // Resolve the size before borrowing the decoration state: `geometry`
-        // itself reads that state and the `RefCell` borrow would overlap.
+        // Resolve everything that reads the decoration state before borrowing
+        // it, so the two borrows can't overlap.
+        let is_ssd = self.is_ssd();
         let size = self.geometry().size;
+        let maximized = self.is_maximized();
         let state = self.decoration_state();
         if state.header_bar.fullscreen {
             return None;
         }
-        state.header_bar.resize_edge(point, size)
+        // A plain maximized window (not part of a snap group) has no grip. A
+        // snapped window keeps its grip, because dragging it is what drives the
+        // compositor-owned group resize.
+        if maximized && state.snap_zone.is_none() {
+            return None;
+        }
+        if is_ssd {
+            state.header_bar.resize_edge(point, size)
+        } else {
+            // CSD windows in a snap group get an invisible compositor edge band
+            // so a drag on their border starts the unified group resize (the
+            // client, told it is maximized, won't resize itself).
+            state.snap_zone?;
+            resize_edge_band(point, size)
+        }
     }
 }
 
@@ -1135,7 +1185,12 @@ impl<B: Backend> AnvilState<B> {
         window: &WindowElement,
         edges: ResizeEdge,
         window_relative_location: Point<f64, Logical>,
-    ) -> Option<(Point<i32, Logical>, Size<i32, Logical>, Point<f64, Logical>)> {
+    ) -> Option<(
+        Point<i32, Logical>,
+        Size<i32, Logical>,
+        Point<f64, Logical>,
+        Option<Rectangle<i32, Logical>>,
+    )> {
         if !window.alive() || edges.is_empty() {
             return None;
         }
@@ -1143,6 +1198,7 @@ impl<B: Backend> AnvilState<B> {
         // snapped window stays in its group while resized, so `snap_restore`
         // (and the restore icon) is kept; only moving breaks the snap.
         window.decoration_state().animation = None;
+        let snap_area = self.snap_area_for(window);
         let initial_window_location = self.space.element_location(window)?;
         // Resizing works in surface (content) coordinates, so ignore the
         // decoration bounds that `SpaceElement::geometry` adds.
@@ -1161,7 +1217,12 @@ impl<B: Backend> AnvilState<B> {
             });
         }
 
-        Some((initial_window_location, initial_window_size, pointer_location))
+        Some((
+            initial_window_location,
+            initial_window_size,
+            pointer_location,
+            snap_area,
+        ))
     }
 
     /// Begin an interactive pointer resize of an SSD window from one of its edges.
@@ -1177,25 +1238,27 @@ impl<B: Backend> AnvilState<B> {
         button: u32,
         window_relative_location: Point<f64, Logical>,
     ) {
-        let Some((initial_window_location, initial_window_size, pointer_location)) =
+        let Some((initial_window_location, initial_window_size, pointer_location, snap_area)) =
             self.prepare_ssd_resize(&window, edges, window_relative_location)
         else {
             return;
         };
 
+        let mut resize = ResizeGrabState::new(
+            window,
+            edges,
+            initial_window_location,
+            initial_window_size,
+            pointer_location,
+        );
+        resize.set_snap_area(snap_area);
         let grab = PointerResizeSurfaceGrab {
             start_data: PointerGrabStartData {
                 focus: None,
                 button,
                 location: pointer_location,
             },
-            resize: ResizeGrabState::new(
-                window,
-                edges,
-                initial_window_location,
-                initial_window_size,
-                pointer_location,
-            ),
+            resize,
         };
 
         // `Focus::Clear` resets the cursor to the default arrow, so restore the
@@ -1222,25 +1285,27 @@ impl<B: Backend> AnvilState<B> {
         slot: TouchSlot,
         window_relative_location: Point<f64, Logical>,
     ) {
-        let Some((initial_window_location, initial_window_size, pointer_location)) =
+        let Some((initial_window_location, initial_window_size, pointer_location, snap_area)) =
             self.prepare_ssd_resize(&window, edges, window_relative_location)
         else {
             return;
         };
 
+        let mut resize = ResizeGrabState::new(
+            window,
+            edges,
+            initial_window_location,
+            initial_window_size,
+            pointer_location,
+        );
+        resize.set_snap_area(snap_area);
         let grab = TouchResizeSurfaceGrab {
             start_data: TouchGrabStartData {
                 focus: None,
                 slot,
                 location: pointer_location,
             },
-            resize: ResizeGrabState::new(
-                window,
-                edges,
-                initial_window_location,
-                initial_window_size,
-                pointer_location,
-            ),
+            resize,
         };
 
         let seat = self.seat.clone();

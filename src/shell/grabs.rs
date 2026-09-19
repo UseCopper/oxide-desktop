@@ -539,7 +539,132 @@ pub fn advance_resize_configure(window: &WindowElement, space: &mut Space<Window
     });
 }
 
-fn toplevel_min_max_size(window: &WindowElement) -> (Size<i32, Logical>, Size<i32, Logical>) {
+/// Drive a snap-group sibling to a new decorated rectangle using the same
+/// serialized resize pipeline as an interactive resize.
+///
+/// The sibling is not under a grab, so this seeds its `ResizeState::Resizing`
+/// (anchored on its current geometry and the divider-facing `edges`), publishes
+/// the intended size, and advances the configure pipeline. Its frame therefore
+/// follows its committed geometry instead of stretching.
+pub fn drive_sibling_resize(
+    window: &WindowElement,
+    space: &mut Space<WindowElement>,
+    edges: ResizeEdge,
+    target_rect: Rectangle<i32, Logical>,
+) {
+    if !window.alive() {
+        return;
+    }
+    let Some(surface) = window.wl_surface() else {
+        return;
+    };
+
+    let is_ssd = window.is_ssd();
+    let content = if is_ssd {
+        Size::from((
+            (target_rect.size.w - 2 * super::ssd::BORDER_WIDTH).max(1),
+            (target_rect.size.h - super::ssd::HEADER_BAR_HEIGHT - super::ssd::BORDER_WIDTH).max(1),
+        ))
+    } else {
+        target_rect.size
+    };
+
+    let Some(initial_location) = space.element_location(window) else {
+        return;
+    };
+    let initial_size = window.resize_content_size();
+
+    with_states(&surface, |states| {
+        if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+            let mut data = data.borrow_mut();
+            match &mut data.resize_state {
+                ResizeState::Resizing(resize) => {
+                    resize.last_window_size = content;
+                    resize.edges = edges;
+                }
+                _ => {
+                    let mut resize = ResizeData::new(edges, initial_location, initial_size);
+                    resize.last_window_size = content;
+                    data.resize_state = ResizeState::Resizing(resize);
+                }
+            }
+        }
+    });
+
+    advance_resize_configure(window, space);
+}
+
+/// Finish a driven sibling: leave `ResizeState::Resizing` and request the final
+/// size so it settles through the normal ack/commit machine.
+pub fn finish_sibling_resize(
+    window: &WindowElement,
+    space: &mut Space<WindowElement>,
+    serial: Serial,
+) {
+    let Some(surface) = window.wl_surface() else {
+        return;
+    };
+    let intended = with_states(&surface, |states| {
+        let data = states.data_map.get::<RefCell<SurfaceData>>()?;
+        let data = data.borrow();
+        match data.resize_state {
+            ResizeState::Resizing(resize) => Some(resize.last_window_size),
+            _ => None,
+        }
+    });
+    let Some(size) = intended else {
+        return;
+    };
+
+    match window.0.underlying_surface() {
+        WindowSurface::Wayland(toplevel) => {
+            toplevel.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Resizing);
+                state.size = Some(size);
+            });
+            let configure_serial = toplevel.send_pending_configure().unwrap_or(serial);
+            with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                    let mut data = data.borrow_mut();
+                    if let ResizeState::Resizing(resize_data) = data.resize_state {
+                        data.resize_state =
+                            ResizeState::WaitingForFinalAck(resize_data, configure_serial);
+                    }
+                }
+            });
+        }
+        #[cfg(feature = "xwayland")]
+        WindowSurface::X11(x11) => {
+            let Some(current) = space.element_location(window) else {
+                return;
+            };
+            let (edges, initial_loc, initial_size) = with_states(&surface, |states| {
+                let data = states.data_map.get::<RefCell<SurfaceData>>()?;
+                match &data.borrow().resize_state {
+                    ResizeState::Resizing(resize) => {
+                        Some((resize.edges, resize.initial_window_location, resize.initial_window_size))
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or((ResizeEdge::NONE, current, size));
+            let location = resize_target_location(edges, initial_loc, initial_size, size, current);
+            if let Err(err) = x11.configure_with_sync(Rectangle::new(location, size), None) {
+                tracing::warn!(?err, "Failed to configure X11 sibling window");
+            }
+            with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                    let mut data = data.borrow_mut();
+                    if let ResizeState::Resizing(resize_data) = data.resize_state {
+                        data.resize_state = ResizeState::WaitingForCommit(resize_data);
+                    }
+                }
+            });
+        }
+    }
+}
+
+pub fn toplevel_min_max_size(window: &WindowElement) -> (Size<i32, Logical>, Size<i32, Logical>) {
     if let Some(surface) = window.wl_surface() {
         with_states(&surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceCachedState>();
@@ -567,6 +692,7 @@ pub struct ResizeGrabState {
     initial_window_size: Size<i32, Logical>,
     start_location: Point<f64, Logical>,
     pointer: Point<f64, Logical>,
+    snap_area: Option<Rectangle<i32, Logical>>,
 }
 
 impl ResizeGrabState {
@@ -578,6 +704,7 @@ impl ResizeGrabState {
         start_location: Point<f64, Logical>,
     ) -> Self {
         Self {
+            snap_area: None,
             window,
             edges,
             initial_window_location,
@@ -585,6 +712,10 @@ impl ResizeGrabState {
             start_location,
             pointer: start_location,
         }
+    }
+
+    pub fn set_snap_area(&mut self, area: Option<Rectangle<i32, Logical>>) {
+        self.snap_area = area;
     }
 
     /// Remember the latest pointer position. The heavy work happens once per
@@ -625,6 +756,17 @@ impl ResizeGrabState {
         let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
         width = width.max(min_width).min(max_width);
         height = height.max(min_height).min(max_height);
+
+        // If this window is snapped, move the group dividers to match the
+        // intended size so siblings re-flow with it.
+        if let Some(area) = self.snap_area {
+            data.split_resize_neighbours_from_intent(
+                &self.window,
+                area,
+                self.edges,
+                (width, height).into(),
+            );
+        }
 
         publish_resize_size(&self.window, (width, height).into());
         advance_resize_configure(&self.window, &mut data.space);
@@ -696,6 +838,9 @@ impl ResizeGrabState {
                 });
             }
         }
+
+        // Finalize the siblings that were driven along with this resize.
+        data.finish_group_resizes(&self.window, serial);
     }
 }
 
