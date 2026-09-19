@@ -3,7 +3,8 @@ use smithay::{
         Color32F, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
-            AsRenderElements, RenderElement, Wrap,
+            AsRenderElements, Kind, RenderElement, Wrap,
+            solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::WaylandSurfaceRenderElement,
             utils::{
                 ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
@@ -15,14 +16,18 @@ use smithay::{
         ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements, constrain_space_element,
     },
     output::Output,
-    utils::{Point, Rectangle, Size},
+    utils::{Logical, Point, Rectangle, Scale, Size},
+    wayland::shell::wlr_layer::Layer,
 };
 
 #[cfg(feature = "debug")]
 use crate::drawing::FpsElement;
 use crate::{
     drawing::{CLEAR_COLOR, CLEAR_COLOR_FULLSCREEN, PointerRenderElement},
-    shell::{FullscreenSurface, WindowElement, WindowRenderElement},
+    shell::{
+        FullscreenSurface, SNAP_PREVIEW_ALPHA, SnapPreviewState, WindowElement, preview_color,
+        WindowRenderElement,
+    },
 };
 
 smithay::backend::renderer::element::render_elements! {
@@ -55,6 +60,7 @@ smithay::backend::renderer::element::render_elements! {
     Space=SpaceRenderElements<R, E>,
     Window=Wrap<E>,
     Custom=CustomRenderElements<R>,
+    SnapPreview=SolidColorRenderElement,
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
 }
 
@@ -66,6 +72,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Space(arg0) => f.debug_tuple("Space").field(arg0).finish(),
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Custom(arg0) => f.debug_tuple("Custom").field(arg0).finish(),
+            Self::SnapPreview(arg0) => f.debug_tuple("SnapPreview").field(arg0).finish(),
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
@@ -138,6 +145,22 @@ where
         })
 }
 
+/// The active snap preview for `output` (translated into output-local logical
+/// coordinates) and its current fade alpha.
+fn snap_preview(
+    output: &Output,
+    space: &Space<WindowElement>,
+) -> Option<(Rectangle<i32, Logical>, f32)> {
+    let preview = output.user_data().get::<SnapPreviewState>()?;
+    let alpha = preview.alpha();
+    if alpha <= 0.0 {
+        return None;
+    }
+    let rect = preview.get()?;
+    let geo = space.output_geometry(output)?;
+    Some((Rectangle::new(rect.loc - geo.loc, rect.size), alpha))
+}
+
 #[profiling::function]
 pub fn output_elements<R>(
     output: &Output,
@@ -155,25 +178,94 @@ where
         .get::<FullscreenSurface>()
         .and_then(|f| f.get())
     {
-        let scale = output.current_scale().fractional_scale().into();
-        let window_render_elements: Vec<WindowRenderElement<R>> =
-            AsRenderElements::<R>::render_elements(&window, renderer, (0, 0).into(), scale, 1.0);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let layer_map = smithay::desktop::layer_map_for_output(output);
+        // A Top layer (e.g. the panel) is hidden while a window is fullscreen,
+        // like most compositors do. Overlay layers (notifications, OSDs) stay
+        // above the fullscreen window; everything else is drawn behind it.
+        let (overlay, below): (Vec<_>, Vec<_>) = layer_map
+            .layers()
+            .rev()
+            .filter(|surface| surface.layer() != Layer::Top)
+            .partition(|surface| surface.layer() == Layer::Overlay);
 
-        let elements = custom_elements
+        let mut elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
-            .chain(
-                window_render_elements
-                    .into_iter()
-                    .map(|e| OutputRenderElements::Window(Wrap::from(e))),
-            )
             .collect::<Vec<_>>();
+
+        for surface in overlay {
+            let Some(geo) = layer_map.layer_geometry(surface) else {
+                continue;
+            };
+            elements.extend(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
+                    renderer,
+                    geo.loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
+            );
+        }
+
+        // Draw the fullscreen window at the output origin so it covers the
+        // whole output; the client is configured to the full output size.
+        let window_render_elements: Vec<WindowRenderElement<R>> = AsRenderElements::<R>::render_elements(
+            &window,
+            renderer,
+            Point::from((0, 0)),
+            scale,
+            1.0,
+        );
+        elements.extend(
+            window_render_elements
+                .into_iter()
+                .map(|e| OutputRenderElements::Window(Wrap::from(e))),
+        );
+
+        for surface in below {
+            let Some(geo) = layer_map.layer_geometry(surface) else {
+                continue;
+            };
+            elements.extend(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
+                    renderer,
+                    geo.loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
+            );
+        }
+
         (elements, CLEAR_COLOR_FULLSCREEN)
     } else {
         let mut output_render_elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
+
+        // The snap preview sits just behind the cursor and above the windows,
+        // so it highlights the target area without being hidden by them.
+        if let Some((rect, alpha)) = snap_preview(output, space) {
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let [red, green, blue] = preview_color();
+            let buffer = SolidColorBuffer::new(rect.size, [red, green, blue, 1.0]);
+            output_render_elements.push(OutputRenderElements::SnapPreview(
+                SolidColorRenderElement::from_buffer(
+                    &buffer,
+                    rect.loc.to_physical_precise_round(scale),
+                    scale,
+                    alpha * SNAP_PREVIEW_ALPHA,
+                    Kind::Unspecified,
+                ),
+            ));
+        }
 
         if show_window_preview && space.elements_for_output(output).count() > 0 {
             output_render_elements.extend(space_preview_elements(renderer, space, output));

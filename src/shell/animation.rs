@@ -199,6 +199,15 @@ impl WindowAnimation {
         (elapsed / self.duration.as_secs_f64()).clamp(0.0, 1.0)
     }
 
+    /// Pin the animation's location to `loc`, leaving the content interpolation
+    /// untouched. Used when an interactive drag ends mid-transition: the window
+    /// stays where it was dropped instead of sliding to the original target
+    /// while its size finishes animating.
+    pub fn pin_location(&mut self, loc: Point<f64, Logical>) {
+        self.start.loc = loc;
+        self.end.loc = loc;
+    }
+
     /// The interpolated geometry at `now`, along with the eased progress in
     /// `0.0..=1.0`. The same eased value drives the crossfade so the fade and
     /// the geometry move at the same rate.
@@ -267,6 +276,17 @@ mod tests {
             assert!((open.0 - close.0).abs() < 1e-6);
             assert!((open.1 - close.1).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn pinning_location_keeps_size_interpolation() {
+        let start = WindowRect::from_geometry((0, 0).into(), (100, 100).into());
+        let end = WindowRect::from_geometry((200, 200).into(), (50, 50).into());
+        let mut animation = WindowAnimation::new(start, end, Duration::from_millis(100));
+        animation.pin_location((10.0, 20.0).into());
+        let (rect, _) = animation.sample(Instant::now());
+        assert_eq!(rect.loc, Point::from((10.0, 20.0)));
+        assert!(rect.content.w <= 100.0 && rect.content.w >= 50.0);
     }
 
     #[test]

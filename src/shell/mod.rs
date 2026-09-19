@@ -21,19 +21,20 @@ use smithay::{
         },
     },
     desktop::{
-        LayerSurface, PopupKind, PopupManager, Space, WindowSurfaceType, layer_map_for_output,
-        space::SpaceElement,
+        LayerSurface, PopupKind, PopupManager, Space, WindowSurface, WindowSurfaceType,
+        layer_map_for_output, space::SpaceElement,
     },
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::Output,
     reexports::{
         calloop::Interest,
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Client, Resource,
             protocol::{wl_buffer::WlBuffer, wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Size, Transform},
+    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -61,6 +62,7 @@ use crate::{
 mod animation;
 mod element;
 mod grabs;
+mod snap;
 pub(crate) mod ssd;
 #[cfg(feature = "xwayland")]
 mod x11;
@@ -69,13 +71,21 @@ mod xdg;
 pub use self::animation::*;
 pub use self::element::*;
 pub use self::grabs::*;
+pub use self::snap::*;
 
 use self::ssd::{
     BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, SurfaceFrame,
     VisibilityState,
 };
 
-use self::xdg::handle_toplevel_commit;
+use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
+
+thread_local! {
+    /// A freshly mapped window waiting for keyboard focus. `place_new_window`
+    /// runs with only a `Space`, so the actual focus is applied by
+    /// [`AnvilState::focus_new_windows`] right after.
+    static PENDING_FOCUS: RefCell<Option<WindowElement>> = const { RefCell::new(None) };
+}
 
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
@@ -308,6 +318,17 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
+    /// Give keyboard focus to any window `place_new_window` just mapped.
+    pub fn focus_new_windows(&mut self) {
+        let window = PENDING_FOCUS.with(|cell| cell.borrow_mut().take());
+        let Some(window) = window else {
+            return;
+        };
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, Some(window.into()), SERIAL_COUNTER.next_serial());
+        }
+    }
+
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
         self.space
             .elements()
@@ -338,6 +359,441 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         window.decoration_state().animation =
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
+    }
+
+    /// Pin any in-flight transition of `window` to its current location. Called
+    /// when an interactive drag ends so the window stays where it was dropped
+    /// while the size transition finishes.
+    pub fn pin_window_animation(&self, window: &WindowElement) {
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
+        if let Some(animation) = window.decoration_state().animation.as_mut() {
+            animation.pin_location(loc.to_f64());
+        }
+    }
+
+    /// Resolve the snap target under `global`. `exclude` is the window being
+    /// dragged: it is ignored when deciding whether the bottom half is
+    /// occupied, which is what turns a top-edge slam into a top-half snap
+    /// instead of fullscreen.
+    pub fn snap_zone_at(
+        &self,
+        global: Point<f64, Logical>,
+        exclude: Option<&WindowElement>,
+    ) -> Option<SnapTarget> {
+        let output = self.space.output_under(global).next().cloned()?;
+        let area = output_work_area(&self.space, &output)?;
+        let mut zone = snap::zone_at(area, global)?;
+        if zone == SnapZone::TopHalf && !self.bottom_half_occupied(&output, area, exclude) {
+            zone = SnapZone::Maximize;
+        }
+        Some(SnapTarget {
+            output,
+            area,
+            zone,
+        })
+    }
+
+    /// Whether any window other than `exclude` currently fills the bottom half
+    /// of `area` on `output`.
+    fn bottom_half_occupied(
+        &self,
+        output: &Output,
+        area: Rectangle<i32, Logical>,
+        exclude: Option<&WindowElement>,
+    ) -> bool {
+        const TOLERANCE: i32 = 4;
+        let target = SnapZone::BottomHalf.rect(area);
+        self.space.elements_for_output(output).any(|window| {
+            if window.is_ghosting() || exclude == Some(window) {
+                return false;
+            }
+            let Some(loc) = self.space.element_location(window) else {
+                return false;
+            };
+            let size = window.geometry().size;
+            (loc.x - target.loc.x).abs() <= TOLERANCE
+                && (loc.y - target.loc.y).abs() <= TOLERANCE
+                && (size.w - target.size.w).abs() <= TOLERANCE
+                && (size.h - target.size.h).abs() <= TOLERANCE
+        })
+    }
+
+    /// Record the snap zone under the pointer. Whenever the zone changes the
+    /// dwell timer restarts and any preview starts fading out; the preview for
+    /// the new zone is shown by [`Self::tick_snap_preview`] once the pointer
+    /// has stayed there long enough.
+    pub fn note_snap_target(&mut self, target: Option<SnapTarget>) {
+        if self.snap_candidate.as_ref() == target.as_ref() {
+            return;
+        }
+        self.snap_candidate = target;
+        self.snap_candidate_since = Instant::now();
+        // Fade out whatever was showing; the new zone fades in after the dwell.
+        self.hide_snap_preview();
+    }
+
+    /// Fade every snap preview out.
+    fn hide_snap_preview(&self) {
+        for output in self.space.outputs() {
+            if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                preview.hide();
+            }
+        }
+    }
+
+    /// Drop the snap candidate and fade the preview out.
+    pub fn clear_snap_preview(&mut self) {
+        self.snap_candidate = None;
+        self.hide_snap_preview();
+    }
+
+    /// Advance the snap preview: show it once the pointer has dwelled in the
+    /// current zone for long enough, and fade all previews toward their target.
+    pub fn tick_snap_preview(&mut self, now: Instant) {
+        let dwelled = self.snap_candidate.is_some()
+            && now.saturating_duration_since(self.snap_candidate_since) >= SNAP_PREVIEW_DWELL;
+        let show = if dwelled {
+            self.snap_candidate.clone()
+        } else {
+            None
+        };
+
+        for output in self.space.outputs() {
+            if let Some(target) = show.as_ref().filter(|target| target.output == *output) {
+                output
+                    .user_data()
+                    .insert_if_missing(SnapPreviewState::default);
+                // Preview the cell the window will actually occupy: reuse the
+                // group's current divider grid so the box matches the result,
+                // not a freshly centered zone.
+                let grid = self
+                    .group_grid(output)
+                    .unwrap_or_else(|| SnapGrid::centered(target.area));
+                if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                    preview.show(grid.rect(target.zone, target.area));
+                }
+            }
+            if let Some(preview) = output.user_data().get::<SnapPreviewState>() {
+                preview.tick(now);
+            }
+        }
+    }
+
+    /// Tile `window` into `target`'s zone. The top zone hands off to the
+    /// titlebar maximize button's behaviour; every other zone configures the
+    /// client to the zone and animates the frame into place, remembering the
+    /// floating geometry so a later drag can restore it.
+    pub fn apply_snap(&mut self, window: &WindowElement, target: &SnapTarget) {
+        if window.is_ghosting() || self.space.element_location(window).is_none() {
+            return;
+        }
+        if target.zone == SnapZone::Maximize {
+            self.toggle_maximize(window.clone());
+            return;
+        }
+        // A fullscreen window covers the output; there is nothing to tile.
+        if window.decoration_state().header_bar.fullscreen {
+            return;
+        }
+
+        // Join the group already on this output: reuse its divider grid (which a
+        // resize may have moved) so the new window lands in the existing layout
+        // rather than a freshly centered one.
+        let grid = self.group_grid(&target.output).unwrap_or_else(|| SnapGrid::centered(target.area));
+        // Tile to exactly the rectangle the preview showed, so the two never
+        // disagree on odd work-area sizes.
+        let rect = grid.rect(target.zone, target.area);
+        if window.decoration_state().header_bar.snap_restore.is_none() {
+            window.decoration_state().header_bar.snap_restore =
+                relative_geometry_of_output(&self.space, &target.output, window);
+        }
+        window.decoration_state().snap_zone = Some(target.zone);
+        window.decoration_state().snap_grid = Some(grid);
+        let animated = self.configure_snapped(window, rect, true);
+        self.animate_window(window, animated, rect.loc);
+    }
+
+    /// The divider grid shared by the snapped windows on `output`, if any.
+    fn group_grid(&self, output: &Output) -> Option<SnapGrid> {
+        self.space
+            .elements_for_output(output)
+            .find_map(|window| window.decoration_state().snap_grid)
+    }
+
+    /// Restore a snapped window to its floating geometry at `loc`, animating
+    /// the transition like an unmaximize. `content` is the undecorated client
+    /// size.
+    pub fn restore_snapped(
+        &mut self,
+        window: &WindowElement,
+        loc: Point<i32, Logical>,
+        content: Size<i32, Logical>,
+    ) {
+        // Restoring supersedes the snap, so stop treating it as tiled.
+        window.decoration_state().snap_zone = None;
+        window.decoration_state().snap_grid = None;
+        let is_ssd = window.is_ssd();
+        let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
+        self.configure_snapped(window, rect, false);
+        self.space.map_element(window.clone(), loc, true);
+        self.animate_window(window, content, loc);
+    }
+
+    /// The work area `window` is snapped into, or `None` when it floats.
+    pub fn snap_area_for(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
+        if window.decoration_state().header_bar.snap_restore.is_none() {
+            return None;
+        }
+        let output = output_for_window(&self.space, window)?;
+        output_work_area(&self.space, &output)
+    }
+
+    /// The edges a sibling in `zone` moves when the group divider changes: the
+    /// divider-facing edge(s) of its cell.
+    /// Push a moved division edge to the zones across it, reconfiguring
+    /// neighbours from the updated grid. Called from the resize grab each frame.
+    pub fn split_resize_neighbours_from_intent(
+        &mut self,
+        window: &WindowElement,
+        area: Rectangle<i32, Logical>,
+        edges: ResizeEdge,
+        intended_size: Size<i32, Logical>,
+    ) {
+        let Some(zone) = window.decoration_state().snap_zone else {
+            return;
+        };
+        let Some(grid) = window.decoration_state().snap_grid else {
+            return;
+        };
+        if zone == SnapZone::Maximize {
+            return;
+        }
+
+        let dragged = Edges {
+            left: edges.intersects(ResizeEdge::LEFT),
+            right: edges.intersects(ResizeEdge::RIGHT),
+            top: edges.intersects(ResizeEdge::TOP),
+            bottom: edges.intersects(ResizeEdge::BOTTOM),
+        };
+        // The grid dividers live in work-area (decorated) coordinates, but the
+        // resize intent is a *content* size. Grow it by the SSD chrome so the
+        // divider lands where the decorated frame will be.
+        let decorated = self::xdg::decorated_content_size(intended_size, window.is_ssd());
+        let grid = grid.with_dragged_edges(zone, area, dragged, decorated);
+        // Stop the whole group if any member can't shrink enough to fit its new
+        // cell: clamp the divider so every present member stays at or above its
+        // minimum size.
+        let grid = self.clamp_grid_to_minimums(grid, area, window);
+        window.decoration_state().snap_grid = Some(grid);
+        self.reflow_group(window, grid, area);
+    }
+
+    /// Clamp the moved dividers so no present member's cell is smaller than that
+    /// member's minimum decorated size. Returns the adjusted grid.
+    fn clamp_grid_to_minimums(
+        &self,
+        grid: SnapGrid,
+        area: Rectangle<i32, Logical>,
+        resizing: &WindowElement,
+    ) -> SnapGrid {
+        let mut grid = grid;
+        let members: Vec<(WindowElement, SnapZone)> = self
+            .space
+            .elements()
+            .filter(|other| {
+                !other.is_ghosting()
+                    && other.decoration_state().snap_zone.is_some()
+                    && other.decoration_state().snap_grid.is_some()
+            })
+            .filter_map(|other| {
+                let zone = other.decoration_state().snap_zone?;
+                Some((other.clone(), zone))
+            })
+            .collect();
+
+        let left = area.loc.x;
+        let top = area.loc.y;
+        let right = area.loc.x + area.size.w;
+        let bottom = area.loc.y + area.size.h;
+
+        for (member, zone) in &members {
+            if member == resizing {
+                // The dragged window's own min is already applied to its size.
+                continue;
+            }
+            let (min_size, _) = self::grabs::toplevel_min_max_size(member);
+            let is_ssd = member.is_ssd();
+            let deco = if is_ssd {
+                self::xdg::decorated_content_size(Size::from((0, 0)), true)
+            } else {
+                Size::from((0, 0))
+            };
+            let min_w = min_size.w + deco.w;
+            let min_h = min_size.h + deco.h;
+
+            // A left cell's width is (grid.x - left); a right cell's is
+            // (right - grid.x). Same on the other axis.
+            if !zone.spans_width() && min_w > 0 {
+                if zone.left_of_center() {
+                    // grid.x must be at least left + min_w.
+                    grid.x = grid.x.max(left + min_w);
+                } else {
+                    grid.x = grid.x.min(right - min_w);
+                }
+            }
+            if !zone.spans_height() && min_h > 0 {
+                if zone.above_center() {
+                    grid.y = grid.y.max(top + min_h);
+                } else {
+                    grid.y = grid.y.min(bottom - min_h);
+                }
+            }
+        }
+
+        // Keep the dividers inside the area after clamping.
+        grid.x = grid.x.clamp(left + 1, right - 1);
+        grid.y = grid.y.clamp(top + 1, bottom - 1);
+        grid
+    }
+
+    /// The edges a sibling in `zone` moves when the group divider changes: the
+    /// divider-facing edge(s) of its cell.
+    fn sibling_edges(zone: SnapZone) -> ResizeEdge {
+        let mut edges = ResizeEdge::NONE;
+        if zone.left_of_center() && !zone.right_of_center() {
+            edges |= ResizeEdge::RIGHT;
+        } else if zone.right_of_center() && !zone.left_of_center() {
+            edges |= ResizeEdge::LEFT;
+        }
+        if zone.above_center() && !zone.below_center() {
+            edges |= ResizeEdge::BOTTOM;
+        } else if zone.below_center() && !zone.above_center() {
+            edges |= ResizeEdge::TOP;
+        }
+        edges
+    }
+
+    /// Push a moved division edge to the zones across it, reconfiguring
+    /// neighbours from the updated grid.
+    fn reflow_group(
+        &mut self,
+        window: &WindowElement,
+        grid: SnapGrid,
+        area: Rectangle<i32, Logical>,
+    ) {
+        let members: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|other| {
+                !other.is_ghosting()
+                    && other.decoration_state().snap_grid.is_some()
+                    && other.decoration_state().snap_zone.is_some()
+            })
+            .cloned()
+            .collect();
+
+        for other in members {
+            if &other == window {
+                continue;
+            }
+            if other.decoration_state().header_bar.fullscreen {
+                continue;
+            }
+            let Some(zone) = other.decoration_state().snap_zone else {
+                continue;
+            };
+            let rect = grid.rect(zone, area);
+            other.decoration_state().snap_grid = Some(grid);
+            let edges = Self::sibling_edges(zone);
+            self::grabs::drive_sibling_resize(&other, &mut self.space, edges, rect);
+        }
+    }
+
+    /// Finalize every sibling that was driven along with `window`'s resize, so
+    /// they leave the special `Resizing` state and settle on their final size.
+    pub fn finish_group_resizes(&mut self, window: &WindowElement, serial: Serial) {
+        let members: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|other| {
+                !other.is_ghosting()
+                    && other.decoration_state().snap_grid.is_some()
+                    && other.decoration_state().snap_zone.is_some()
+            })
+            .cloned()
+            .collect();
+        for other in members {
+            if &other == window || other.decoration_state().header_bar.fullscreen {
+                continue;
+            }
+            self::grabs::finish_sibling_resize(&other, &mut self.space, serial);
+        }
+    }
+    /// return the window origin the drag should start from, keeping the pointer
+    /// over the same spot on the titlebar. Returns `None` for a floating
+    /// window. Used by the client-initiated move grabs.
+    pub fn take_snap_restore_for_drag(
+        &mut self,
+        window: &WindowElement,
+        pointer_global: Point<f64, Logical>,
+    ) -> Option<Point<i32, Logical>> {
+        let rel = window.decoration_state().header_bar.snap_restore.take()?;
+        let current_loc = self.space.element_location(window)?;
+        let decorated_size = self
+            .space
+            .element_geometry(window)
+            .map(|geo| geo.size)
+            .unwrap_or_default();
+        let (_, content) = absolute_geometry(&self.space, window, rel)?;
+        let restored = self::xdg::restore_drag_location(
+            current_loc,
+            decorated_size,
+            pointer_global,
+            Some(content),
+            window.is_ssd(),
+        );
+        self.restore_snapped(window, restored, content);
+        Some(restored)
+    }
+
+    /// Configure `window`'s client to occupy the decorated rectangle `rect`.
+    /// Wayland clients are given the undecorated content size; X11's
+    /// `configure` takes the frame rectangle directly. Returns the size to
+    /// animate the frame to. When `maximized` is true the Wayland client is
+    /// also told it is in maximized state (so CSD apps tile correctly).
+    fn configure_snapped(
+        &mut self,
+        window: &WindowElement,
+        rect: Rectangle<i32, Logical>,
+        maximized: bool,
+    ) -> Size<i32, Logical> {
+        let is_ssd = window.is_ssd();
+        let content = undecorated_content_size(rect.size, is_ssd);
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|state| {
+                    if maximized {
+                        state.states.set(xdg_toplevel::State::Maximized);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                    }
+                    state.size = Some(content);
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+                content
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => {
+                if let Err(err) = surface.configure(rect) {
+                    tracing::warn!(?err, "Failed to configure snapped X11 window");
+                }
+                rect.size
+            }
+        }
     }
 
     /// Advance every in-flight window animation. Called once per frame before
@@ -374,7 +830,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
             ));
-            if self.space.element_location(window) != Some(loc) {
+            // While a client move grab owns the window, it drives the position;
+            // the animation only supplies the (shrinking) size.
+            let being_dragged = self.dragging_window.as_ref() == Some(window);
+            if !being_dragged && self.space.element_location(window) != Some(loc) {
                 self.space.relocate_element(window, loc);
             }
             // Once the curve is done, keep the animation (which holds the window
@@ -397,6 +856,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
 
         self.tick_visibility_animations(&windows, now);
+        self.tick_snap_preview(now);
+        #[cfg(feature = "panel")]
+        self.tick_panel();
     }
 
     /// Advance every window's open/close transition: start opens that were
@@ -817,48 +1279,45 @@ fn place_new_window(
     window: &WindowElement,
     activate: bool,
 ) {
-    // place the window at a random location on same output as pointer
-    // or if there is not output in a [0;800]x[0;800] square
-    use rand::distributions::{Distribution, Uniform};
-
+    // Center the window on the output under the pointer (the monitor the mouse
+    // is on), falling back to the first output, then a fixed area.
     let output = space
         .output_under(pointer_location)
         .next()
         .or_else(|| space.outputs().next())
         .cloned();
-    let output_geometry = output
-        .and_then(|o| {
-            let geo = space.output_geometry(&o)?;
-            let map = layer_map_for_output(&o);
-            let zone = map.non_exclusive_zone();
-            Some(Rectangle::new(geo.loc + zone.loc, zone.size))
-        })
+    let area = output
+        .as_ref()
+        .and_then(|output| output_work_area(space, output))
         .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
 
-    // set the initial toplevel bounds
+    // Set the initial toplevel bounds.
     #[allow(irrefutable_let_patterns)]
     if let Some(toplevel) = window.0.toplevel() {
         toplevel.with_pending_state(|state| {
-            state.bounds = Some(output_geometry.size);
+            state.bounds = Some(area.size);
         });
     }
 
-    // Guard against tiny outputs where the random range would be empty (panics in `Uniform::new`).
-    let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
-    let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let mut rng = rand::thread_rng();
-    let x = if max_x > output_geometry.loc.x {
-        Uniform::new(output_geometry.loc.x, max_x).sample(&mut rng)
-    } else {
-        output_geometry.loc.x
-    };
-    let y = if max_y > output_geometry.loc.y {
-        Uniform::new(output_geometry.loc.y, max_y).sample(&mut rng)
-    } else {
-        output_geometry.loc.y
-    };
+    // `geometry()` is the decorated size, so the whole frame ends up centered.
+    let size = window.geometry().size;
+    let location = Point::from((
+        area.loc.x + (area.size.w - size.w).max(0) / 2,
+        area.loc.y + (area.size.h - size.h).max(0) / 2,
+    ));
+    space.map_element(window.clone(), location, activate);
 
-    space.map_element(window.clone(), (x, y), activate);
+    // `map_element(.., true)` only sets the xdg activated state; give the
+    // window the actual keyboard focus too.
+    if activate {
+        state_focus(space, window);
+    }
+}
+
+/// Hand `window` to [`AnvilState::focus_new_windows`], which applies the real
+/// keyboard focus. `place_new_window` only has a `Space`, so it can't do it here.
+fn state_focus(_space: &Space<WindowElement>, window: &WindowElement) {
+    PENDING_FOCUS.with(|cell| *cell.borrow_mut() = Some(window.clone()));
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {
@@ -922,11 +1381,35 @@ fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool 
 
 /// The area of an output that floating windows are laid out within, i.e. its
 /// geometry minus any layer-shell exclusive zones (panels, docks, ...).
-fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
+pub fn output_work_area(space: &Space<WindowElement>, output: &Output) -> Option<Rectangle<i32, Logical>> {
     let geo = space.output_geometry(output)?;
-    let zone = layer_map_for_output(output).non_exclusive_zone();
+    // Refresh the exclusive zones: a layer surface may have changed its
+    // reserved edge since the last arrange.
+    let mut map = layer_map_for_output(output);
+    map.arrange();
+    let zone = map.non_exclusive_zone();
     let area = Rectangle::new(geo.loc + zone.loc, zone.size);
     (area.size.w > 0 && area.size.h > 0).then_some(area)
+}
+
+/// Clamp a dragged window's proposed top-left so its titlebar can't be moved
+/// under a layer-shell exclusive zone (e.g. a top panel), keeping it grabbable.
+/// The output under `pointer` decides which work area applies.
+pub fn clamp_window_position(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    pointer: Point<f64, Logical>,
+    proposed: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    let output = space
+        .output_under(pointer)
+        .next()
+        .cloned()
+        .or_else(|| output_for_window(space, window));
+    let Some(area) = output.and_then(|output| output_work_area(space, &output)) else {
+        return proposed;
+    };
+    Point::from((proposed.x, proposed.y.max(area.loc.y)))
 }
 
 /// The output a window belongs to.
@@ -1044,6 +1527,7 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
     let Some(output_geo) = space.output_geometry(output) else {
         return;
     };
+    let work_area = output_work_area(space, output).unwrap_or(output_geo);
 
     let windows: Vec<WindowElement> = space.elements_for_output(output).cloned().collect();
     for window in windows {
@@ -1056,23 +1540,39 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
         if let Some(toplevel) = window.0.toplevel() {
             let fullscreen = window.decoration_state().header_bar.fullscreen;
             if fullscreen {
-                let size = self::xdg::fullscreen_content_size(output_geo.size, window.is_ssd());
+                let size = self::xdg::fullscreen_content_size(work_area.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                     state.size = Some(size);
                 });
                 toplevel.send_configure();
-                space.map_element(window, output_geo.loc, false);
+                space.map_element(window, work_area.loc, false);
+                continue;
+            }
+            // A snapped window is reconfigured to its cell in the new work
+            // area, not maximized to the whole output.
+            let snap_zone = window.decoration_state().snap_zone;
+            if let Some(zone) = snap_zone {
+                let grid = SnapGrid::centered(work_area);
+                let rect = grid.rect(zone, work_area);
+                window.decoration_state().snap_grid = Some(grid);
+                let content = self::xdg::undecorated_content_size(rect.size, window.is_ssd());
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                    state.size = Some(content);
+                });
+                toplevel.send_configure();
+                space.map_element(window, rect.loc, false);
                 continue;
             }
             if window.is_maximized() {
-                let size = self::xdg::maximize_content_size(output_geo.size, window.is_ssd());
+                let size = self::xdg::maximize_content_size(work_area.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);
                     state.size = Some(size);
                 });
                 toplevel.send_configure();
-                space.map_element(window, output_geo.loc, false);
+                space.map_element(window, work_area.loc, false);
                 continue;
             }
         }

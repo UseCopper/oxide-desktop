@@ -3,7 +3,7 @@ use std::os::unix::io::OwnedFd;
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tracing::{info, warn};
@@ -111,7 +111,7 @@ use smithay::{
 use crate::cursor::Cursor;
 use crate::{
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::{WindowElement, ssd::SSDDrag},
+    shell::{SnapTarget, WindowElement, ssd::SSDDrag},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -197,6 +197,21 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     pub minimized: Vec<(WindowElement, Point<i32, Logical>)>,
     pub ssd_drag: Option<SSDDrag>,
+    /// The window being moved by a client-initiated move grab, if any. While
+    /// set, `tick_animations` leaves its position to the grab so an in-flight
+    /// unmaximize transition only animates its size.
+    pub dragging_window: Option<WindowElement>,
+    /// The snap zone the pointer is currently over, and when it entered it.
+    /// The preview is only shown once the pointer has dwelled here long enough.
+    pub snap_candidate: Option<SnapTarget>,
+    pub snap_candidate_since: Instant,
+    /// The panel connection, when the panel feature is enabled and it bound
+    /// successfully.
+    #[cfg(feature = "panel")]
+    pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
+    /// Counter for assigning stable panel ids to windows.
+    #[cfg(feature = "panel")]
+    pub next_panel_id: u64,
 }
 
 #[derive(Debug)]
@@ -784,7 +799,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         #[cfg(feature = "xwayland")]
         XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
-        AnvilState {
+        let mut state = AnvilState {
             backend_data,
             display_handle: dh,
             socket_name,
@@ -836,7 +851,19 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             show_window_preview: false,
             minimized: Vec::new(),
             ssd_drag: None,
-        }
+            dragging_window: None,
+            snap_candidate: None,
+            snap_candidate_since: Instant::now(),
+            #[cfg(feature = "panel")]
+            panel_ipc: None,
+            #[cfg(feature = "panel")]
+            next_panel_id: 1,
+        };
+
+        #[cfg(feature = "panel")]
+        crate::panel_ipc::spawn_panel(&mut state);
+
+        state
     }
 
     #[cfg(feature = "xwayland")]

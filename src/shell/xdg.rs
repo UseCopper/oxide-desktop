@@ -15,7 +15,7 @@ use smithay::{
             protocol::{wl_output, wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER, Serial, Size},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER as SCOUNTER, Serial, Size},
     wayland::{
         compositor::with_states,
         seat::WaylandFocus,
@@ -67,10 +67,43 @@ pub(crate) fn maximize_content_size(output: Size<i32, Logical>, is_ssd: bool) ->
     }
 }
 
+/// Grow an undecorated content size into the full decorated size the SSD frame
+/// occupies. Used when configuring X11 clients, whose `configure` takes the
+/// frame rectangle rather than the content size.
+pub(crate) fn decorated_content_size(
+    content: Size<i32, Logical>,
+    is_ssd: bool,
+) -> Size<i32, Logical> {
+    if is_ssd {
+        Size::from((
+            content.w + 2 * BORDER_WIDTH,
+            content.h + HEADER_BAR_HEIGHT + BORDER_WIDTH,
+        ))
+    } else {
+        content
+    }
+}
+
+/// Shrink a decorated rectangle's size back to the client's undecorated content
+/// size. Inverse of [`decorated_content_size`].
+pub(crate) fn undecorated_content_size(
+    decorated: Size<i32, Logical>,
+    is_ssd: bool,
+) -> Size<i32, Logical> {
+    if is_ssd {
+        Size::from((
+            (decorated.w - 2 * BORDER_WIDTH).max(1),
+            (decorated.h - HEADER_BAR_HEIGHT - BORDER_WIDTH).max(1),
+        ))
+    } else {
+        decorated
+    }
+}
+
 /// Where to anchor a window being dragged out of the maximized state so the
 /// pointer keeps grabbing the same spot on the titlebar: the same horizontal
 /// fraction of the width, and the same vertical offset from the top.
-fn restore_drag_location(
+pub(crate) fn restore_drag_location(
     window_loc: Point<i32, Logical>,
     decorated_size: Size<i32, Logical>,
     grab: Point<f64, Logical>,
@@ -103,6 +136,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
         window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+        self.focus_new_windows();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -180,6 +214,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 let geometry = SpaceElement::geometry(&window.0);
                 let loc = self.space.element_location(&window).unwrap();
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
+                let snap_area = self.snap_area_for(&window);
 
                 with_states(surface.wl_surface(), move |states| {
                     states
@@ -195,16 +230,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 });
 
                 let start_location = start_data.location;
-                let grab = TouchResizeSurfaceGrab {
-                    start_data,
-                    resize: ResizeGrabState::new(
-                        window,
-                        edges.into(),
-                        initial_window_location,
-                        initial_window_size,
-                        start_location,
-                    ),
-                };
+                let mut resize = ResizeGrabState::new(
+                    window,
+                    edges.into(),
+                    initial_window_location,
+                    initial_window_size,
+                    start_location,
+                );
+                resize.set_snap_area(snap_area);
+                let grab = TouchResizeSurfaceGrab { start_data, resize };
 
                 touch.set_grab(self, grab, serial);
                 return;
@@ -245,6 +279,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             return;
         };
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
+        let snap_area = self.snap_area_for(&window);
 
         with_states(surface.wl_surface(), |states| {
             if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
@@ -257,16 +292,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         });
 
         let start_location = start_data.location;
-        let grab = PointerResizeSurfaceGrab {
-            start_data,
-            resize: ResizeGrabState::new(
-                window,
-                edges.into(),
-                initial_window_location,
-                initial_window_size,
-                start_location,
-            ),
-        };
+        let mut resize = ResizeGrabState::new(
+            window,
+            edges.into(),
+            initial_window_location,
+            initial_window_size,
+            start_location,
+        );
+        resize.set_snap_area(snap_area);
+        let grab = PointerResizeSurfaceGrab { start_data, resize };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }
@@ -343,7 +377,8 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     && let Some(geometry) = self.space.output_geometry(&output)
                     && let Some(toplevel) = window.0.toplevel()
                 {
-                    let desired = fullscreen_content_size(geometry.size, is_ssd);
+                    let area = super::output_work_area(&self.space, &output).unwrap_or(geometry);
+                    let desired = fullscreen_content_size(area.size, is_ssd);
                     if toplevel.with_pending_state(|state| state.size != Some(desired)) {
                         toplevel.with_pending_state(|state| state.size = Some(desired));
                         toplevel.send_configure();
@@ -505,6 +540,45 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
     }
 
+    /// The titlebar maximize button's behaviour: toggle the window between
+    /// maximized and floating. A snapped (tiled) window un-snaps, and a client
+    /// that put itself fullscreen exits that instead, so the user is never
+    /// stuck. Shared by the button and the top-edge snap zone.
+    pub fn toggle_maximize(&mut self, window: WindowElement) {
+        let fullscreen = window.decoration_state().header_bar.fullscreen;
+        let tiled = window.decoration_state().header_bar.snap_restore.is_some();
+        if fullscreen {
+            self.unfullscreen_window(window);
+        } else if window.is_maximized() {
+            self.unmaximize_window(window);
+        } else if tiled {
+            self.unsnap_window(window);
+        } else {
+            self.maximize_window(window);
+        }
+    }
+
+    /// Restore a snapped window to its floating geometry with the same
+    /// transition as an unmaximize.
+    pub fn unsnap_window(&mut self, window: WindowElement) {
+        let Some(rel) = window.decoration_state().header_bar.snap_restore.take() else {
+            return;
+        };
+        let is_ssd = window.is_ssd();
+        let Some((loc, content)) = super::absolute_geometry(&self.space, &window, rel) else {
+            return;
+        };
+        // Raise the window above the rest of the snap group without moving it,
+        // so the transition is visible and its position can animate to `loc`
+        // rather than jumping there.
+        if let Some(current) = self.space.element_location(&window) {
+            self.space.map_element(window.clone(), current, true);
+        }
+        let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
+        self.configure_snapped(&window, rect, false);
+        self.animate_window(&window, content, loc);
+    }
+
     pub fn fullscreen_window(&mut self, window: WindowElement) {
         match window.0.underlying_surface() {
             WindowSurface::Wayland(w) => self.fullscreen_request_xdg(w, None),
@@ -527,6 +601,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(window) = self.window_for_surface(surface.wl_surface()) else {
             return;
         };
+        // Maximizing supersedes any snap; the floating geometry would be stale.
+        window.decoration_state().header_bar.snap_restore = None;
         let outputs_for_window = self.space.outputs_for_element(&window);
         let output = outputs_for_window
             .first()
@@ -541,7 +617,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
         }
 
-        let target = output.and_then(|output| self.space.output_geometry(output));
+        let target = output.and_then(|output| super::output_work_area(&self.space, output));
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = target.map(|geo| maximize_content_size(geo.size, window.is_ssd()));
@@ -601,6 +677,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(window) = self.window_for_surface(wl_surface) else {
             return;
         };
+        // Fullscreen supersedes any snap; dragging a fullscreen window must not
+        // restore a stale floating geometry.
+        window.decoration_state().header_bar.snap_restore = None;
         // A specific output may be requested; otherwise use the output the window
         // is actually on, not `Space`'s arbitrary first output.
         let output = wl_output
@@ -611,7 +690,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(output) = output else {
             return;
         };
-        let Some(geometry) = self.space.output_geometry(&output) else {
+        let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
 
@@ -624,8 +703,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // Remember where the window was, relative to the output it is being
         // fullscreened on, so unfullscreening can put it back on the same
-        // monitor.
-        let restore = super::relative_geometry_of_output(&self.space, &output, &window);
+        // monitor. Skip storing a zero-sized restore (the window may not have
+        // committed a buffer yet — Firefox, for instance, starts fullscreen).
+        let restore = super::relative_geometry_of_output(&self.space, &output, &window)
+            .filter(|rel| rel.w > 0.0 && rel.h > 0.0);
         let mut state = window.decoration_state();
         state.header_bar.fullscreen = true;
         state.header_bar.pointer_loc = None;
@@ -634,10 +715,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         drop(state);
 
+        // A fullscreen window covers the whole output, including any
+        // layer-shell exclusive zone: the panel is hidden while fullscreen.
         let is_ssd = window.is_ssd();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
-            state.size = Some(fullscreen_content_size(geometry.size, is_ssd));
+            state.size = Some(fullscreen_content_size(output_geo.size, is_ssd));
             state.fullscreen_output = wl_output;
         });
         output.user_data().insert_if_missing(FullscreenSurface::default);
@@ -685,6 +768,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .or_else(|| super::output_for_window(&self.space, window))?;
             super::absolute_geometry_for_output(&self.space, &output, *rel, window.is_ssd())
         });
+        // If there's no stored restore (window spawned fullscreen), fall back
+        // to the current output's work area so the client gets a real size
+        // instead of 0×0.
+        let geometry = geometry.or_else(|| {
+            let window = self
+                .space
+                .elements()
+                .find(|w| w.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+                .cloned()?;
+            let output = super::output_for_window(&self.space, &window)?;
+            let area = super::output_work_area(&self.space, &output)?;
+            let is_ssd = window.is_ssd();
+            let size = fullscreen_content_size(area.size, is_ssd);
+            Some((area.loc, size))
+        });
         let ret = surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
             state.size = geometry.map(|(_, size)| size);
@@ -695,7 +793,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             self.space.map_element(window, location, false);
         }
-        if let Some(output) = ret.and_then(|output| Output::from_resource(&output)) {
+
+        // Clear the output's fullscreen surface so rendering falls back to the
+        // normal space layout. This must happen even when the client did not
+        // name an output, otherwise the fullscreen render path keeps drawing
+        // the window (and hides the panel) with a stale size.
+        let client_output = ret.and_then(|output| Output::from_resource(&output));
+        let target = client_output
+            .clone()
+            .or_else(|| {
+                self.space.elements()
+                    .find(|w| w.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
+                    .and_then(|window| super::output_for_window(&self.space, window))
+            });
+        if let Some(output) = target {
             if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
                 trace!("Unfullscreening: {:?}", fullscreen.get());
                 fullscreen.clear();
@@ -741,6 +852,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // If the surface is maximized, unmaximize it and keep the touch over
         // the same spot on the titlebar while the window restores.
+        let mut restore_size = None;
         if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
             let decorated_size = self
                 .space
@@ -748,7 +860,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().maximize_restore.take();
-            let restore_size = restore
+            restore_size = restore
                 .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
                 .map(|(_, size)| size);
             initial_window_location = restore_drag_location(
@@ -765,10 +877,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             surface.send_configure();
         }
 
+        // The grab drives the position, so restore/unmaximize transitions only
+        // animate the window's size while it follows the finger.
+        self.dragging_window = Some(window.clone());
+
+        // A snapped window restores to its floating size as the drag starts.
+        if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
+            initial_window_location = restored;
+        }
+
+        if let Some(size) = restore_size {
+            self.animate_window(&window, size, initial_window_location);
+        }
+
         let grab = TouchMoveSurfaceGrab {
             start_data,
             window,
             initial_window_location,
+            snap_target: None,
         };
 
         touch.set_grab(self, grab, serial);
@@ -811,6 +937,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // If the surface is maximized, unmaximize it and keep the pointer over
         // the same spot on the titlebar while the window restores.
+        let mut restore_size = None;
         if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
             let decorated_size = self
                 .space
@@ -818,7 +945,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().maximize_restore.take();
-            let restore_size = restore
+            restore_size = restore
                 .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
                 .map(|(_, size)| size);
             initial_window_location = restore_drag_location(
@@ -835,10 +962,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             surface.send_configure();
         }
 
+        // The grab drives the position, so restore/unmaximize transitions only
+        // animate the window's size while it follows the pointer.
+        self.dragging_window = Some(window.clone());
+
+        // A snapped window restores to its floating size as the drag starts.
+        if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
+            initial_window_location = restored;
+        }
+
+        if let Some(size) = restore_size {
+            self.animate_window(&window, size, initial_window_location);
+        }
+
         let grab = PointerMoveSurfaceGrab {
             start_data,
             window,
             initial_window_location,
+            snap_target: None,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
