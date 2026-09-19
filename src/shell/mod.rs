@@ -74,7 +74,7 @@ pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, SurfaceFrame,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, LastFrame, RelativeGeometry, Snap, SurfaceFrame,
     VisibilityState,
 };
 
@@ -529,12 +529,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
-        if window.decoration_state().header_bar.snap_restore.is_none() {
-            window.decoration_state().header_bar.snap_restore =
-                relative_geometry_of_output(&self.space, &target.output, window);
+        let floating = window
+            .decoration_state()
+            .snap
+            .map(|snap| snap.floating)
+            .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
+        if let Some(floating) = floating {
+            window.decoration_state().snap = Some(Snap {
+                zone: target.zone,
+                grid,
+                floating,
+            });
         }
-        window.decoration_state().snap_zone = Some(target.zone);
-        window.decoration_state().snap_grid = Some(grid);
         let animated = self.configure_snapped(window, rect, true);
         self.animate_window(window, animated, rect.loc);
     }
@@ -543,7 +549,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     fn group_grid(&self, output: &Output) -> Option<SnapGrid> {
         self.space
             .elements_for_output(output)
-            .find_map(|window| window.decoration_state().snap_grid)
+            .find_map(|window| window.decoration_state().snap.map(|snap| snap.grid))
     }
 
     /// Restore a snapped window to its floating geometry at `loc`, animating
@@ -556,8 +562,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         content: Size<i32, Logical>,
     ) {
         // Restoring supersedes the snap, so stop treating it as tiled.
-        window.decoration_state().snap_zone = None;
-        window.decoration_state().snap_grid = None;
+        window.decoration_state().clear_snap();
         let is_ssd = window.is_ssd();
         let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
         self.configure_snapped(window, rect, false);
@@ -567,7 +572,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     /// The work area `window` is snapped into, or `None` when it floats.
     pub fn snap_area_for(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
-        if window.decoration_state().header_bar.snap_restore.is_none() {
+        if !window.decoration_state().is_snapped() {
             return None;
         }
         let output = output_for_window(&self.space, window)?;
@@ -585,12 +590,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         edges: ResizeEdge,
         intended_size: Size<i32, Logical>,
     ) {
-        let Some(zone) = window.decoration_state().snap_zone else {
+        let Some(snap) = window.decoration_state().snap else {
             return;
         };
-        let Some(grid) = window.decoration_state().snap_grid else {
-            return;
-        };
+        let zone = snap.zone;
+        let grid = snap.grid;
         if zone == SnapZone::Maximize {
             return;
         }
@@ -610,7 +614,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // cell: clamp the divider so every present member stays at or above its
         // minimum size.
         let grid = self.clamp_grid_to_minimums(grid, area, window);
-        window.decoration_state().snap_grid = Some(grid);
+        if let Some(snap) = window.decoration_state().snap.as_mut() {
+            snap.grid = grid;
+        }
         self.reflow_group(window, grid, area);
     }
 
@@ -626,13 +632,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<(WindowElement, SnapZone)> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_zone.is_some()
-                    && other.decoration_state().snap_grid.is_some()
-            })
+            .filter(|other| !other.is_ghosting())
             .filter_map(|other| {
-                let zone = other.decoration_state().snap_zone?;
+                let zone = other.decoration_state().snap_zone()?;
                 Some((other.clone(), zone))
             })
             .collect();
@@ -710,11 +712,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<WindowElement> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_grid.is_some()
-                    && other.decoration_state().snap_zone.is_some()
-            })
+            .filter(|other| !other.is_ghosting() && other.decoration_state().is_snapped())
             .cloned()
             .collect();
 
@@ -725,11 +723,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if other.decoration_state().header_bar.fullscreen {
                 continue;
             }
-            let Some(zone) = other.decoration_state().snap_zone else {
+            let Some(zone) = other.decoration_state().snap_zone() else {
                 continue;
             };
             let rect = grid.rect(zone, area);
-            other.decoration_state().snap_grid = Some(grid);
+            if let Some(snap) = other.decoration_state().snap.as_mut() {
+                snap.grid = grid;
+            }
             let edges = Self::sibling_edges(zone);
             self::grabs::drive_sibling_resize(&other, &mut self.space, edges, rect);
         }
@@ -752,10 +752,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .space
             .elements()
             .filter(|other| {
-                *other != window
-                    && !other.is_ghosting()
-                    && other.decoration_state().snap_grid.is_some()
-                    && other.decoration_state().snap_zone.is_some()
+                *other != window && !other.is_ghosting() && other.decoration_state().is_snapped()
             })
             .cloned()
             .collect();
@@ -764,10 +761,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if other.decoration_state().header_bar.fullscreen {
                 continue;
             }
-            let Some(zone) = other.decoration_state().snap_zone else {
+            let Some(zone) = other.decoration_state().snap_zone() else {
                 continue;
             };
-            other.decoration_state().snap_grid = Some(grid);
+            if let Some(snap) = other.decoration_state().snap.as_mut() {
+                snap.grid = grid;
+            }
             let rect = grid.rect(zone, area);
             let content = self.configure_snapped(&other, rect, true);
             self.animate_window(&other, content, rect.loc);
@@ -780,11 +779,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let members: Vec<WindowElement> = self
             .space
             .elements()
-            .filter(|other| {
-                !other.is_ghosting()
-                    && other.decoration_state().snap_grid.is_some()
-                    && other.decoration_state().snap_zone.is_some()
-            })
+            .filter(|other| !other.is_ghosting() && other.decoration_state().is_snapped())
             .cloned()
             .collect();
         for other in members {
@@ -802,7 +797,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         window: &WindowElement,
         pointer_global: Point<f64, Logical>,
     ) -> Option<Point<i32, Logical>> {
-        let rel = window.decoration_state().header_bar.snap_restore.take()?;
+        let snap = window.decoration_state().snap.take()?;
+        let rel = snap.floating;
         let current_loc = self.space.element_location(window)?;
         let decorated_size = self
             .space
@@ -1656,11 +1652,13 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
             }
             // A snapped window is reconfigured to its cell in the new work
             // area, not maximized to the whole output.
-            let snap_zone = window.decoration_state().snap_zone;
+            let snap_zone = window.decoration_state().snap_zone();
             if let Some(zone) = snap_zone {
                 let grid = SnapGrid::centered(work_area);
                 let rect = grid.rect(zone, work_area);
-                window.decoration_state().snap_grid = Some(grid);
+                if let Some(snap) = window.decoration_state().snap.as_mut() {
+                    snap.grid = grid;
+                }
                 let content = self::xdg::undecorated_content_size(rect.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);

@@ -42,12 +42,15 @@ use super::{
 
 pub struct WindowState {
     pub is_ssd: bool,
-    /// Where to restore the window after fullscreen, as a fraction of the work
-    /// area of the output it was fullscreened on. A *weak* output handle is
-    /// stored so the window and the output's fullscreen state can't keep each
-    /// other alive (and because the output may be unplugged while fullscreen).
-    pub fullscreen_restore: Option<(WeakOutput, RelativeGeometry)>,
-    pub maximize_restore: Option<RelativeGeometry>,
+    /// Where to return the window when it leaves fullscreen or the maximized
+    /// state. Exactly one of these is active at a time, so the "which geometry
+    /// wins" question is answered by the enum variant rather than by four
+    /// fields that must be kept mutually exclusive by hand.
+    pub restore: Option<Restore>,
+    /// The snap group this window is currently tiled into, if any. Bundles the
+    /// zone with the shared divider grid so a snapped window can never have one
+    /// without the other.
+    pub snap: Option<Snap>,
     /// Position and size of the window as fractions of its output's work area
     /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
     /// resize and reapplied against the new work area so floating windows keep
@@ -66,12 +69,73 @@ pub struct WindowState {
     /// Stable identifier used by the panel to refer to this window. Assigned
     /// lazily the first time the window list is published.
     pub panel_id: Option<u64>,
-    /// The snap zone this window is tiled into, while it remains snapped.
-    pub snap_zone: Option<SnapZone>,
-    /// The divider grid this window's snap group is laid out on. Shared by the
-    /// group, updated when a resize moves a divider.
-    pub snap_grid: Option<SnapGrid>,
     pub header_bar: HeaderBar,
+}
+
+/// Where a window returns to when it stops being fullscreen or maximized.
+/// Stored as fractions of the relevant output's work area so it survives
+/// resolution changes.
+#[derive(Debug, Clone)]
+pub enum Restore {
+    /// The floating geometry to return to when unmaximizing.
+    Maximize(RelativeGeometry),
+    /// Fullscreen, remembering the output it covered (as a weak handle, so the
+    /// window and the output can't keep each other alive) and the floating
+    /// geometry it should return to.
+    Fullscreen {
+        output: WeakOutput,
+        floating: RelativeGeometry,
+    },
+}
+
+/// A window's membership in a snap group: the zone it occupies, the divider
+/// grid shared by the group, and the floating geometry it returns to when it
+/// leaves the group.
+#[derive(Debug, Clone, Copy)]
+pub struct Snap {
+    pub zone: SnapZone,
+    pub grid: SnapGrid,
+    pub floating: RelativeGeometry,
+}
+
+impl WindowState {
+    /// Whether the window is currently tiled into a snap zone.
+    pub fn is_snapped(&self) -> bool {
+        self.snap.is_some()
+    }
+
+    /// The zone the window is tiled into, if any.
+    pub fn snap_zone(&self) -> Option<SnapZone> {
+        self.snap.map(|snap| snap.zone)
+    }
+
+    /// Leave the snap group: forget both the zone and the shared grid.
+    pub fn clear_snap(&mut self) {
+        self.snap = None;
+    }
+
+    /// Take the floating geometry recorded for an unmaximize, if the window is
+    /// currently in the maximized state.
+    pub fn take_maximize_restore(&mut self) -> Option<RelativeGeometry> {
+        match self.restore.take() {
+            Some(Restore::Maximize(rel)) => Some(rel),
+            other => {
+                self.restore = other;
+                None
+            }
+        }
+    }
+
+    /// Take the fullscreen restore (output and floating geometry), if any.
+    pub fn take_fullscreen_restore(&mut self) -> Option<(WeakOutput, RelativeGeometry)> {
+        match self.restore.take() {
+            Some(Restore::Fullscreen { output, floating }) => Some((output, floating)),
+            other => {
+                self.restore = other;
+                None
+            }
+        }
+    }
 }
 
 /// How the pointer is anchored to a window during a client-initiated move, so
@@ -224,11 +288,6 @@ pub struct HeaderBar {
     pub pointer_loc: Option<Point<f64, Logical>>,
     pub width: u32,
     pub fullscreen: bool,
-    /// The floating geometry to restore when a snapped window is dragged back
-    /// out of its zone. Set when a snap is applied and taken on drag start.
-    /// Lives here (rather than on [`WindowState`]) so `start_drag` can take it
-    /// while the decoration state is already borrowed.
-    pub snap_restore: Option<RelativeGeometry>,
     pub focused: bool,
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
@@ -879,20 +938,17 @@ impl WindowElement {
         self.user_data().insert_if_missing(|| {
             RefCell::new(WindowState {
                 is_ssd: false,
-                fullscreen_restore: None,
-                maximize_restore: None,
+                restore: None,
+                snap: None,
                 relative: None,
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,
                 panel_id: None,
-                snap_zone: None,
-                snap_grid: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,
                     fullscreen: false,
-                    snap_restore: None,
                     focused: false,
                     close_button_hover: false,
                     maximize_button_hover: false,
@@ -1132,7 +1188,7 @@ impl WindowElement {
         // A plain maximized window (not part of a snap group) has no grip. A
         // snapped window keeps its grip, because dragging it is what drives the
         // compositor-owned group resize.
-        if maximized && state.snap_zone.is_none() {
+        if maximized && !state.is_snapped() {
             return None;
         }
         if is_ssd {
@@ -1141,7 +1197,7 @@ impl WindowElement {
             // CSD windows in a snap group get an invisible compositor edge band
             // so a drag on their border starts the unified group resize (the
             // client, told it is maximized, won't resize itself).
-            state.snap_zone?;
+            state.snap_zone()?;
             resize_edge_band(point, size)
         }
     }
@@ -1184,9 +1240,9 @@ impl<B: Backend> AnvilState<B> {
         // A tiled window pops back to its floating size as soon as the drag
         // actually moves. Done here (not at drag start) because `start_drag`
         // runs while the window's decoration state is already borrowed.
-        let snap_restore = drag.window.decoration_state().header_bar.snap_restore.take();
-        if let Some(rel) = snap_restore
-            && let Some((_, content)) = super::absolute_geometry(&self.space, &drag.window, rel)
+        let snap_restore = drag.window.decoration_state().snap.take();
+        if let Some(snap) = snap_restore
+            && let Some((_, content)) = super::absolute_geometry(&self.space, &drag.window, snap.floating)
         {
             let decorated_size = self
                 .space

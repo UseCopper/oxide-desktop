@@ -38,7 +38,7 @@ use super::{
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
     place_new_window,
 };
-use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor};
+use super::ssd::{BORDER_WIDTH, HEADER_BAR_HEIGHT, DragAnchor, Restore};
 
 /// Size a toplevel should use while fullscreen.
 ///
@@ -549,7 +549,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // A snapped window is told it is maximized, so the snap must be
         // checked first: otherwise the button would take the unmaximize path,
         // which has no floating geometry to restore and would do nothing.
-        let tiled = window.decoration_state().header_bar.snap_restore.is_some();
+        let tiled = window.decoration_state().is_snapped();
         if fullscreen {
             self.unfullscreen_window(window);
         } else if tiled {
@@ -564,14 +564,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// Restore a snapped window to its floating geometry with the same
     /// transition as an unmaximize, then re-tile whatever is left of its group.
     pub fn unsnap_window(&mut self, window: WindowElement) {
-        let Some(rel) = window.decoration_state().header_bar.snap_restore.take() else {
-            return;
-        };
         // Leaving the group: stop treating this window as tiled so its grip and
         // the shared grid no longer apply to it.
-        window.decoration_state().snap_zone = None;
-        window.decoration_state().snap_grid = None;
-
+        let Some(snap) = window.decoration_state().snap.take() else {
+            return;
+        };
+        let rel = snap.floating;
         let is_ssd = window.is_ssd();
         // Raise the window above the rest of the snap group without moving it,
         // so the transition is visible and its position can animate to `loc`
@@ -633,7 +631,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         // Maximizing supersedes any snap; the floating geometry would be stale.
-        window.decoration_state().header_bar.snap_restore = None;
+        window.decoration_state().clear_snap();
         let outputs_for_window = self.space.outputs_for_element(&window);
         let output = outputs_for_window
             .first()
@@ -649,7 +647,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let already_maximized =
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
         if !already_maximized {
-            window.decoration_state().maximize_restore = super::relative_geometry_of(&self.space, &window);
+            window.decoration_state().restore = super::relative_geometry_of(&self.space, &window)
+                .map(Restore::Maximize);
         }
 
         let target = output.and_then(|output| super::output_work_area(&self.space, output));
@@ -687,11 +686,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // unmaximize (its own titlebar button) must leave the snap group rather
         // than the maximized state, which has no floating geometry stored.
         // `unsnap_window` sends the configure that answers this request.
-        if window.decoration_state().header_bar.snap_restore.is_some() {
+        if window.decoration_state().is_snapped() {
             self.unsnap_window(window);
             return;
         }
-        let restore = window.decoration_state().maximize_restore.take();
+        let restore = window.decoration_state().take_maximize_restore();
         let is_ssd = window.is_ssd();
 
         // Client-decorated windows choose their own size again: they get a
@@ -739,7 +738,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         };
         // Fullscreen supersedes any snap; dragging a fullscreen window must not
         // restore a stale floating geometry.
-        window.decoration_state().header_bar.snap_restore = None;
+        window.decoration_state().clear_snap();
         // A specific output may be requested; otherwise use the output the window
         // is actually on, not `Space`'s arbitrary first output.
         let output = wl_output
@@ -770,8 +769,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut state = window.decoration_state();
         state.header_bar.fullscreen = true;
         state.header_bar.pointer_loc = None;
-        if state.fullscreen_restore.is_none() {
-            state.fullscreen_restore = restore.map(|rel| (output.downgrade(), rel));
+        if matches!(state.restore, Some(Restore::Fullscreen { .. }) | None) {
+            state.restore = restore.map(|rel| Restore::Fullscreen {
+                output: output.downgrade(),
+                floating: rel,
+            });
         }
         drop(state);
 
@@ -815,8 +817,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 state.header_bar.fullscreen = false;
                 state.header_bar.pointer_loc = None;
                 state
-                    .fullscreen_restore
-                    .take()
+                    .take_fullscreen_restore()
                     .map(|(output, rel)| (window.clone(), output, rel))
             });
 
@@ -921,7 +922,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .element_geometry(&window)
                 .map(|geo| geo.size)
                 .unwrap_or_default();
-            let restore = window.decoration_state().maximize_restore.take();
+            let restore = window.decoration_state().take_maximize_restore();
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
@@ -1031,7 +1032,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .element_geometry(&window)
                 .map(|geo| geo.size)
                 .unwrap_or_default();
-            let restore = window.decoration_state().maximize_restore.take();
+            let restore = window.decoration_state().take_maximize_restore();
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is

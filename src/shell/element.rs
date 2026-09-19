@@ -277,7 +277,7 @@ impl SSD {
         location: Point<f64, Logical>,
     ) {
         let is_ssd = self.0.decoration_state().is_ssd;
-        let snapped = self.0.decoration_state().snap_zone.is_some();
+        let snapped = self.0.decoration_state().is_snapped();
         // Use the exact same hit test as pointer focus and button handling so
         // the cursor, focus and click always agree. A CSD snapped window also
         // has an (invisible) resize edge band, so it needs the resize cursor.
@@ -838,7 +838,7 @@ where
             let fullscreen = state.header_bar.fullscreen;
             // A snapped (tiled) window is "restorable" too, so it shows the
             // restore icon and un-snaps when the button is pressed.
-            let tiled = state.header_bar.snap_restore.is_some();
+            let tiled = state.is_snapped();
             let width = display_size.w + if fullscreen { 0 } else { 2 * BORDER_WIDTH };
             state
                 .header_bar
