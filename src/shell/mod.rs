@@ -607,9 +607,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // cell: clamp the divider so every present member stays at or above its
         // minimum size.
         let grid = self.clamp_grid_to_minimums(grid, area, window);
-        if let Some(snap) = window.decoration_state().snap.as_mut() {
-            snap.grid = grid;
-        }
+        window.with_state(|state| {
+            if let Some(snap) = state.snap.as_mut() {
+                snap.grid = grid;
+            }
+        });
         self.reflow_group(window, grid, area);
     }
 
@@ -720,9 +722,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 continue;
             };
             let rect = grid.rect(zone, area);
-            if let Some(snap) = other.decoration_state().snap.as_mut() {
-                snap.grid = grid;
-            }
+            other.with_state(|state| {
+                if let Some(snap) = state.snap.as_mut() {
+                    snap.grid = grid;
+                }
+            });
             let edges = Self::sibling_edges(zone);
             self::grabs::drive_sibling_resize(&other, &mut self.space, edges, rect);
         }
@@ -757,9 +761,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             let Some(zone) = other.decoration_state().snap_zone() else {
                 continue;
             };
-            if let Some(snap) = other.decoration_state().snap.as_mut() {
-                snap.grid = grid;
-            }
+            other.with_state(|state| {
+                if let Some(snap) = state.snap.as_mut() {
+                    snap.grid = grid;
+                }
+            });
             let rect = grid.rect(zone, area);
             let content = self.configure_snapped(&other, rect, true);
             self.animate_window(&other, content, rect.loc);

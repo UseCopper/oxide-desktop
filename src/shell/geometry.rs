@@ -217,9 +217,13 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
             if let Some(zone) = window.decoration_state().snap_zone() {
                 let grid = SnapGrid::centered(work_area);
                 let rect = grid.rect(zone, work_area);
-                if let Some(snap) = window.decoration_state().snap.as_mut() {
-                    snap.grid = grid;
-                }
+                // Store the new grid in a short-lived borrow: the `is_ssd()`
+                // call below reads the decoration state again.
+                window.with_state(|state| {
+                    if let Some(snap) = state.snap.as_mut() {
+                        snap.grid = grid;
+                    }
+                });
                 let content = undecorated_content_size(rect.size, window.is_ssd());
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Maximized);

@@ -1113,6 +1113,14 @@ impl WindowElement {
             .borrow_mut()
     }
 
+    /// Run `f` with a short-lived borrow of the decoration state. Prefer this
+    /// over holding a `decoration_state()` result across other calls: any
+    /// callback that reads the state again (e.g. `is_ssd`, `geometry`) would
+    /// otherwise re-enter the `RefCell` and panic.
+    pub fn with_state<R>(&self, f: impl FnOnce(&mut WindowState) -> R) -> R {
+        f(&mut self.decoration_state())
+    }
+
     /// The ghost tracking for this window, if its decoration state was ever set
     /// up. Returns `None` before the first `decoration_state()` call.
     fn ghost_state(&self) -> Option<&GhostState> {
