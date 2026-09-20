@@ -1113,6 +1113,14 @@ impl WindowElement {
             .borrow_mut()
     }
 
+    /// Run `f` with a short-lived borrow of the decoration state. Prefer this
+    /// over holding a `decoration_state()` result across other calls: any
+    /// callback that reads the state again (e.g. `is_ssd`, `geometry`) would
+    /// otherwise re-enter the `RefCell` and panic.
+    pub fn with_state<R>(&self, f: impl FnOnce(&mut WindowState) -> R) -> R {
+        f(&mut self.decoration_state())
+    }
+
     /// The ghost tracking for this window, if its decoration state was ever set
     /// up. Returns `None` before the first `decoration_state()` call.
     fn ghost_state(&self) -> Option<&GhostState> {
@@ -1150,6 +1158,28 @@ impl WindowElement {
 
     pub fn is_ssd(&self) -> bool {
         self.decoration_state().is_ssd
+    }
+
+    /// Whether the window is tiled into a snap zone.
+    pub fn is_snapped(&self) -> bool {
+        self.decoration_state().is_snapped()
+    }
+
+    /// Whether the window is fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.decoration_state().header_bar.fullscreen
+    }
+
+    /// The floating geometry recorded for the window's snap group, if any.
+    /// Reads the field and releases the state borrow before returning, so
+    /// callers can safely follow up with other `decoration_state()` reads.
+    pub fn snap_floating(&self) -> Option<RelativeGeometry> {
+        self.decoration_state().snap.map(|snap| snap.floating)
+    }
+
+    /// The divider grid shared by the window's snap group, if any.
+    pub fn snap_grid(&self) -> Option<SnapGrid> {
+        self.decoration_state().snap.map(|snap| snap.grid)
     }
 
     /// Mark a freshly mapped window so its open transition starts as soon as it

@@ -521,10 +521,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
+        // Read the already-recorded floating geometry first. `snap_floating`
+        // releases the state borrow before returning, so the fallback (which
+        // reads the window size and borrows the state again) is safe.
         let floating = window
-            .decoration_state()
-            .snap
-            .map(|snap| snap.floating)
+            .snap_floating()
             .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
         if let Some(floating) = floating {
             window.decoration_state().snap = Some(Snap {
@@ -606,9 +607,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // cell: clamp the divider so every present member stays at or above its
         // minimum size.
         let grid = self.clamp_grid_to_minimums(grid, area, window);
-        if let Some(snap) = window.decoration_state().snap.as_mut() {
-            snap.grid = grid;
-        }
+        window.with_state(|state| {
+            if let Some(snap) = state.snap.as_mut() {
+                snap.grid = grid;
+            }
+        });
         self.reflow_group(window, grid, area);
     }
 
@@ -719,9 +722,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 continue;
             };
             let rect = grid.rect(zone, area);
-            if let Some(snap) = other.decoration_state().snap.as_mut() {
-                snap.grid = grid;
-            }
+            other.with_state(|state| {
+                if let Some(snap) = state.snap.as_mut() {
+                    snap.grid = grid;
+                }
+            });
             let edges = Self::sibling_edges(zone);
             self::grabs::drive_sibling_resize(&other, &mut self.space, edges, rect);
         }
@@ -756,9 +761,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             let Some(zone) = other.decoration_state().snap_zone() else {
                 continue;
             };
-            if let Some(snap) = other.decoration_state().snap.as_mut() {
-                snap.grid = grid;
-            }
+            other.with_state(|state| {
+                if let Some(snap) = state.snap.as_mut() {
+                    snap.grid = grid;
+                }
+            });
             let rect = grid.rect(zone, area);
             let content = self.configure_snapped(&other, rect, true);
             self.animate_window(&other, content, rect.loc);
