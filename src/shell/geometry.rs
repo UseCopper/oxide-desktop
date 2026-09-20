@@ -173,8 +173,11 @@ pub fn capture_relative_geometries(space: &Space<WindowElement>, output: &Output
             continue;
         }
         // Fullscreen and maximized windows are re-configured to the output
-        // rather than scaled, so they don't need a snapshot.
-        if window.decoration_state().header_bar.fullscreen || window.is_maximized() {
+        // rather than scaled, so they don't need a snapshot. Bind the flag
+        // first: the `decoration_state()` temporary would otherwise stay alive
+        // through `is_maximized()`, which reads the state again.
+        let fullscreen = window.decoration_state().header_bar.fullscreen;
+        if fullscreen || window.is_maximized() {
             continue;
         }
         if let Some(rel) = relative_geometry_of(space, window) {
@@ -213,12 +216,13 @@ pub fn apply_relative_geometries(space: &mut Space<WindowElement>, output: &Outp
                 continue;
             }
             // A snapped window is reconfigured to its cell in the new work
-            // area, not maximized to the whole output.
-            if let Some(zone) = window.decoration_state().snap_zone() {
+            // area, not maximized to the whole output. Bind the zone first:
+            // `if let` keeps the `decoration_state()` temporary alive for the
+            // whole body, and the body reads the state again.
+            let zone = window.decoration_state().snap_zone();
+            if let Some(zone) = zone {
                 let grid = SnapGrid::centered(work_area);
                 let rect = grid.rect(zone, work_area);
-                // Store the new grid in a short-lived borrow: the `is_ssd()`
-                // call below reads the decoration state again.
                 window.with_state(|state| {
                     if let Some(snap) = state.snap.as_mut() {
                         snap.grid = grid;
