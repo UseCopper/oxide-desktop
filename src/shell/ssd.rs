@@ -1152,6 +1152,28 @@ impl WindowElement {
         self.decoration_state().is_ssd
     }
 
+    /// Whether the window is tiled into a snap zone.
+    pub fn is_snapped(&self) -> bool {
+        self.decoration_state().is_snapped()
+    }
+
+    /// Whether the window is fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.decoration_state().header_bar.fullscreen
+    }
+
+    /// The floating geometry recorded for the window's snap group, if any.
+    /// Reads the field and releases the state borrow before returning, so
+    /// callers can safely follow up with other `decoration_state()` reads.
+    pub fn snap_floating(&self) -> Option<RelativeGeometry> {
+        self.decoration_state().snap.map(|snap| snap.floating)
+    }
+
+    /// The divider grid shared by the window's snap group, if any.
+    pub fn snap_grid(&self) -> Option<SnapGrid> {
+        self.decoration_state().snap.map(|snap| snap.grid)
+    }
+
     /// Mark a freshly mapped window so its open transition starts as soon as it
     /// has content to show.
     pub fn begin_open(&self) {

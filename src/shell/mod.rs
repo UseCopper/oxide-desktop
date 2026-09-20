@@ -521,10 +521,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
+        // Read the already-recorded floating geometry first. `snap_floating`
+        // releases the state borrow before returning, so the fallback (which
+        // reads the window size and borrows the state again) is safe.
         let floating = window
-            .decoration_state()
-            .snap
-            .map(|snap| snap.floating)
+            .snap_floating()
             .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
         if let Some(floating) = floating {
             window.decoration_state().snap = Some(Snap {
