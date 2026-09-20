@@ -935,7 +935,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         self.tick_visibility_animations(&windows, now);
         self.tick_snap_preview(now);
-        #[cfg(feature = "panel")]
         self.tick_panel();
     }
 

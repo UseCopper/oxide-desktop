@@ -207,10 +207,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub snap_candidate_since: Instant,
     /// The panel connection, when the panel feature is enabled and it bound
     /// successfully.
-    #[cfg(feature = "panel")]
     pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
     /// Counter for assigning stable panel ids to windows.
-    #[cfg(feature = "panel")]
     pub next_panel_id: u64,
 }
 
@@ -854,13 +852,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             dragging_window: None,
             snap_candidate: None,
             snap_candidate_since: Instant::now(),
-            #[cfg(feature = "panel")]
             panel_ipc: None,
-            #[cfg(feature = "panel")]
             next_panel_id: 1,
         };
 
-        #[cfg(feature = "panel")]
         crate::panel_ipc::spawn_panel(&mut state);
 
         state
