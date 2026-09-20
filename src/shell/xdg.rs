@@ -648,8 +648,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let already_maximized =
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
         if !already_maximized {
-            window.decoration_state().restore = super::relative_geometry_of(&self.space, &window)
-                .map(Restore::Maximize);
+            // Compute the geometry before touching the decoration state: it
+            // reads the window's size, which borrows the state again.
+            let restore = super::relative_geometry_of(&self.space, &window).map(Restore::Maximize);
+            window.decoration_state().restore = restore;
         }
 
         let target = output.and_then(|output| super::output_work_area(&self.space, output));
@@ -691,10 +693,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             self.unsnap_window(window);
             return;
         }
-        let target = window
-            .decoration_state()
-            .take_maximize_restore()
-            .and_then(|restore| super::restore_target(&self.space, &window, restore));
+        // Take the restore first: the `decoration_state()` borrow must end
+        // before `restore_target` reads the decoration kind again.
+        let restore = window.decoration_state().take_maximize_restore();
+        let target = restore.and_then(|restore| super::restore_target(&self.space, &window, restore));
 
         match target {
             // `restore_window` sends the configure that answers the request.
