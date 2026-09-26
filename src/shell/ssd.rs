@@ -32,12 +32,12 @@ use std::{
 use crate::{AnvilState, state::Backend};
 
 use super::{
-    SnapGrid, SnapTarget, SnapZone, SurfaceData, VisibilityAnimation, WindowAnimation,
-    WindowElement,
+    SnapGrid, SnapTarget, SnapZone, SurfaceData, VisibilityAnimation, WindowAnimation, WindowElement,
     grabs::{
         PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeGrabState, ResizeState,
         TouchResizeSurfaceGrab,
     },
+    relative_geometry_at,
 };
 
 pub struct WindowState {
@@ -56,6 +56,18 @@ pub struct WindowState {
     /// resize and reapplied against the new work area so floating windows keep
     /// their relative placement across resolution changes and monitor layouts.
     pub relative: Option<RelativeGeometry>,
+    /// Where the window sat before the move that is currently in progress
+    /// started, so a snap, maximize, or fullscreen that happens part-way
+    /// through a drag restores to where the window came *from* rather than to
+    /// wherever the drag had dragged it to. Set when a move starts, consumed by
+    /// the next save, and dropped when the move ends without one.
+    pub pre_move: Option<RelativeGeometry>,
+    /// Whether the window still needs to be centred on its output. A window is
+    /// spawned before the client has committed a buffer, so its size — and
+    /// therefore the offset that centres it — is not yet known; it is placed at
+    /// the work area's centre point and straightened out on the first commit.
+    /// Cleared by that commit, so a window is only ever nudged once.
+    pub spawn_center_pending: bool,
     /// An in-flight maximize/unmaximize transition, if any. While set, the
     /// window is drawn at the sampled geometry instead of its committed size.
     pub animation: Option<WindowAnimation>,
@@ -112,6 +124,14 @@ impl WindowState {
     /// Leave the snap group: forget both the zone and the shared grid.
     pub fn clear_snap(&mut self) {
         self.snap = None;
+    }
+
+    /// Take the floating geometry a save should record for `window`: the
+    /// position it occupied before the move in progress started, falling back
+    /// to the one its snap group is already recording. The pre-move entry is
+    /// always consumed, so it can never outlive the move that recorded it.
+    pub fn take_floating_for_save(&mut self) -> Option<RelativeGeometry> {
+        self.pre_move.take().or(self.snap.map(|snap| snap.floating))
     }
 
     /// Take the floating geometry recorded for an unmaximize, if the window is
@@ -394,6 +414,18 @@ pub struct SSDDrag {
     /// The snap target the pointer is currently over, resolved on each motion
     /// and applied when the drag ends.
     pub snap_target: Option<SnapTarget>,
+    /// Where the window's top-left sat when the button went down, so a snap,
+    /// maximize, or fullscreen applied before the button comes back up records
+    /// *that* rather than wherever the drag has moved the window to.
+    ///
+    /// Only the position, and it lives here rather than on the window's
+    /// decoration state, because `start_drag` runs while that state is already
+    /// borrowed: `Space` can report a location without touching it, but the
+    /// window's size needs it. The size is filled in by whoever consumes this,
+    /// which is safe because a drag does not change it. Recording it here at
+    /// press time — rather than from a deferred callback — is the point: such a
+    /// callback may not run before the first motion event moves the window.
+    pub pre_move_loc: Option<Point<i32, Logical>>,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +704,12 @@ impl HeaderBar {
             start_global,
             start_origin: window_origin,
             snap_target: None,
+            // Sampled now, while the window is still where the button found it.
+            // `element_location` reads only the space: the decoration state is
+            // borrowed by our caller, and the window's size lives behind it. A
+            // tiled window's position is its cell, so the drag's first motion
+            // replaces this with the floating geometry it pops out to.
+            pre_move_loc: state.space.element_location(window),
         });
     }
 
@@ -1054,6 +1092,8 @@ impl WindowElement {
                 restore: None,
                 snap: None,
                 relative: None,
+                pre_move: None,
+                spawn_center_pending: true,
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,
@@ -1359,9 +1399,32 @@ impl<B: Backend> AnvilState<B> {
                 // Deferred: this may run while the window's decoration state is
                 // borrowed (e.g. from the touch/tablet target handlers), and
                 // `apply_snap` needs to borrow it.
+                //
+                // The drag's pre-move sample is handed over explicitly: it was
+                // taken at press time, and the drag is already gone from
+                // `ssd_drag` by the time this runs, so `apply_snap` could not
+                // recover it on its own. Seeding it first also guarantees the
+                // save sees it, rather than racing the write.
                 let window = drag.window;
-                self.handle
-                    .insert_idle(move |data| data.apply_snap(&window, &target));
+                let pre_move_loc = drag.pre_move_loc;
+                self.handle.insert_idle(move |data| {
+                    // Built here, not at press time: the size needs the
+                    // decoration state, which the press handler still held. The
+                    // position is the part that had to be sampled at press time.
+                    if let Some(rel) =
+                        pre_move_loc.and_then(|loc| relative_geometry_at(&data.space, &window, loc))
+                    {
+                        data.set_pre_move(&window, Some(rel));
+                    }
+                    data.apply_snap(&window, &target);
+                });
+            } else {
+                // No snap, so nothing consumed the pre-move position: drop it,
+                // or the next maximize or fullscreen would undo the drag that
+                // just finished. It is only ever written from a snap or a save,
+                // so there is nothing here to race.
+                let window = drag.window;
+                self.handle.insert_idle(move |data| data.clear_pre_move(&window));
             }
             tracing::debug!("SSD drag ended");
         }
@@ -1401,8 +1464,15 @@ impl<B: Backend> AnvilState<B> {
             );
             self.restore_snapped(&drag.window, restored, content);
             drag.start_origin = restored;
+            // The window is leaving its snap group, so the geometry it is being
+            // popped out to is the position this drag started from. Recorded
+            // here, while the snap is in hand: by release time the snap is gone,
+            // and the press-time sample is the cell the window was tiled into.
+            self.set_pre_move(&drag.window, Some(snap.floating));
+            drag.pre_move_loc = None;
             if let Some(active) = self.ssd_drag.as_mut() {
                 active.start_origin = restored;
+                active.pre_move_loc = None;
             }
         }
 

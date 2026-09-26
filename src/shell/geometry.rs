@@ -97,6 +97,35 @@ pub fn relative_geometry_of(
     relative_geometry_of_output(space, &output, window)
 }
 
+/// Turn a position into fractions of the window's output work area, using the
+/// window's current size. For callers that captured a location earlier and
+/// could not afford to read the size at the time — a drag samples its origin
+/// while the decoration state is borrowed, and
+/// [`WindowElement::geometry`](super::WindowElement) needs that state.
+pub fn relative_geometry_at(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    loc: Point<i32, Logical>,
+) -> Option<RelativeGeometry> {
+    let output = output_for_window(space, window)?;
+    let area = output_work_area(space, &output)?;
+    Some(RelativeGeometry::capture(loc, window.geometry().size, area))
+}
+
+/// Turn an already-known rectangle into fractions of the window's output work
+/// area. For callers holding a geometry the window has moved off of — the
+/// pre-maximize rect a window is being dragged out of — where
+/// [`relative_geometry_of`] would only see the current position.
+pub fn relative_geometry_of_rect(
+    space: &Space<WindowElement>,
+    window: &WindowElement,
+    rect: Rectangle<i32, Logical>,
+) -> Option<RelativeGeometry> {
+    let output = output_for_window(space, window)?;
+    let area = output_work_area(space, &output)?;
+    Some(RelativeGeometry::capture(rect.loc, rect.size, area))
+}
+
 /// Turn a fractional geometry's position back into an absolute location against
 /// a specific output's work area, without needing a committed size. Used by
 /// client-decorated windows, which restore their own size after unmaximizing.

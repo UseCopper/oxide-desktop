@@ -638,6 +638,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .first()
             // The window hasn't been mapped yet, use the primary output instead
             .or_else(|| self.space.outputs().next());
+        // Resolved to an owned rectangle here so the borrow of the space ends
+        // before the restore below, which needs `&mut self` to reach the
+        // in-flight drag.
+        let target = output.and_then(|output| super::output_work_area(&self.space, output));
 
         // Remember where the window was so unmaximizing can put it back, stored
         // as a fraction of the work area so it survives resolution changes.
@@ -649,12 +653,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
         if !already_maximized {
             // Compute the geometry before touching the decoration state: it
-            // reads the window's size, which borrows the state again.
-            let restore = super::relative_geometry_of(&self.space, &window).map(Restore::Maximize);
-            window.decoration_state().restore = restore;
+            // reads the window's size, which borrows the state again. A move
+            // in progress wins over the live geometry, so a window dragged
+            // across the screen and then maximized comes back to where the
+            // drag started instead of where it was dropped.
+            let restore = self.take_pre_move_for_save(&window);
+            let restore = restore.or_else(|| super::relative_geometry_of(&self.space, &window));
+            window.decoration_state().restore = restore.map(Restore::Maximize);
         }
 
-        let target = output.and_then(|output| super::output_work_area(&self.space, output));
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = target.map(|geo| maximize_content_size(geo.size, window.is_ssd()));
@@ -749,9 +756,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // Remember where the window was, relative to the output it is being
         // fullscreened on, so unfullscreening can put it back on the same
-        // monitor. Skip storing a zero-sized restore (the window may not have
-        // committed a buffer yet — Firefox, for instance, starts fullscreen).
-        let restore = super::relative_geometry_of_output(&self.space, &output, &window)
+        // monitor. A move in progress wins over the live geometry, so a window
+        // dragged across the screen and then fullscreened comes back to where
+        // the drag started. Skip storing a zero-sized restore (the window may
+        // not have committed a buffer yet — Firefox, for instance, starts
+        // fullscreen).
+        let saved = self.take_pre_move_for_save(&window);
+        let restore = saved
+            .or_else(|| super::relative_geometry_of_output(&self.space, &output, &window))
             .filter(|rel| rel.w > 0.0 && rel.h > 0.0);
         let mut state = window.decoration_state();
         state.header_bar.fullscreen = true;
@@ -903,13 +915,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut restore_size = None;
         let mut anchor = None;
         let mut client_unmaximize = false;
-        if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
+        // The pre-maximize geometry, kept so the move can be undone to it below.
+        let mut unmaximize_from = None;
+        let maximized =
+            surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+        if maximized {
             let decorated_size = self
                 .space
                 .element_geometry(&window)
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().take_maximize_restore();
+            unmaximize_from = restore;
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
@@ -947,6 +964,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // animate the window's size while it follows the finger.
         self.dragging_window = Some(window.clone());
 
+        // Record where this move starts from, so a snap or fullscreen that
+        // happens before the finger lifts restores to that spot. Done before
+        // the snap below consumes its geometry, and after the unmaximize above
+        // so a maximized window reports where it is being restored to.
+        if maximized {
+            self.note_pre_move_out_of_maximize(&window, unmaximize_from);
+        } else {
+            self.note_pre_move(&window, None);
+        }
+
         // A snapped window restores to its floating size as the drag starts.
         if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
             initial_window_location = restored;
@@ -959,6 +986,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // wait for the client to commit its own size first.
             self.animate_restore(&window, initial_window_location, restore_size);
         }
+
+        // Place the window now rather than on the first motion. The grab only
+        // moves the window once the pointer moves, and a restore transition
+        // contributes just its *size* to the layout — `SpaceElement::geometry`
+        // leaves the location to the space — so without this the window is drawn
+        // at its stale location until the pointer moves, then jumps.
+        //
+        // After `animate_restore`, which reads the current location to compute
+        // the transition's start.
+        self.space
+            .map_element(window.clone(), initial_window_location, true);
 
         let grab = TouchMoveSurfaceGrab {
             start_data,
@@ -1011,13 +1049,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut restore_size = None;
         let mut anchor = None;
         let mut client_unmaximize = false;
-        if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
+        // The pre-maximize geometry, kept so the move can be undone to it below.
+        let mut unmaximize_from = None;
+        let maximized =
+            surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+        if maximized {
             let decorated_size = self
                 .space
                 .element_geometry(&window)
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().take_maximize_restore();
+            unmaximize_from = restore;
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
@@ -1055,6 +1098,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // animate the window's size while it follows the pointer.
         self.dragging_window = Some(window.clone());
 
+        // Record where this move starts from, so a snap or fullscreen that
+        // happens before the button is released restores to that spot. Done
+        // before the snap below consumes its geometry, and after the unmaximize
+        // above so a maximized window reports where it is being restored to.
+        if maximized {
+            self.note_pre_move_out_of_maximize(&window, unmaximize_from);
+        } else {
+            self.note_pre_move(&window, None);
+        }
+
         // A snapped window restores to its floating size as the drag starts.
         if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
             initial_window_location = restored;
@@ -1067,6 +1120,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             // wait for the client to commit its own size first.
             self.animate_restore(&window, initial_window_location, restore_size);
         }
+
+        // Place the window now rather than on the first motion. The grab only
+        // moves the window once the pointer moves, and a restore transition
+        // contributes just its *size* to the layout — `SpaceElement::geometry`
+        // leaves the location to the space — so without this the window is drawn
+        // at its stale location until the pointer moves, then jumps.
+        //
+        // After `animate_restore`, which reads the current location to compute
+        // the transition's start.
+        self.space
+            .map_element(window.clone(), initial_window_location, true);
 
         let grab = PointerMoveSurfaceGrab {
             start_data,
@@ -1129,6 +1193,35 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
     // and resize land on the same commit; client-decorated windows keep using
     // their declared geometry.
     let geometry = window.committed_content_size();
+
+    // A window is spawned before the client has committed a buffer, so the size
+    // that centres it is not known yet and it is placed at the work area's
+    // centre *point*. Now that it has a real size, shift it back by half the
+    // difference so the frame is genuinely centred. Only while it is still
+    // exactly where it was spawned, so a window that has since been moved or
+    // resized is never nudged, and only once, on the first commit.
+    if window.decoration_state().spawn_center_pending {
+        window.decoration_state().spawn_center_pending = false;
+        let size = window.geometry().size;
+        if size.w > 0 && size.h > 0
+            && let Some(area) = super::output_for_window(space, &window)
+                .and_then(|output| super::output_work_area(space, &output))
+        {
+            let spawn = Point::from((
+                area.loc.x + area.size.w / 2,
+                area.loc.y + area.size.h / 2,
+            ));
+            if window_loc == spawn {
+                window_loc = Point::from((
+                    area.loc.x + (area.size.w - size.w).max(0) / 2,
+                    area.loc.y + (area.size.h - size.h).max(0) / 2,
+                ));
+                // Don't raise: this is the window's own first commit, and
+                // stealing focus here would fight the spawn's activation.
+                space.map_element(window.clone(), window_loc, false);
+            }
+        }
+    }
 
     // A client-decorated unmaximize is waiting for the size the client chose;
     // start the transition for real as soon as it commits a different size.

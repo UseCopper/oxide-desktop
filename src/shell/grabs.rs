@@ -101,6 +101,10 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
             data.clear_snap_preview();
             if let Some(target) = self.snap_target.take() {
                 data.apply_snap(&self.window, &target);
+            } else {
+                // Nothing consumed the pre-move position, so drop it rather than
+                // let the next maximize or fullscreen undo this drag.
+                data.clear_pre_move(&self.window);
             }
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
@@ -202,6 +206,9 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        // Also covers a grab torn down without a release event (a cancel, or the
+        // seat losing the pointer): no snap ran, so nothing else cleared it.
+        data.clear_pre_move(&self.window);
     }
 }
 
@@ -246,6 +253,8 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         data.clear_snap_preview();
         if let Some(target) = self.snap_target.take() {
             data.apply_snap(&self.window, &target);
+        } else {
+            data.clear_pre_move(&self.window);
         }
         handle.up(data, event);
         handle.unset_grab(self, data);
@@ -328,6 +337,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        data.clear_pre_move(&self.window);
     }
 }
 

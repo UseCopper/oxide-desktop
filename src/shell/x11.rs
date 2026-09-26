@@ -30,8 +30,8 @@ use crate::{AnvilState, focus::KeyboardFocusTarget, state::Backend};
 
 use super::{
     FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeGrabState,
-    ResizeState,
-    SurfaceData, TouchMoveSurfaceGrab, WindowElement, place_new_window,
+    ResizeState, SurfaceData, TouchMoveSurfaceGrab, WindowElement, decorated_content_size,
+    place_new_window, relative_geometry_of_rect,
 };
 
 #[derive(Debug, Default)]
@@ -338,6 +338,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(geo) => geo,
             None => return,
         };
+        // A move in progress wins over the live geometry, so a window dragged
+        // across the screen and then maximized comes back to where the drag
+        // started instead of where it was dropped.
+        let old_geo = match self.take_pre_move_for_save(&elem) {
+            Some(rel) => super::absolute_geometry(&self.space, &elem, rel)
+                .map(|(loc, content)| {
+                    Rectangle::new(loc, decorated_content_size(content, elem.is_ssd()))
+                })
+                .unwrap_or(old_geo),
+            None => old_geo,
+        };
         let outputs_for_window = self.space.outputs_for_element(&elem);
         let output = outputs_for_window
             .first()
@@ -472,7 +483,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
                     // If surface is maximized then unmaximize it
                     let mut restore_size = None;
-                    if window.is_maximized() {
+                    // The pre-maximize geometry, kept so the move can be
+                    // undone to it below.
+                    let mut unmaximize_from = None;
+                    let maximized = window.is_maximized();
+                    if maximized {
                         if let Err(err) = window.set_maximized(false) {
                             tracing::warn!(?err, "Failed to unset X11 maximized");
                         }
@@ -484,6 +499,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             .and_then(|data| data.restore())
                         {
                             restore_size = Some(old_geo.size);
+                            unmaximize_from = Some(old_geo);
                             if let Err(err) =
                                 window.configure(Rectangle::new(initial_window_location, old_geo.size))
                             {
@@ -496,6 +512,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     // transitions only animate the window's size.
                     self.dragging_window = Some(element.clone());
 
+                    // Record where this move starts from, so a snap applied on
+                    // release (or a fullscreen requested mid-drag) restores to
+                    // that spot. Done before the snap below consumes its
+                    // geometry, and after the unmaximize above so a maximized
+                    // window reports where it is being restored to.
+                    let pre_move = unmaximize_from.and_then(|old_geo| {
+                        relative_geometry_of_rect(&self.space, &element, old_geo)
+                    });
+                    if maximized {
+                        self.note_pre_move_out_of_maximize(&element, pre_move);
+                    } else {
+                        self.note_pre_move(&element, None);
+                    }
+
                     // A snapped window restores to its floating size.
                     if let Some(restored) =
                         self.take_snap_restore_for_drag(&element, start_data.location)
@@ -506,6 +536,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     if let Some(size) = restore_size {
                         self.animate_window(&element, size, initial_window_location);
                     }
+
+                    // Place the window now rather than on the first motion: the
+                    // grab only moves it once the pointer does, and a restore
+                    // transition contributes just its size to the layout
+                    // (`SpaceElement::geometry` leaves the location to the
+                    // space), so the window would otherwise be drawn at its
+                    // stale location until the pointer moves, then jump.
+                    self.space
+                        .map_element(element.clone(), initial_window_location, true);
 
                     let grab = TouchMoveSurfaceGrab {
                         start_data,
@@ -541,7 +580,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         // If surface is maximized then unmaximize it
         let mut restore_size = None;
-        if window.is_maximized() {
+        // The pre-maximize geometry, kept so the move can be undone to it below.
+        let mut unmaximize_from = None;
+        let maximized = window.is_maximized();
+        if maximized {
             if let Err(err) = window.set_maximized(false) {
                 tracing::warn!(?err, "Failed to unset X11 maximized");
             }
@@ -553,6 +595,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .and_then(|data| data.restore())
             {
                 restore_size = Some(old_geo.size);
+                unmaximize_from = Some(old_geo);
                 if let Err(err) = window.configure(Rectangle::new(initial_window_location, old_geo.size))
                 {
                     tracing::warn!(?err, "Failed to configure X11 window");
@@ -564,6 +607,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // animate the window's size.
         self.dragging_window = Some(element.clone());
 
+        // Record where this move starts from, so a snap applied on release (or
+        // a fullscreen requested mid-drag) restores to that spot. Done before
+        // the snap below consumes its geometry, and after the unmaximize above
+        // so a maximized window reports where it is being restored to.
+        let pre_move = unmaximize_from.and_then(|old_geo| {
+            relative_geometry_of_rect(&self.space, &element, old_geo)
+        });
+        if maximized {
+            self.note_pre_move_out_of_maximize(&element, pre_move);
+        } else {
+            self.note_pre_move(&element, None);
+        }
+
+
         // A snapped window restores to its floating size.
         if let Some(restored) =
             self.take_snap_restore_for_drag(&element, self.pointer.current_location())
@@ -574,6 +631,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if let Some(size) = restore_size {
             self.animate_window(&element, size, initial_window_location);
         }
+
+        // Place the window now rather than on the first motion: the grab only
+        // moves it once the pointer does, and a restore transition contributes
+        // just its size to the layout (`SpaceElement::geometry` leaves the
+        // location to the space), so the window would otherwise be drawn at its
+        // stale location until the pointer moves, then jump.
+        self.space
+            .map_element(element.clone(), initial_window_location, true);
 
         let grab = PointerMoveSurfaceGrab {
             start_data,

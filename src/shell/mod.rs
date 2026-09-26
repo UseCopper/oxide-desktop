@@ -67,7 +67,7 @@ pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, Snap, VisibilityState,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, RelativeGeometry, Snap, VisibilityState,
 };
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
@@ -497,6 +497,74 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
     }
 
+    /// Remember where `window` sits so that a snap, maximize, or fullscreen
+    /// triggered while it is being moved restores to where the move started
+    /// rather than to wherever the drag has dragged it to.
+    ///
+    /// `known` carries the geometry the move is already undoing — the pre-maximize
+    /// or pre-snap geometry a tiled or maximized window was popped out of — so the
+    /// pre-move position is the one the user is actually moving away from. A
+    /// floating window has no such geometry, so it is captured as it sits.
+    pub fn note_pre_move(&mut self, window: &WindowElement, known: Option<RelativeGeometry>) {
+        // Resolve the fallback before borrowing the state: capturing the current
+        // geometry reads the window's size, which borrows the state again.
+        let recorded = known.or_else(|| window.snap_floating());
+        let pre_move = match recorded {
+            Some(rel) => Some(rel),
+            None => relative_geometry_of(&self.space, window),
+        };
+        window.decoration_state().pre_move = pre_move;
+    }
+
+    /// Record the pre-move geometry for a move that is popping `window` out of
+    /// the maximized state. A maximized window has no meaningful live position,
+    /// so the pre-maximize geometry *is* the pre-move position — and when the
+    /// maximized state never recorded one there is nothing to record, so any
+    /// earlier entry is dropped rather than replaced with the maximized rect.
+    pub fn note_pre_move_out_of_maximize(
+        &mut self,
+        window: &WindowElement,
+        restore: Option<RelativeGeometry>,
+    ) {
+        window.decoration_state().pre_move = restore;
+    }
+
+    /// Store the geometry a save should treat as `window`'s pre-move position.
+    /// Used to hand a drag's press-time sample over to the save paths, which run
+    /// after the drag itself has been torn down.
+    pub fn set_pre_move(&mut self, window: &WindowElement, pre_move: Option<RelativeGeometry>) {
+        window.decoration_state().pre_move = pre_move;
+    }
+
+    /// The geometry a snap, maximize, or fullscreen of `window` should record:
+    /// where it sat before the move in progress started, so it comes back there
+    /// instead of to wherever the drag left it. Falls back to the window's snap
+    /// group, then to nothing (letting the caller capture the live geometry).
+    ///
+    /// An in-flight SSD drag is consulted first: its origin was sampled at press
+    /// time, which is the only point where the answer is knowable. Only the
+    /// position is sampled there, so the size is read now — safe, because no
+    /// decoration state is borrowed and a drag does not change the size.
+    pub fn take_pre_move_for_save(&mut self, window: &WindowElement) -> Option<RelativeGeometry> {
+        let loc = self
+            .ssd_drag
+            .as_ref()
+            .filter(|drag| drag.window == *window)
+            .and_then(|drag| drag.pre_move_loc);
+        // Built before touching the state: `window.geometry()` reads it.
+        if let Some(rel) = loc.and_then(|loc| relative_geometry_at(&self.space, window, loc)) {
+            window.decoration_state().pre_move = Some(rel);
+        }
+        window.decoration_state().take_floating_for_save()
+    }
+
+    /// Forget a window's pre-move geometry, so the next snap, maximize, or
+    /// fullscreen saves where the window actually sits. Called when a move ends
+    /// without producing a snap; the save paths consume it themselves.
+    pub fn clear_pre_move(&mut self, window: &WindowElement) {
+        window.decoration_state().pre_move = None;
+    }
+
     /// Tile `window` into `target`'s zone. The top zone hands off to the
     /// titlebar maximize button's behaviour; every other zone configures the
     /// client to the zone and animates the frame into place, remembering the
@@ -506,9 +574,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         }
         if target.zone == SnapZone::Maximize {
+            // Hands off to `maximize_window`, which saves through the same
+            // `take_pre_move_for_save` and so consumes the pre-move entry
+            // itself. Taking it here would discard it before that ran, leaving
+            // the maximize to record wherever the drag had moved the window to.
             self.toggle_maximize(window.clone());
             return;
         }
+        // Consumed up front so it can never outlive the move that recorded it,
+        // even when the tiling below turns out to be a no-op.
+        let saved = self.take_pre_move_for_save(window);
         // A fullscreen window covers the output; there is nothing to tile.
         if window.decoration_state().header_bar.fullscreen {
             return;
@@ -521,12 +596,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
-        // Read the already-recorded floating geometry first. `snap_floating`
-        // releases the state borrow before returning, so the fallback (which
-        // reads the window size and borrows the state again) is safe.
-        let floating = window
-            .snap_floating()
-            .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
+        // Prefer the geometry recorded before the move that got us here (or the
+        // one the group was already recording) over where the window sits now,
+        // which a drag may have left anywhere.
+        let floating = saved.or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
         if let Some(floating) = floating {
             window.decoration_state().snap = Some(Snap {
                 zone: target.zone,
