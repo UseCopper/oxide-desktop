@@ -101,9 +101,21 @@ struct WindowInfo {
 }
 
 pub fn run_panel() {
-    let app = Application::builder()
-        .application_id("dev.oxide.Panel")
-        .build();
+    // One panel per compositor, which means one D-Bus application id per
+    // compositor. A shared id makes the session bus treat a second panel as a
+    // remote instance of the first: it forwards its activation to the panel that
+    // is already running and then exits, so the second compositor gets no panel
+    // and the first grows a second window — on its own output, since that
+    // panel's Wayland connection is the one it was started with.
+    //
+    // The compositor hands its socket name to us in `WAYLAND_DISPLAY`, which is
+    // unique per instance (`bind_auto` never reuses a name), so keying the id off
+    // it keeps the panels independent without any extra plumbing.
+    let id = match std::env::var("WAYLAND_DISPLAY") {
+        Ok(socket) if !socket.is_empty() => format!("dev.oxide.Panel.{socket}"),
+        _ => "dev.oxide.Panel".to_string(),
+    };
+    let app = Application::builder().application_id(&id).build();
 
     let stream = connect_panel();
     app.connect_activate(move |app| build_ui(app, stream.clone()));
