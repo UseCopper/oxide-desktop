@@ -67,7 +67,8 @@ pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, RelativeGeometry, Snap, VisibilityState,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, RelativeGeometry, Snap, SpawnPlacement,
+    VisibilityState,
 };
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
@@ -1299,6 +1300,14 @@ fn place_new_window(
         area.loc.y + (area.size.h - size.h).max(0) / 2,
     ));
     space.map_element(window.clone(), location, activate);
+
+    // `size` is zero here — the client has not committed a buffer yet — so the
+    // arithmetic above put the window's *top-left* on the work area's centre
+    // point. Remember where that was and which area it was aimed at, so the
+    // first commit can move the frame the remaining half-size. The area is kept
+    // rather than re-derived later, since a panel appearing or the output layout
+    // changing in between must not make the check disagree with the placement.
+    window.decoration_state().spawn = Some(SpawnPlacement { location, area });
 
     // `map_element(.., true)` only sets the xdg activated state; give the
     // window the actual keyboard focus too.

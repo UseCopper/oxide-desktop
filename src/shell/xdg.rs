@@ -1194,33 +1194,16 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
     // their declared geometry.
     let geometry = window.committed_content_size();
 
-    // A window is spawned before the client has committed a buffer, so the size
-    // that centres it is not known yet and it is placed at the work area's
-    // centre *point*. Now that it has a real size, shift it back by half the
-    // difference so the frame is genuinely centred. Only while it is still
-    // exactly where it was spawned, so a window that has since been moved or
-    // resized is never nudged, and only once, on the first commit.
-    if window.decoration_state().spawn_center_pending {
-        window.decoration_state().spawn_center_pending = false;
-        let size = window.geometry().size;
-        if size.w > 0 && size.h > 0
-            && let Some(area) = super::output_for_window(space, &window)
-                .and_then(|output| super::output_work_area(space, &output))
-        {
-            let spawn = Point::from((
-                area.loc.x + area.size.w / 2,
-                area.loc.y + area.size.h / 2,
-            ));
-            if window_loc == spawn {
-                window_loc = Point::from((
-                    area.loc.x + (area.size.w - size.w).max(0) / 2,
-                    area.loc.y + (area.size.h - size.h).max(0) / 2,
-                ));
-                // Don't raise: this is the window's own first commit, and
-                // stealing focus here would fight the spawn's activation.
-                space.map_element(window.clone(), window_loc, false);
-            }
-        }
+    // `place_new_window` could only center the *point* the window would go to,
+    // because the client picks its own size and had not committed a buffer yet.
+    // Now that there is a size, move the remaining half so the frame is
+    // genuinely centered. Only while the window is still exactly where it was
+    // placed, so a window that has been moved or resized is never nudged.
+    if let Some(centered) = window.spawn_centering(window_loc) {
+        window_loc = centered;
+        // Don't raise: this is the window's own first commit, and stealing focus
+        // here would fight the spawn's activation.
+        space.map_element(window.clone(), window_loc, false);
     }
 
     // A client-decorated unmaximize is waiting for the size the client chose;

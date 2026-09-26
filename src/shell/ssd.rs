@@ -62,12 +62,10 @@ pub struct WindowState {
     /// wherever the drag had dragged it to. Set when a move starts, consumed by
     /// the next save, and dropped when the move ends without one.
     pub pre_move: Option<RelativeGeometry>,
-    /// Whether the window still needs to be centred on its output. A window is
-    /// spawned before the client has committed a buffer, so its size — and
-    /// therefore the offset that centres it — is not yet known; it is placed at
-    /// the work area's centre point and straightened out on the first commit.
-    /// Cleared by that commit, so a window is only ever nudged once.
-    pub spawn_center_pending: bool,
+    /// Where a freshly spawned window was placed, and the work area it was aimed
+    /// at, so its first commit can finish centering it. See
+    /// [`SpawnPlacement`].
+    pub spawn: Option<SpawnPlacement>,
     /// An in-flight maximize/unmaximize transition, if any. While set, the
     /// window is drawn at the sampled geometry instead of its committed size.
     pub animation: Option<WindowAnimation>,
@@ -82,6 +80,21 @@ pub struct WindowState {
     /// lazily the first time the window list is published.
     pub panel_id: Option<u64>,
     pub header_bar: HeaderBar,
+}
+
+/// Where a new window was placed, and the work area it was centered against.
+///
+/// A client picks its own size, so at spawn time there is no size to center
+/// *on*: [`place_new_window`](super::place_new_window) can only map the window to
+/// the work area's centre **point**, which leaves the frame sitting down and to
+/// the right of centre by half its size. The size only becomes known at the
+/// client's first commit, which is where this is used to finish the job.
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnPlacement {
+    /// The location the window was mapped to.
+    pub location: Point<i32, Logical>,
+    /// The work area the window was centered against.
+    pub area: Rectangle<i32, Logical>,
 }
 
 /// Where a window returns to when it stops being fullscreen or maximized.
@@ -1093,7 +1106,7 @@ impl WindowElement {
                 snap: None,
                 relative: None,
                 pre_move: None,
-                spawn_center_pending: true,
+                spawn: None,
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,
@@ -1159,6 +1172,35 @@ impl WindowElement {
     /// otherwise re-enter the `RefCell` and panic.
     pub fn with_state<R>(&self, f: impl FnOnce(&mut WindowState) -> R) -> R {
         f(&mut self.decoration_state())
+    }
+
+    /// The location this window should be moved to in order to finish centering
+    /// it, given that it currently sits at `window_loc`.
+    ///
+    /// Returns `None` — and stops tracking the spawn — once the window is no
+    /// longer exactly where it was placed, or has been placed by something other
+    /// than [`place_new_window`](super::place_new_window). Keeps waiting while
+    /// the size is still unknown, since the first commit can precede the size
+    /// being available.
+    pub fn spawn_centering(
+        &self,
+        window_loc: Point<i32, Logical>,
+    ) -> Option<Point<i32, Logical>> {
+        let spawn = self.decoration_state().spawn?;
+        if window_loc != spawn.location {
+            // Moved before it ever had a size: leave it alone from now on.
+            self.decoration_state().spawn = None;
+            return None;
+        }
+        let size = self.geometry().size;
+        if size.w <= 0 || size.h <= 0 {
+            return None;
+        }
+        self.decoration_state().spawn = None;
+        Some(Point::from((
+            spawn.area.loc.x + (spawn.area.size.w - size.w).max(0) / 2,
+            spawn.area.loc.y + (spawn.area.size.h - size.h).max(0) / 2,
+        )))
     }
 
     /// The ghost tracking for this window, if its decoration state was ever set
