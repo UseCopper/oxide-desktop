@@ -73,7 +73,7 @@ use smithay::{
         },
         drm::{
             Device as _,
-            control::{Device, ModeTypeFlags, connector, crtc},
+            control::{Device, Mode, ModeFlags, ModeTypeFlags, connector, crtc},
         },
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
@@ -652,6 +652,11 @@ struct SurfaceData {
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     last_presentation_time: Option<Time<Monotonic>>,
     vblank_throttle_timer: Option<RegistrationToken>,
+    /// How long the last repaint of this surface took, smoothed. The repaint
+    /// delay before the next frame is derived from this: the later we can
+    /// composite while still finishing before the vblank, the fresher the
+    /// client's post-frame-callback buffer is when we do.
+    last_render_duration: Duration,
 }
 
 impl Drop for SurfaceData {
@@ -695,6 +700,83 @@ enum DeviceAddError {
     NoRenderNode,
     #[error("Primary GPU is missing")]
     PrimaryGpuMissing,
+}
+
+/// A mode's refresh rate in Hz, derived the way the kernel and wlroots do:
+/// `clock * 1000 / (htotal * vtotal)`, doubled for interlaced modes since the
+/// timing describes fields rather than frames.
+///
+/// `None` for a mode with an empty timing, which some drivers list alongside the
+/// real ones.
+fn mode_refresh_hz(mode: &Mode) -> Option<f64> {
+    let (_, _, htotal) = mode.hsync();
+    let (_, _, vtotal) = mode.vsync();
+    let total = u64::from(htotal) * u64::from(vtotal);
+    if total == 0 || mode.clock() == 0 {
+        return None;
+    }
+    let mut refresh = f64::from(mode.clock()) * 1000.0 / total as f64;
+    if mode.flags().contains(ModeFlags::INTERLACE) {
+        refresh *= 2.0;
+    }
+    Some(refresh)
+}
+
+/// The mode to run a connector at: the highest resolution it offers, and within
+/// that the highest refresh rate.
+///
+/// The kernel's `PREFERRED` flag is deliberately not the criterion — it is
+/// whatever the EDID advertises as ideal, which is frequently the *lowest*
+/// refresh rate at native resolution, or a mode chosen for silence rather than
+/// smoothness.
+///
+/// `OXIDE_MODE` overrides the choice by matching the start of a mode's name, so
+/// `OXIDE_MODE=1920x1080` pins the highest-refresh 1080p mode and
+/// `OXIDE_MODE=1920x1080@60` pins an exact one. This is the escape hatch for a
+/// sink whose highest mode it cannot sustain: the mode list is what the sink
+/// reports, not what the CRTC can scan out, so the two can disagree.
+fn best_mode(connector: &connector::Info) -> Option<Mode> {
+    let modes = connector.modes();
+    if modes.is_empty() {
+        return None;
+    }
+
+    if let Ok(requested) = std::env::var("OXIDE_MODE")
+        && let Some(mode) = modes
+            .iter()
+            .find(|mode| mode.name().to_bytes().starts_with(requested.as_bytes()))
+    {
+        return Some(*mode);
+    }
+
+    // Interlaced and double-scan modes report timings that do not mean what the
+    // plain formula assumes, and they are never what "highest resolution and
+    // framerate" is asking for, so they are only used as a last resort.
+    let usable = |mode: &&Mode| !mode.flags().intersects(ModeFlags::INTERLACE | ModeFlags::DBLSCAN);
+
+    let mut best: Option<&Mode> = None;
+    let mut best_key = (0u64, 0.0f64);
+    for mode in modes.iter().filter(usable) {
+        let (Some(refresh), (w, h)) = (mode_refresh_hz(mode), mode.size()) else {
+            continue;
+        };
+        let key = (u64::from(w) * u64::from(h), refresh);
+        if best.is_none() || key.0 > best_key.0 || (key.0 == best_key.0 && key.1 > best_key.1) {
+            best = Some(mode);
+            best_key = key;
+        }
+    }
+    if best.is_some() {
+        return best.copied();
+    }
+
+    // Nothing but interlaced/double-scan modes: fall back to the kernel's
+    // preference, then to whatever the connector listed first.
+    modes
+        .iter()
+        .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| modes.first())
+        .copied()
 }
 
 fn get_surface_dmabuf_feedback(
@@ -958,14 +1040,18 @@ impl AnvilState<UdevData> {
                 );
             }
         } else {
-            let mode_id = connector
-                .modes()
-                .iter()
-                .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .unwrap_or(0);
-
-            let drm_mode = connector.modes()[mode_id];
+            let Some(drm_mode) = best_mode(&connector) else {
+                warn!(?output_name, "Connector reported no usable modes");
+                return;
+            };
             let wl_mode = WlMode::from(drm_mode);
+            info!(
+                ?output_name,
+                mode = ?String::from_utf8_lossy(drm_mode.name().to_bytes()),
+                resolution = ?drm_mode.size(),
+                refresh_hz = mode_refresh_hz(&drm_mode),
+                "Selected mode",
+            );
 
             let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
             let output = Output::new(
@@ -1073,6 +1159,7 @@ impl AnvilState<UdevData> {
                 dmabuf_feedback,
                 last_presentation_time: None,
                 vblank_throttle_timer: None,
+                last_render_duration: Duration::ZERO,
             };
 
             device.surfaces.insert(crtc, surface);
@@ -1370,9 +1457,20 @@ impl AnvilState<UdevData> {
             // this results in approx. 3.33ms time for repainting in the compositor.
             // A too big delay could result in missing the next VBlank in the compositor.
             //
+            // Rather than assume a fixed fraction of the frame, spend what the
+            // frame has left after subtracting the repaint we actually measured:
+            // the goal is to composite as late as possible while still landing
+            // before the vblank, so the only thing that should shorten the delay
+            // is our own rendering being slow. A slow repaint is exactly the case
+            // a fixed fraction gets wrong — it would compound with the delay and
+            // miss the vblank, costing a whole frame.
+            //
             // A more complete solution could work on a sliding window analyzing past repaints
             // and do some prediction for the next repaint.
-            let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6f64);
+            let headroom = frame_duration / 10;
+            let repaint_delay = frame_duration
+                .saturating_sub(surface.last_render_duration)
+                .saturating_sub(headroom);
 
             let timer = if surface
                 .render_node
@@ -1513,6 +1611,12 @@ impl AnvilState<UdevData> {
             &mut self.cursor_status,
             self.show_window_preview,
         );
+
+        // Smoothed so a single slow frame — a client uploading a texture, say —
+        // does not collapse the repaint delay for the frames after it, while a
+        // consistently slow repaint shortens the delay immediately.
+        surface.last_render_duration = (surface.last_render_duration * 3 / 4).max(start.elapsed());
+
         let reschedule = match result {
             Ok((has_rendered, states)) => {
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
