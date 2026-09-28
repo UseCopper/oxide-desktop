@@ -4,8 +4,14 @@
 //! window list directly. A tiny newline/tab-delimited protocol over a Unix
 //! socket connects the two:
 //!
-//! * compositor -> panel: `list\t<count>\t<id>\t<focused>\t<app_id>\t<title>...`
-//! * panel -> compositor: `focus\t<id>`
+//! * compositor -> panel: `list\t<count>\t<id>\t<focused>\t<minimized>\t<app_id>\t<title>...`
+//!   then one `img\t<id>\t<width>\t<height>\t<sequence>` header and its RGBA
+//!   payload per preview
+//! * panel -> compositor: `focus\t<id>`, `close\t<id>`, `launch\t<app_id>`,
+//!   `preview\t<id>\t<width>\t<height>\t<wanted>`, `accent\t<r>\t<g>\t<b>`
+//!
+//! `launch` carries an app id rather than a command, and the compositor resolves it
+//! against the installed desktop entries before running anything.
 //!
 //! The socket is polled from [`AnvilState::tick_panel`] (driven by the frame
 //! loop), so no calloop source is needed.
@@ -68,6 +74,12 @@ pub enum PanelMessage {
     Focus(u64),
     /// Close the window with this id, and only that one.
     Close(u64),
+    /// Start the app with this id.
+    ///
+    /// An id rather than a command line, so the panel cannot ask for something to be
+    /// run that was never an installed application: the compositor looks the id up in
+    /// the desktop entries itself and runs what it finds, or nothing.
+    Launch(String),
     /// The panel is showing a picker and wants a preview of this window, scaled
     /// to fit inside the given box.
     Preview {
@@ -183,6 +195,15 @@ impl PanelIpc {
             } else if let Some(rest) = line.strip_prefix("close\t") {
                 if let Ok(id) = rest.trim().parse::<u64>() {
                     messages.push(PanelMessage::Close(id));
+                }
+            } else if let Some(rest) = line.strip_prefix("launch\t") {
+                // An app id can be anything a client put in `app_id`, so it is framed
+                // the same way every other field on this socket is: no tabs, no
+                // newlines, so one message can never arrive as two.
+                let mut id = String::new();
+                push_sanitized(&mut id, rest);
+                if !id.is_empty() {
+                    messages.push(PanelMessage::Launch(id));
                 }
             } else if let Some(rest) = line.strip_prefix("preview\t") {
                 let mut parts = rest.split('\t');
@@ -310,6 +331,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             match message {
                 PanelMessage::Focus(id) => self.focus_panel_window(id),
                 PanelMessage::Close(id) => self.close_panel_window(id),
+                PanelMessage::Launch(id) => self.launch_app(&id),
                 PanelMessage::Accent(rgb) => crate::shell::set_preview_color(rgb),
                 PanelMessage::Preview {
                     id,
@@ -468,6 +490,48 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
         self.close_window(window);
+    }
+
+    /// Start the app the panel named, from its desktop entry.
+    ///
+    /// Spawned here rather than by the panel, for two reasons. The app becomes a
+    /// child of the session rather than of the panel, which the compositor can
+    /// outlive; and the command that runs is one the compositor looked up itself, out
+    /// of the installed entries, rather than a string the panel sent over a socket.
+    ///
+    /// An id with no entry, or an entry with nothing runnable in it, is reported and
+    /// otherwise ignored. A pinned app whose entry has since been uninstalled is the
+    /// case that actually happens.
+    fn launch_app(&mut self, id: &str) {
+        use std::process::{Command, Stdio};
+
+        let Some(app) = crate::desktop::lookup(id) else {
+            warn!(app = %id, "Panel asked to launch an app with no desktop entry");
+            return;
+        };
+        let Some((program, arguments)) = app.command() else {
+            warn!(app = %id, exec = %app.exec, "Desktop entry has nothing runnable");
+            return;
+        };
+
+        let spawned = Command::new(&program)
+            .args(&arguments)
+            // Nothing of ours on its standard streams: the app would otherwise
+            // inherit this process's terminal and be killed with it.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                tracing::info!(app = %id, name = %app.label(), pid = child.id(), "Launched");
+                // Deliberately not waited on. Reaping it would mean holding a list of
+                // children for a panel that is a UI and has better things to do, and a
+                // child that exits on its own is reaped by init either way.
+                drop(child);
+            }
+            Err(err) => warn!(app = %id, program = %program, %err, "Failed to launch app"),
+        }
     }
 
     /// Build the `list\t...` snapshot of every open window, including minimized
