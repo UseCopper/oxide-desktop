@@ -39,6 +39,12 @@ use crate::{
 const PANEL_THUMBNAILS_PER_TICK: usize = 2;
 
 /// The per-tick preview budget, overridable for a faster GPU.
+/// How many queued requests one tick may look at, over and above the render budget.
+///
+/// Only a backstop: a window that needs no render is dropped from the queue as it is
+/// seen, so this is not normally reached.
+const PANEL_PREVIEWS_EXAMINED_PER_TICK: usize = 32;
+
 fn panel_thumbnails_per_tick() -> usize {
     std::env::var("OXIDE_PANEL_THUMBNAILS_PER_TICK")
         .ok()
@@ -68,6 +74,16 @@ pub enum PanelMessage {
         id: u64,
         max_width: i32,
         max_height: i32,
+        /// The panel has nothing for this window, so answer even if the pixels have
+        /// not changed.
+        ///
+        /// A window that cannot be rendered — minimized, so unmapped and with nothing
+        /// to capture — can only be answered from the last frame captured for it, and
+        /// the panel is asking precisely because it does not have that frame. Without
+        /// this the request would be dropped as already-current and the panel would
+        /// never get one, so its cell would stay blank and, since the menu waits for
+        /// a preview of everything it is about to show, the menu would not open.
+        wanted: bool,
     },
     /// The desktop accent color, as linear-ish sRGB components.
     Accent([f32; 3]),
@@ -78,6 +94,7 @@ pub enum PanelMessage {
 ///
 /// The payload is length-prefixed rather than newline-terminated because raw
 /// pixels contain newlines, which would otherwise truncate the message.
+#[derive(Debug, Clone)]
 pub struct PanelImage {
     pub id: u64,
     pub width: i32,
@@ -174,10 +191,15 @@ impl PanelIpc {
                     && w > 0
                     && h > 0
                 {
+                    // A fourth field: whether the panel already has an image for
+                    // this window. Absent means no, which is the safe reading — the
+                    // cost of answering with the last frame is one cached image.
+                    let wanted = parts.next().map(|flag| flag == "1").unwrap_or(true);
                     messages.push(PanelMessage::Preview {
                         id,
                         max_width: w,
                         max_height: h,
+                        wanted,
                     });
                 }
             } else if let Some(rest) = line.strip_prefix("accent\t") {
@@ -271,6 +293,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(ipc) => ipc.poll(),
             None => return,
         };
+        // Windows the panel said it had nothing for.
+        let mut panel_wants: Vec<u64> = Vec::new();
         // Preview renders are budgeted per tick. One costs a readback of the
         // window's whole content plus an area-average over it, so answering every
         // request that has piled up would put all of that in a single frame and
@@ -291,7 +315,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     id,
                     max_width,
                     max_height,
+                    wanted,
                 } => {
+                    if wanted {
+                        panel_wants.push(id);
+                    }
                     if self.panel_preview_queued.insert(id) {
                         self.panel_preview_queue.push_back(id);
                     }
@@ -306,21 +334,63 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // A window that has gone is not worth a special case here: popping it and
         // finding nothing to render is the same outcome, and this way there is one
         // place that knows what a live window is.
-        for _ in 0..panel_thumbnails_per_tick() {
-            let Some(id) = self.panel_preview_queue.pop_front() else {
+        // The budget counts *renders*, not requests looked at. A window already
+        // showing the right pixels costs nothing to skip and must not use a slot:
+        // otherwise the same windows at the front of the queue are examined every
+        // tick, render nothing because they are static, and a window that has
+        // actually changed behind them is never reached at all. That is what a
+        // multi-window menu looks like from here — the frames never arrive.
+        //
+        // Bounded so that a queue full of unchanged windows cannot spin: past this
+        // many the rest waits for the next tick, which is the same as before.
+        let budget = panel_thumbnails_per_tick();
+        // Carried out of the message pass: which of the queued windows the panel
+        // said it had no image for, and so must be answered even if the pixels have
+        // not moved.
+        let mut rendered = 0;
+        let mut examined = 0;
+        while rendered < budget && examined < PANEL_PREVIEWS_EXAMINED_PER_TICK {
+            let Some(id) = self.panel_preview_queue.front().copied() else {
                 break;
             };
-            self.panel_preview_queued.remove(&id);
-            // No size means the window was dropped while queued; the panel asks again
-            // on its next tick, so there is nothing to do but move on.
-            let Some((max_width, max_height)) = self.panel_preview_sizes.remove(&id) else {
+            examined += 1;
+            let forget = |state: &mut Self, id: u64| {
+                state.panel_preview_queue.pop_front();
+                state.panel_preview_queued.remove(&id);
+                state.panel_preview_sizes.remove(&id);
+            };
+            // No size recorded means a stale entry left over from an earlier request.
+            let Some((max_width, max_height)) = self.panel_preview_sizes.get(&id).copied() else {
+                forget(self, id);
                 continue;
             };
-            let Some(image) = self.render_panel_thumbnail(id, max_width, max_height) else {
+            if self.panel_preview_is_current(id) && !panel_wants.contains(&id) {
+                // Already right on the panel's screen. Drop the request, and do not
+                // spend one of the renders on finding that out.
+                forget(self, id);
                 continue;
+            }
+            forget(self, id);
+            // A live render if there is one, and the last captured frame if there is
+            // not: a minimized window is unmapped, so there is nothing to capture and
+            // the panel is left showing whatever it last had, which for a window it
+            // has never seen is nothing at all. Holding the frame here is what lets a
+            // minimized window keep a preview instead of going blank.
+            let rendered_fresh = self.render_panel_thumbnail(id, max_width, max_height);
+            let image = match rendered_fresh {
+                Some(image) => {
+                    self.panel_cached_previews.insert(id, image.clone());
+                    Some(image)
+                }
+                // Nothing to capture — a minimized window is unmapped — so answer
+                // from the last frame that was captured for it.
+                None => self.panel_cached_preview(id),
             };
-            if let Some(ipc) = self.panel_ipc.as_mut() {
-                ipc.send_image(image);
+            if let Some(image) = image {
+                rendered += 1;
+                if let Some(ipc) = self.panel_ipc.as_mut() {
+                    ipc.send_image(image);
+                }
             }
         }
         let snapshot = self.panel_snapshot();
@@ -343,25 +413,40 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         max_height: i32,
     ) -> Option<PanelImage> {
         let window = self.panel_window(id)?;
-        // Skip a window whose contents have not moved on: the panel is already
-        // showing the right pixels, and rendering a preview means reading the
-        // window's full content back off the GPU. This is what lets the picker
-        // poll fast enough to look live.
-        let generation = window.decoration_state().content_generation;
-        if window.decoration_state().previewed_generation == Some(generation) {
-            return None;
-        }
         let max = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((max_width, max_height));
         let Some((size, pixels)) = self.backend_data.panel_thumbnail(&window, max) else {
             return None;
         };
-        window.decoration_state().previewed_generation = Some(generation);
+        let generation = window.with_state(|state| state.content_generation);
+        window.with_state(|state| state.previewed_generation = Some(generation));
         Some(PanelImage {
             id,
             width: size.w,
             height: size.h,
             pixels,
         })
+    }
+
+    /// Answer a request from the last frame captured for that window, if any.
+    fn panel_cached_preview(&self, id: u64) -> Option<PanelImage> {
+        self.panel_cached_previews.get(&id).cloned()
+    }
+
+    /// Whether the panel is already showing the right pixels for this window.
+    ///
+    /// Rendering a preview reads the window's full content back off the GPU, so a
+    /// window whose contents have not moved on is skipped. That is what lets the
+    /// picker poll fast enough to look live — and it is why skipping must not cost
+    /// the same as rendering.
+    fn panel_preview_is_current(&self, id: u64) -> bool {
+        let Some(window) = self.panel_window(id) else {
+            return false;
+        };
+        // Through `with_state`, so the borrow cannot span anything. Two
+        // `decoration_state()` calls in a single expression are two `RefMut`s alive
+        // at once and the second panics, which is what opening a menu with more than
+        // one window did.
+        window.with_state(|state| state.previewed_generation == Some(state.content_generation))
     }
 
     /// The window with this panel id, if it is still open (minimized windows
@@ -372,7 +457,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .chain(self.minimized.iter().map(|(window, _)| window))
             .find(|window| {
                 !window.is_ghosting()
-                    && window.decoration_state().panel_id == Some(id)
+                    && window.with_state(|state| state.panel_id) == Some(id)
             })
             .cloned()
     }
@@ -386,8 +471,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 
     /// Build the `list\t...` snapshot of every open window, including minimized
-    /// ones (which are unmapped from `Space`). Each window gets its own entry,
-    /// so several instances of the same app stay distinct.
+    /// ones (which are unmapped from `Space`). Each window gets its own entry, so
+    /// several instances of the same app stay distinct.
+    ///
+    /// Minimized windows are sent, and flagged. They are not gone — the app still has
+    /// them, and the bar should say so — but there is nothing on screen to capture a
+    /// preview from, so the panel must not offer one. Sending them and letting the
+    /// panel decide is the difference between "minimized" and "closed"; hiding them
+    /// here made the two look the same.
     fn panel_snapshot(&mut self) -> String {
         let mut windows: Vec<(WindowElement, bool)> = self
             .space
@@ -414,15 +505,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 continue;
             }
             // Assign a stable id the first time the window is published.
-            let id = if let Some(id) = window.decoration_state().panel_id {
-                id
-            } else {
-                let id = self.next_panel_id;
-                self.next_panel_id += 1;
-                window.decoration_state().panel_id = Some(id);
-                id
+            let id = match window.with_state(|state| state.panel_id) {
+                Some(id) => id,
+                None => {
+                    let id = self.next_panel_id;
+                    self.next_panel_id += 1;
+                    window.with_state(|state| state.panel_id = Some(id));
+                    id
+                }
             };
 
+            // One tab-separated field each, in this order, which is what
+            // `parse_snapshot` reads: id, focused, minimized, app id, title. Removing
+            // one of these means removing its leading tab too, or the panel reads the
+            // gap as a field and rejects the whole snapshot.
             let app_id = window.app_id().unwrap_or_default();
             let title = window.title().unwrap_or_default();
             entries.push('\t');
@@ -446,7 +542,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .space
             .elements()
             .chain(self.minimized.iter().map(|(window, _)| window))
-            .find(|window| window.decoration_state().panel_id == Some(id))
+            .find(|window| window.with_state(|state| state.panel_id) == Some(id))
             .cloned();
         let Some(window) = window else {
             return;

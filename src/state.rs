@@ -221,6 +221,11 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// Which of those are already queued, so a window asked for again while it
     /// waits is not queued twice.
     pub panel_preview_queued: std::collections::HashSet<u64>,
+    /// The last frame captured for each window, so a window that can no longer be
+    /// rendered — a minimized one, which is unmapped and has nothing to capture — can
+    /// still be answered. The panel keeps showing whatever it last had otherwise, and
+    /// for a window it has never seen that would be nothing at all.
+    pub panel_cached_previews: std::collections::HashMap<u64, crate::panel_ipc::PanelImage>,
     /// The size each queued window was asked for, carried with it rather than
     /// remembered per tick: a window can be queued on one tick and come up for
     /// service several ticks later, and keeping the size only for the tick it
@@ -872,6 +877,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             next_panel_id: 1,
         panel_preview_queue: std::collections::VecDeque::new(),
         panel_preview_queued: std::collections::HashSet::new(),
+        panel_cached_previews: std::collections::HashMap::new(),
         panel_preview_sizes: std::collections::HashMap::new(),
         };
 

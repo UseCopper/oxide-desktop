@@ -132,6 +132,15 @@ const CLOSE_HOVER: (f64, f64, f64) = (1.0, 1.0, 1.0);
 const CLOSE_HOVER_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
 /// The preview size asked of the compositor, which bounds what can arrive.
 const PREVIEW_TARGET: (i32, i32) = (PREVIEW_MAX_CELL, PREVIEW_HEIGHT);
+/// The two kinds of preview request, as the flag the panel sends.
+///
+/// A refresh is the timer asking whether anything has moved; a wanted request is the
+/// panel saying it has no image for that window yet. Only the second has to be
+/// answered when the pixels have not changed, which is what lets a minimized window
+/// be sent the last frame captured for it instead of nothing.
+const WANTED: u8 = 1;
+const REFRESH: u8 = 0;
+
 /// How often an open menu asks for fresh previews, so a window that is animating
 /// or playing video reads as live rather than frozen.
 ///
@@ -142,6 +151,23 @@ const PREVIEW_REFRESH: Duration = Duration::from_millis(33);
 /// How long an entry takes to grow from nothing to its width, or to shrink to
 /// nothing, when a window appears or goes.
 const CELL_MORPH: Duration = Duration::from_millis(220);
+/// Where a phase's curve finishes, as a fraction of its clock.
+///
+/// Both curves approach their end asymptotically, so the last tenth of a phase moves
+/// the value by less than a pixel and then the animation sits there visibly doing
+/// nothing. The log showed it: `growing 1.00` for five frames before the fade even
+/// began, and the same dead tail on the way down. The curve is reparametrised to
+/// finish here instead, which keeps its shape and spends no frames on the tail.
+const PHASE_END: f64 = 0.85;
+
+/// A phase's value at `elapsed`, and whether it is finished.
+fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
+    if elapsed >= PHASE_END {
+        return (1.0, true);
+    }
+    (ease(elapsed / PHASE_END), false)
+}
+
 /// How long a window takes to fade in or out, separately from the width, because
 /// the two run one after the other rather than together.
 const CELL_FADE: Duration = Duration::from_millis(140);
@@ -326,8 +352,13 @@ struct MenuEntry {
     rect: Cell<Rect>,
     /// The width this entry has settled at, from its preview's aspect.
     target: Cell<i32>,
-    /// How wide it is, 0 to 1 of `target`.
+    /// How wide it is, in pixels, borders included.
     width: Cell<f64>,
+    /// The two ends of the width motion, in the same pixels. The motion eases
+    /// between these rather than towards a fraction of a target, so that changing
+    /// the target part way through moves where it is going without moving the cell.
+    from: Cell<f64>,
+    to: Cell<f64>,
     /// How opaque it is, 0 to 1.
     alpha: Cell<f64>,
     /// Which part of the way in or out it is on.
@@ -359,6 +390,54 @@ enum Motion {
 }
 
 impl MenuEntry {
+    /// The width a settled entry sits at: its preview plus the cell's borders.
+    fn full_width(&self) -> f64 {
+        f64::from(self.target.get() + CELL_BORDER * 2)
+    }
+
+    /// Put the cell at its settled width, with no motion.
+    fn snap_to_full(&self) {
+        let full = self.full_width();
+        self.from.set(full);
+        self.to.set(full);
+        self.width.set(full);
+    }
+
+    /// Aim the width motion at the entry's current target, without moving the cell.
+    ///
+    /// A preview landing mid-motion changes the width the cell is heading for. When
+    /// the cell's width was a fraction of that target, taking the new one resized the
+    /// cell underneath the curve: the surface jumped 42px in a single frame while the
+    /// cell eased from 0.93 to 0.97, and every refresh of a live preview did it again.
+    /// The motion is in pixels now, so all that changes here is where it is going —
+    /// `from` is moved so the value at the current point of the curve is still exactly
+    /// the width on screen, and the cell carries on to the new width without a step.
+    fn reaim(&self) {
+        match self.motion.get() {
+            // On its way out: the width is already closing to nothing, and where it
+            // began is behind it.
+            Motion::FadingOut | Motion::Shrinking => {}
+            // Settled: nothing is easing, so a window that changed size is simply a
+            // new width, and it takes effect at once.
+            Motion::Settled => self.snap_to_full(),
+            Motion::Growing | Motion::FadingIn => {
+                let to = self.full_width();
+                let f = phase_value(ease_in_out, self.elapsed.get()).0;
+                // Solve `from + (to - from) * f == width` for `from`, so the curve
+                // passes through the width that is on screen right now. At the end of
+                // the phase there is no curve left to bend and the motion simply
+                // restarts from where the cell is.
+                let from = if f >= 1.0 {
+                    self.width.get()
+                } else {
+                    (self.width.get() - to * f) / (1.0 - f)
+                };
+                self.from.set(from);
+                self.to.set(to);
+            }
+        }
+    }
+
     fn new(info: &WindowInfo) -> Self {
         Self {
             title: RefCell::new(window_title(info)),
@@ -369,6 +448,8 @@ impl MenuEntry {
             // the same motion as a window appearing in an already open menu.
             target: Cell::new(PREVIEW_HEIGHT),
             width: Cell::new(0.0),
+            from: Cell::new(0.0),
+            to: Cell::new(PREVIEW_HEIGHT as f64 + CELL_BORDER as f64 * 2.0),
             alpha: Cell::new(0.0),
             motion: Cell::new(Motion::Growing),
             elapsed: Cell::new(0.0),
@@ -558,10 +639,7 @@ impl Menu {
             .borrow()
             .iter()
             .filter_map(|id| entries.get(id))
-            .map(|entry| {
-                let full = entry.target.get() + CELL_BORDER * 2;
-                (f64::from(full) * entry.width.get()).round().max(0.0) as i32
-            })
+            .map(|entry| entry.width.get().round().max(0.0) as i32)
             .collect()
     }
 
@@ -569,14 +647,16 @@ impl Menu {
     fn ready(&self) -> bool {
         let order = self.order.borrow();
         let entries = self.entries.borrow();
-        !order.is_empty() && order.iter().all(|id| {
-            entries
-                .get(id)
-                .is_some_and(|entry| {
-                    entry.motion.get() != Motion::Shrinking
-                        && entry.preview.borrow().is_some()
-                })
-        })
+        // One preview is enough to open. Waiting for every one of them let a single
+        // window that could never produce an image keep the whole menu shut; the rest
+        // fill in as they land, and the reveal fallback still covers a window that
+        // produces none at all.
+        !order.is_empty()
+            && order.iter().any(|id| {
+                entries
+                    .get(id)
+                    .is_some_and(|entry| entry.preview.borrow().is_some())
+            })
     }
 
     /// What the pointer is over, worked out from where it is and the current layout.
@@ -668,19 +748,20 @@ fn build_menu(
     {
         let menu = menu.clone();
         canvas.add_tick_callback(move |_, clock| {
-            if menu.morphing.get() {
-                // The clock's own timestamp for this frame, differenced against the
-                // last one. The binding does not hand the frame time over, and using
-                // the clock's is better anyway: it is the time the frame is being
-                // presented at, not the time a timer happened to be serviced.
-                let now = clock.frame_time();
-                let previous = menu.last_frame.replace(now);
-                // The very first frame of a motion has no previous one, so it is worth
-                // nothing: stepping on it would jump the motion forward by a whole
-                // frame the caller never waited for.
-                if now > previous {
-                    tick_morph(&menu, now - previous);
-                }
+            // The clock's own timestamp for this frame, differenced against the last
+            // one. The binding does not hand the frame time over, and using the
+            // clock's is better anyway: it is the time the frame is being presented
+            // at, not the time a timer happened to be serviced.
+            let now = clock.frame_time();
+            let previous = menu.last_frame.replace(now);
+            // Taken on *every* frame, motion or not. Only reading it while a motion
+            // was running left it holding the timestamp of the last animation, so the
+            // first frame of the next one differenced against seconds ago — and the
+            // step is capped, so the whole 100ms landed in that one frame. Every
+            // motion then began most of the way through: a fade-out opening at 0.64
+            // instead of 1.0, a grow opening at 84% of its width.
+            if menu.morphing.get() && now > previous {
+                tick_morph(&menu, now - previous);
             }
             glib::ControlFlow::Continue
         });
@@ -860,6 +941,12 @@ fn draw_menu(menu: &Rc<Menu>, context: &gtk4::cairo::Context, width: i32, height
         // The outline last of all: the preview covers the whole of the cell below
         // the strip, so a border stroked before it had its left, right and bottom
         // edges painted over and the cell read as having no outline at all.
+        //
+        // In a group of its own, so it fades with the cell instead of staying at
+        // full strength while everything inside it faded away. An outline is the
+        // thing you see last when a cell dissolves, so this left a hard edge drawn
+        // around nothing for the whole of the fade out.
+        let _ = context.push_group();
         set_source(context, edge);
         context.set_line_width(1.0);
         rounded_top_rectangle(
@@ -871,6 +958,8 @@ fn draw_menu(menu: &Rc<Menu>, context: &gtk4::cairo::Context, width: i32, height
             CELL_RADIUS,
         );
         let _ = context.stroke();
+        let _ = context.pop_group_to_source();
+        let _ = context.paint_with_alpha(alpha);
     }
 }
 
@@ -1024,26 +1113,24 @@ fn rounded_top_rectangle(
     let _ = context.close_path();
 }
 
-/// Ease out cubic: quick off the mark, then asymptotic to the target.
+/// Ease in and out: slowest and fastest at the ends, quickest in the middle.
 ///
-/// The same curve the menu's reveal uses, so a window arriving and the menu
-/// arriving have the same feel. `t` is 0 to 1.
-fn ease_out(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
-}
-
-/// Ease in cubic: slow off the mark, then away quickly.
+/// What a fade uses, in both directions, so fading in and fading out are the same
+/// motion played forwards and backwards.
 ///
-/// The mirror of [`ease_out`], and what a fade *out* needs. Using the other curve
-/// meant the opacity was already down to a quarter within one tick — ease-out is
-/// quickest at the start, which is the opposite of what a fade wants — so the
-/// departure looked instantaneous and then appeared to hang on nothing while the
-/// width phase caught up. Mirrored, fading in and fading out are the same motion
-/// played forwards and backwards.
-fn ease_in(t: f64) -> f64 {
+/// It was cubic ease-in, the mirror of the cubic ease-out, on the reasoning that a fade
+/// should be quick to leave. But a cubic is far too extreme for opacity: `1 - t^3` is
+/// still above 0.87 halfway through the phase, so the cell sat there looking
+/// unchanged and then the whole fade happened in three frames. The departure read as
+/// a wait followed by a disappearance, and the shrink that follows then appeared to
+/// start from nowhere. Opacity wants to be moving at a visible rate for the whole
+/// phase, which is what this does: it starts on the first frame and arrives at zero
+/// smoothly.
+///
+/// The widths keep their cubic ease-out. A width *should* commit and settle.
+fn ease_in_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
-    t.powi(3)
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// One step of a path.
@@ -1217,6 +1304,7 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
     // that can overrun a frame, and a fixed increment turns a dropped frame into an
     // animation that runs slow instead of one that skips. Capped, so a long stall —
     // a modal, a window drag — resumes rather than jumping to the end.
+    let stepped = frame_time > 0;
     let elapsed_seconds = (frame_time as f64 / 1_000_000.0).clamp(0.0, 0.1);
     let width_step = elapsed_seconds / CELL_MORPH.as_secs_f64();
     let fade_step = elapsed_seconds / CELL_FADE.as_secs_f64();
@@ -1243,8 +1331,9 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
                     };
                     let elapsed = (entry.elapsed.get() + fade_step).min(1.0);
                     entry.elapsed.set(elapsed);
-                    entry.alpha.set(1.0 - ease_in(elapsed));
-                    hidden &= entry.alpha.get() <= 0.0;
+                    let (value, done) = phase_value(ease_in_out, elapsed);
+                    entry.alpha.set(1.0 - value);
+                    hidden &= done || entry.alpha.get() <= 0.0;
                 }
             }
             if hidden {
@@ -1289,13 +1378,16 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
             let left_span = (menu.left_to.get() - left_from) as f64;
             let elapsed = (menu.width_elapsed.get() + width_step).min(1.0);
             menu.width_elapsed.set(elapsed);
-            let eased = ease_out(elapsed);
+            // The same curve, and the same trimmed phase, as a cell's width. This one
+            // had neither: it eased over the whole clock, so it spent its last third
+            // moving nothing.
+            let (eased, arrived) = phase_value(ease_in_out, elapsed);
             menu.width_override.set(Some((from as f64 + span * eased).round() as i32));
             // The same fraction of the same motion, so the row never slides out from
             // under the icon it is meant to be sitting under.
             menu.window
                 .set_margin(Edge::Left, (left_from as f64 + left_span * eased).round() as i32);
-            if elapsed >= 1.0 {
+            if arrived {
                 // Arrived: the new previews are in place and still invisible.
                 menu.width_override.set(None);
                 menu.switch.set(Switch::FadingIn);
@@ -1309,8 +1401,9 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
                 for entry in entries.values() {
                     let elapsed = (entry.elapsed.get() + fade_step).min(1.0);
                     entry.elapsed.set(elapsed);
-                    entry.alpha.set(ease_out(elapsed));
-                    up &= entry.alpha.get() >= 1.0;
+                    let (value, done) = phase_value(ease_in_out, elapsed);
+                    entry.alpha.set(value);
+                    up &= done || entry.alpha.get() >= 1.0;
                 }
             }
             if up {
@@ -1321,14 +1414,6 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
             }
         }
         Switch::Idle => {
-            // Nothing left on show, and every departure has finished: close. Done
-            // here rather than by the snapshot that emptied it, so the last preview
-            // gets to animate away first.
-            if menu.order.borrow().is_empty() && menu.app.borrow().is_some() {
-                menu_close(menu);
-                menu.morphing.set(false);
-                return;
-            }
             let mut entries = menu.entries.borrow_mut();
             // An entry is dropped once it has closed up to nothing.
             entries.retain(|_, entry| {
@@ -1343,32 +1428,56 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
                 // Eased, so each phase starts briskly and settles. The value is read
                 // from the elapsed fraction rather than accumulated, so a dropped or
                 // doubled tick cannot leave the motion permanently adrift.
-                let eased = ease_out(elapsed);
+                // One curve for the widths and the opacity, and it is symmetric. A
+                // cubic ease out is more than half a cell wide within a few frames
+                // and then crawls for the rest of the phase, which is the same
+                // complaint the fades had: the first half is over before the second
+                // one starts.
+                let (out, out_done) = phase_value(ease_in_out, elapsed);
+                let (fade, fade_done) = phase_value(ease_in_out, elapsed);
+                // The width at this point of the phase. Every phase carries one, so a
+                // cell re-aimed mid-fade eases to its new width on the fade's own
+                // clock rather than snapping to it.
+                let width_at = |entry: &MenuEntry, f: f64| {
+                    let from = entry.from.get();
+                    from + (entry.to.get() - from) * f
+                };
                 match phase {
                     Motion::Growing => {
-                        entry.width.set(eased);
-                        if elapsed >= 1.0 {
+                        entry.width.set(width_at(entry, out));
+                        if out_done {
                             entry.motion.set(Motion::FadingIn);
                             entry.elapsed.set(0.0);
+                            // Grown: the width is done, and the fade starts from it.
+                            entry.from.set(entry.width.get());
+                            entry.to.set(entry.width.get());
                         }
                     }
                     Motion::FadingIn => {
-                        entry.alpha.set(eased);
-                        if elapsed >= 1.0 {
+                        entry.width.set(width_at(entry, out));
+                        entry.alpha.set(fade);
+                        if fade_done {
                             entry.motion.set(Motion::Settled);
                         }
                     }
                     Motion::Settled => return true,
                     Motion::FadingOut => {
-                        entry.alpha.set(1.0 - ease_in(elapsed));
-                        if elapsed >= 1.0 {
+                        entry.alpha.set(1.0 - fade);
+                        if fade_done {
                             entry.motion.set(Motion::Shrinking);
                             entry.elapsed.set(0.0);
+                            // Closing up from the width it faded out at.
+                            entry.from.set(entry.width.get());
+                            entry.to.set(0.0);
                         }
                     }
                     Motion::Shrinking => {
-                        entry.width.set(1.0 - eased);
-                        if elapsed >= 1.0 {
+                        // Ease *out*, so the cell commits straight away and settles.
+                        // The mirror of the fade would hold it at full width for the
+                        // first half of the phase — six frames of a full-width cell
+                        // after it is already invisible — and read as a stall.
+                        entry.width.set(width_at(entry, out));
+                        if out_done {
                             return false;
                         }
                     }
@@ -1383,15 +1492,18 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
         }
     }
     relayout(menu);
-    if menu_debug() {
+    if menu_debug() && stepped {
         let entries = menu.entries.borrow();
         let order = menu.order.borrow();
         let report: Vec<String> = order
             .iter()
             .filter_map(|id| entries.get(id).map(|entry| (*id, entry)))
             .map(|(id, entry)| {
+                // Width in pixels, alpha as a fraction: the width is what the
+                // surface is made of, so it is the number to watch for a resize that
+                // does not follow its curve.
                 format!(
-                    "{}:{} {:.2}/{:.2}",
+                    "{}:{} {:.0}px/{:.2}",
                     id,
                     phase_name(entry.motion.get()),
                     entry.width.get(),
@@ -1412,6 +1524,24 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
             menu.window_margin_left(),
             report.join("  "),
         );
+    }
+    // Nothing left on show, and every departure has finished: close, so the menu
+    // fades away rather than sitting there empty.
+    //
+    // This has to be at the end of this tick, and not at the top of the next one. The
+    // tick that drops the last cell is also the tick that empties the order, but that
+    // cell never reaches `moving += 1` — it is on its way out — so `moving` is zero
+    // and `morphing` is cleared below. Asking at the top of the tick therefore asked
+    // for a tick that was never going to be requested again, and a menu whose last
+    // window had gone left its surface on screen with nothing in it, waiting for the
+    // pointer to move before it would go.
+    if menu.switch.get() == Switch::Idle
+        && menu.order.borrow().is_empty()
+        && menu.app.borrow().is_some()
+    {
+        menu_close(menu);
+        menu.morphing.set(false);
+        return;
     }
     if moving == 0 {
         menu.morphing.set(false);
@@ -1464,7 +1594,7 @@ fn build_entries(menu: &Rc<Menu>, group: &[WindowInfo], stream: Option<&Rc<UnixS
             // between the two widths, and the incoming previews are in place for it.
             // Left at zero to be grown per-entry they never grew, because that motion
             // is switched off during a switch.
-            entry.width.set(1.0);
+            entry.snap_to_full();
             entry.alpha.set(0.0);
             entry.motion.set(Motion::Settled);
             entry.elapsed.set(0.0);
@@ -1622,7 +1752,7 @@ fn menu_reveal(menu: &Rc<Menu>, force: bool) {
 /// Put every entry straight to its settled size and opacity.
 fn settle_all(menu: &Rc<Menu>) {
     for entry in menu.entries.borrow().values() {
-        entry.width.set(1.0);
+        entry.snap_to_full();
         entry.alpha.set(1.0);
         entry.motion.set(Motion::Settled);
         entry.elapsed.set(0.0);
@@ -1673,7 +1803,7 @@ fn menu_replace(
                 // Full width from the start: the width motion is easing the surface
                 // from the outgoing width to the incoming one, and a cell starting at
                 // nothing would drag the surface down with it.
-                entry.width.set(1.0);
+                entry.snap_to_full();
                 entry.title.replace(window_title(info));
                 entry.focused.set(info.focused);
                 if entry.preview.borrow().is_none() {
@@ -1689,6 +1819,7 @@ fn menu_replace(
         return;
     }
 
+    let previous = menu.order.borrow().clone();
     let mut arrived = false;
     let mut wanted: Vec<u64> = Vec::new();
     {
@@ -1722,7 +1853,7 @@ fn menu_replace(
             // fading in, because nothing ever moved it off `Settled` again.
             if matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking) {
                 entry.motion.set(Motion::Settled);
-                entry.width.set(1.0);
+                entry.snap_to_full();
                 entry.alpha.set(1.0);
                 entry.elapsed.set(0.0);
             }
@@ -1736,7 +1867,21 @@ fn menu_replace(
                 wanted.push(info.id);
             }
         }
-        *menu.order.borrow_mut() = live.clone();
+        // A departing window has to stay in the order until the tick has actually
+        // removed it. The order is what gets drawn, so taking it out of there the
+        // moment it leaves the snapshot made the cell vanish in a single frame, and
+        // the fade and the collapse that followed played out with nothing on screen —
+        // which is a close that does not animate.
+        let leaving: HashMap<u64, bool> = entries
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking),
+                )
+            })
+            .collect();
+        *menu.order.borrow_mut() = draw_order(&previous, &live, &leaving);
     }
     // Outside the borrow: asking for a preview reads the entries, and doing that
     // while they are borrowed for writing panics.
@@ -1762,9 +1907,19 @@ fn menu_set_image(menu: &Rc<Menu>, id: u64, width: i32, height: i32, pixels: Vec
     let Some(preview) = Preview::new(width, height, pixels) else {
         return;
     };
-    entry
-        .target
-        .set(preview_width(preview.width, preview.height));
+    let width = preview_width(preview.width, preview.height);
+    // Only re-aim when the width has actually changed.
+    //
+    // `reaim` leaves the cell where it is but resets how fast it is travelling, and
+    // a menu refreshes every window on show on a timer, so re-aiming on every
+    // preview re-normalised that slope several times a phase. The cell kept
+    // speeding up: an ease out has monotonically shrinking steps, and the log had
+    // them growing (1, 8, 3, 7, 21, 10). A refresh of the same size is not a change
+    // of target and must not touch the motion at all.
+    if entry.target.get() != width {
+        entry.target.set(width);
+        entry.reaim();
+    }
     entry.preview.replace(Some(preview));
     drop(entries);
     // A new preview can be a new shape, which can be a new width for the whole
@@ -1789,8 +1944,10 @@ fn request_preview_if_missing(menu: &Rc<Menu>, info: &WindowInfo, stream: Option
     send(
         stream,
         &format!(
-            "preview\t{}\t{}\t{}\n",
-            info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1
+            // Says the panel has nothing for this window, so the compositor must
+            // answer even if the pixels have not moved.
+            "preview\t{}\t{}\t{}\t{}\n",
+            info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, WANTED
         ),
     );
 }
@@ -1822,6 +1979,25 @@ struct Pending {
     bar_width: i32,
 }
 
+/// The order entries are drawn in.
+///
+/// The windows on show, in the snapshot's order, with anything on its way out still
+/// in the place it already had — a new window joins at the end, and a departing one
+/// keeps its position until the tick removes it.
+fn draw_order(previous: &[u64], live: &[u64], leaving: &HashMap<u64, bool>) -> Vec<u64> {
+    let mut order: Vec<u64> = previous
+        .iter()
+        .copied()
+        .filter(|id| live.contains(id) || leaving.get(id).copied().unwrap_or(false))
+        .collect();
+    for id in live {
+        if !order.contains(id) {
+            order.push(*id);
+        }
+    }
+    order
+}
+
 /// The windows still open, from a snapshot, as the id set the menu compares against.
 ///
 /// A set rather than a lookup per entry: the menu asks about every entry it holds
@@ -1841,8 +2017,9 @@ fn menu_refresh(menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Rc<UnixStream>
         send(
             stream,
             &format!(
-                "preview\t{}\t{}\t{}\n",
-                info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1
+                // A refresh: only answer if the window has actually changed.
+                "preview\t{}\t{}\t{}\t{}\n",
+                info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, REFRESH
             ),
         );
     }
@@ -2046,11 +2223,11 @@ button.task {{
 button.task:hover {{
     background-color: rgba(255, 255, 255, 0.10);
 }}
-button.task.focused {{
-    background-color: rgba({r}, {g}, {b}, 0.28);
-}}
 button.task.minimized {{
     opacity: 0.45;
+}}
+button.task.focused {{
+    background-color: rgba({r}, {g}, {b}, 0.28);
 }}
 "
     )
@@ -2404,14 +2581,6 @@ fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream
     // id get a key of their own so they don't all collapse together.
     let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
     for info in windows {
-        // A minimized window is still a window — it keeps its entry and its preview
-        // — but there is nothing on screen to capture, so it is not offered in the
-        // menu. Counting it as on show left a blank cell that never filled, because
-        // the compositor had nothing to render it from. Minimising now animates it
-        // out of the row and restoring animates it back.
-        if info.minimized {
-            continue;
-        }
         let key = if info.app_id.is_empty() {
             format!("#{}", info.id)
         } else {
@@ -2436,7 +2605,32 @@ fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream
             .find(|(group_key, _)| group_key == key)
             .map(|(_, group)| group.clone())
             .unwrap_or_default();
+        // Every window, minimized ones included. A minimized window cannot be
+        // captured, so the compositor answers with the last frame it took for it and
+        // the cell shows that: more use than a hole in the row, and it keeps the count
+        // on the square and the number of previews in step.
         menu_replace(menu, &every, &group, Some(stream));
+        if menu_debug() {
+            // The bar and the menu disagreeing about which windows exist is the
+            // awkward one to read off the screen: the count is right and the row is
+            // empty, with nothing in between to say why.
+            let entries = menu.entries.borrow();
+            let order = menu.order.borrow();
+            let with_preview = order
+                .iter()
+                .filter(|id| {
+                    entries
+                        .get(id)
+                        .is_some_and(|entry| entry.preview.borrow().is_some())
+                })
+                .count();
+            eprintln!(
+                "oxide-panel: snapshot {} windows, {} minimized; menu order {order:?}, \
+                 {with_preview} with a preview",
+                windows.len(),
+                windows.iter().filter(|info| info.minimized).count(),
+            );
+        }
     }
 
     for (key, group) in &groups {
@@ -2471,16 +2665,18 @@ fn app_button(
     menu: &Rc<Menu>,
 ) -> Button {
     let focused = windows.iter().any(|window| window.focused);
+    // Only when every one of the app's windows is minimized, so the square says the
+    // app is there but not on screen rather than implying anything about the others.
     let minimized = windows.iter().all(|window| window.minimized);
     let count = windows.len();
 
     let button = Button::new();
     button.add_css_class("task");
-    if focused {
-        button.add_css_class("focused");
-    }
     if minimized {
         button.add_css_class("minimized");
+    }
+    if focused {
+        button.add_css_class("focused");
     }
     // Without this the HBox stretches the button to the panel height.
     button.set_valign(gtk4::Align::Center);
@@ -2543,6 +2739,7 @@ fn app_button(
                 if menu.app.borrow().as_deref() == Some(key.as_str()) {
                     return;
                 }
+                // Only the windows on screen, as everywhere else the menu is filled.
                 let group: Vec<&WindowInfo> = group.iter().collect();
                 menu_open(&menu, &key, &group, &button, &stream);
             }
@@ -2909,6 +3106,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_snapshot_whose_fields_are_not_the_ones_it_reads() {
+        // Five fields per window: id, focused, minimized, app id, title. A producer
+        // that emitted a sixth — an extra tab left behind by removing one — does not
+        // get silently
+        // misread as an empty app id: the walk runs off the end of the line and the
+        // whole snapshot is rejected. That is the behaviour that turns a producer
+        // mistake into an empty panel rather than a panel full of nonsense.
+        assert!(parse_snapshot("list\t1\t7\t1\t0\t\tfirefox\tMozilla").is_none());
+        // One field short, likewise.
+        assert!(parse_snapshot("list\t1\t7\t1\t0\tfirefox").is_none());
+        // A count that does not parse.
+        assert!(parse_snapshot("list\tx\t7\t1\t0\tfirefox\tMozilla").is_none());
+        // And the well-formed line still works, including an empty app id, which is
+        // how a window with no app id is sent.
+        let windows = parse_snapshot("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerm").unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1].app_id, "");
+    }
+
+    #[test]
     fn ignores_other_messages() {
         assert!(parse_snapshot("focus\t3").is_none());
     }
@@ -3049,6 +3266,66 @@ mod tests {
     }
 
     #[test]
+    fn the_first_frame_of_a_motion_is_worth_one_frame() {
+        // The clock is read on every frame, so a motion's first step is the gap since
+        // the frame before it. Reading it only while a motion was running left it
+        // holding the last animation's timestamp, and since the step is capped the
+        // entire cap landed in one frame.
+        let frame_seconds = |delta: i64| (delta as f64 / 1_000_000.0).clamp(0.0, 0.1);
+        // A real frame at 60Hz is a small fraction of a 140ms fade and a 220ms grow,
+        // so the first frame of a motion barely moves it either way.
+        let first = frame_seconds(16_667);
+        // A fade uses ease-in-out, which is nearly flat at the very start, so its
+        // first frame moves it a little. What must not happen is a stall finishing
+        // it: the cubic ease-in it replaced was still above 0.87 *halfway* through
+        // the phase, so a long gap wiped it out in one step.
+        assert!(1.0 - ease_in_out(first / 0.14) > 0.95, "a fade-out opens at opaque");
+        assert!(
+            1.0 - ease_in_out(frame_seconds(100_000) / 0.14) > 0.1,
+            "and a capped stall must not finish the fade"
+        );
+        // A grow is on the same symmetric curve, so one frame is a small step of it.
+        // What must not happen is the whole 100ms cap going in one frame, which is
+        // most of the grow — and is what the log showed, 84%, from a clock read only
+        // while a motion was running.
+        let one_frame = phase_value(ease_in_out, first / 0.22).0;
+        let a_capped_stall = phase_value(ease_in_out, frame_seconds(100_000) / 0.22).0;
+        assert!(one_frame < 0.1, "one frame, got {one_frame}");
+        // The cap bounds a stall; it must not complete the grow. A cubic ease out
+        // put that at 84%, and on the log the phase then finished in the next frame.
+        assert!(
+            a_capped_stall < 0.7,
+            "a stall must not run the grow to the end, got {a_capped_stall}"
+        );
+        // A frame after a long idle is still one frame's worth of the cap, not the
+        // whole gap: the cap is there to bound a stall, not to be spent deliberately.
+        let after_idle = frame_seconds(4_000_000);
+        assert_eq!(after_idle, frame_seconds(100_000));
+        // Which is the cap, and even that is most of a fade — so reading the clock
+        // only while a motion was running put a fade-out straight to 0.64 and a grow
+        // straight to 84% of its width in the frame the motion began.
+    }
+
+    #[test]
+    fn a_departing_window_stays_in_the_order_until_it_is_gone() {
+        // The order is what gets drawn, so a window on its way out has to remain in it
+        // for as long as it is still there — otherwise its cell disappears the instant
+        // it leaves the snapshot and the fade and collapse play out unseen.
+        let leaving: HashMap<u64, bool> = [(4, true), (5, false)].into_iter().collect();
+        let order = draw_order(&[1, 4, 2], &[1, 2], &leaving);
+        assert_eq!(order, vec![1, 4, 2], "4 keeps its place, 3 is nowhere");
+        // A window that is not leaving and not on show is dropped at once: that is
+        // the difference between animating out and simply not being there.
+        assert_eq!(draw_order(&[1, 5, 2], &[1, 2], &leaving), vec![1, 2]);
+        // A new window joins at the end rather than disturbing the rest.
+        assert_eq!(draw_order(&[1, 2], &[1, 2, 3], &leaving), vec![1, 2, 3]);
+        // Reordering the snapshot does not shuffle the row about mid-animation.
+        assert_eq!(draw_order(&[1, 2, 4], &[2, 1], &leaving), vec![1, 2, 4]);
+        // Nothing on show and nothing leaving: an empty menu.
+        assert!(draw_order(&[1], &[], &leaving).is_empty());
+    }
+
+    #[test]
     fn the_order_is_the_snapshot_s_own_and_the_survivors_are_kept() {
         // The order is simply the group on show, already in the snapshot's order.
         let group: Vec<u64> = vec![12, 10];
@@ -3105,7 +3382,7 @@ mod tests {
         let from_left = 600;
         let to_left = 180;
         let at = |t: f64| {
-            let eased = ease_out(t);
+            let eased = phase_value(ease_in_out, t).0;
             (
                 (from_width as f64 + (to_width - from_width) as f64 * eased).round() as i32,
                 (from_left as f64 + (to_left - from_left) as f64 * eased).round() as i32,
@@ -3153,6 +3430,204 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_landing_mid_grow_moves_where_the_cell_is_going_not_where_it_is() {
+        // A preview arriving part way through a grow used to take the new width as
+        // the multiplier on the eased fraction, so the cell was resized underneath
+        // the curve: the surface jumped 42px in one frame while the cell eased from
+        // 0.93 to 0.97, and every refresh of a live preview did it again.
+        let entry = MenuEntry::new(&WindowInfo {
+            id: 1,
+            focused: false,
+            minimized: false,
+            app_id: String::new(),
+            title: String::new(),
+        });
+        // Part way through, a cell 100px wide and heading for 200.
+        entry.width.set(93.0);
+        entry.from.set(0.0);
+        entry.to.set(200.0);
+        entry.elapsed.set(0.5);
+
+        // Its preview lands and says the settled width is 260, not 200.
+        entry.target.set(260 - CELL_BORDER * 2);
+        entry.reaim();
+
+        // The cell has not moved...
+        assert_eq!(entry.width.get(), 93.0, "re-aiming must not move the cell");
+        // ...and the curve still passes through where it was, so the next tick is
+        // continuous with this one rather than a step.
+        let f = phase_value(ease_in_out, 0.5).0;
+        let now = entry.from.get() + (entry.to.get() - entry.from.get()) * f;
+        assert!((now - 93.0).abs() < 0.001, "got {now}");
+        // It is now heading for the new width, and a little of a frame from here it
+        // is closer to it than before.
+        assert_eq!(entry.to.get(), 260.0);
+        let f_next = phase_value(ease_in_out, 0.52).0;
+        let later = entry.from.get() + (entry.to.get() - entry.from.get()) * f_next;
+        assert!(later > 93.0, "and still growing: {later}");
+    }
+
+    #[test]
+    fn a_refresh_of_the_same_size_leaves_the_motion_alone() {
+        // The menu refreshes every window on show on a timer. Each refresh lands a
+        // preview, and each re-aim reset how fast the cell was travelling, so a cell
+        // kept speeding up through its own grow: an ease out has monotonically
+        // shrinking steps, and the log had them growing (1, 8, 3, 7, 21, 10).
+        let entry = MenuEntry::new(&WindowInfo {
+            id: 1,
+            focused: false,
+            minimized: false,
+            app_id: String::new(),
+            title: String::new(),
+        });
+        entry.target.set(150);
+        entry.from.set(0.0);
+        entry.to.set(150.0);
+        entry.width.set(90.0);
+        entry.elapsed.set(0.5);
+
+        // What `menu_set_image` does when the incoming preview is the same size.
+        let same = entry.target.get();
+        if entry.target.get() != same {
+            entry.reaim();
+        }
+        let (slope_before, from_before, to_before) =
+            (entry.to.get() - entry.from.get(), entry.from.get(), entry.to.get());
+
+        // And again, and again: the curve is untouched.
+        for _ in 0..5 {
+            if entry.target.get() != same {
+                entry.reaim();
+            }
+        }
+        assert_eq!(entry.from.get(), from_before);
+        assert_eq!(entry.to.get(), to_before);
+        assert_eq!(entry.to.get() - entry.from.get(), slope_before);
+    }
+
+    #[test]
+    fn a_settled_cell_takes_a_new_width_at_once() {
+        // Nothing is easing, so a window that changed size is simply a new width.
+        let entry = MenuEntry::new(&WindowInfo {
+            id: 1,
+            focused: false,
+            minimized: false,
+            app_id: String::new(),
+            title: String::new(),
+        });
+        entry.motion.set(Motion::Settled);
+        entry.snap_to_full();
+        let before = entry.width.get();
+        entry
+            .target
+            .set(before as i32 - CELL_BORDER * 2 + 40);
+        entry.reaim();
+        assert_eq!(entry.width.get(), before + 40.0);
+    }
+
+    #[test]
+    fn a_cell_on_its_way_out_is_not_re_aimed() {
+        // Its width is already closing to nothing; where it began is behind it, and
+        // re-aiming would drag the departure back towards a full-width cell.
+        let entry = MenuEntry::new(&WindowInfo {
+            id: 1,
+            focused: false,
+            minimized: false,
+            app_id: String::new(),
+            title: String::new(),
+        });
+        entry.motion.set(Motion::Shrinking);
+        entry.width.set(40.0);
+        entry.from.set(200.0);
+        entry.to.set(0.0);
+        entry.elapsed.set(0.5);
+        entry.target.set(400);
+        entry.reaim();
+        assert_eq!(entry.width.get(), 40.0);
+        assert_eq!(entry.from.get(), 200.0);
+        assert_eq!(entry.to.get(), 0.0);
+    }
+
+    #[test]
+    fn a_cell_commits_to_collapsing_rather_than_hanging_at_full_width() {
+        // Both phases of a departure are on the same curve. They used to be mirrors
+        // of each other — a cubic ease-in for the fade and a cubic ease-out for the
+        // collapse — and each was wrong in the same way: the fade hung where it
+        // started and the collapse hung at full width, each for half its phase.
+        let collapsed = |t: f64| 1.0 - phase_value(ease_in_out, t).0;
+        assert_eq!(collapsed(0.0), 1.0);
+        // Moving on the first frame rather than waiting: an invisible cell that sits
+        // at full width for the first half of its collapse reads as a stall.
+        assert!(collapsed(0.1) < 1.0, "got {}", collapsed(0.1));
+        assert!(
+            (0.4..0.6).contains(&collapsed(PHASE_END / 2.0)),
+            "got {}",
+            collapsed(PHASE_END / 2.0)
+        );
+        assert!(collapsed(0.9) < 0.1, "got {}", collapsed(0.9));
+        assert_eq!(collapsed(1.0), 0.0);
+        // The fade is not a mirror of the collapse. It is symmetric, so unlike the
+        // width it is still moving at the end rather than settling.
+        let faded = |t: f64| 1.0 - phase_value(ease_in_out, t).0;
+        assert!(faded(0.2) > 0.8, "a fade lingers a little where it started");
+        assert!(
+            (0.35..0.65).contains(&faded(0.5)),
+            "halfway is about half, got {}",
+            faded(0.5)
+        );
+        assert!(faded(0.9) < 0.1, "and is still moving at the end");
+        assert_eq!(faded(1.0), 0.0);
+    }
+
+    #[test]
+    fn a_phase_spends_no_frames_on_the_tail_of_its_curve() {
+        // Both curves reach their end asymptotically, so the last of a phase moves the
+        // value by nothing visible and the animation sits there doing nothing. The log
+        // showed `growing 1.00` for five frames before the fade began.
+        let (value, done) = phase_value(ease_in_out, 0.0);
+        assert_eq!((value, done), (0.0, false));
+        let (value, done) = phase_value(ease_in_out, PHASE_END / 2.0);
+        assert!(!done);
+        assert!((0.4..0.6).contains(&value), "got {value}");
+        // Finished well before the clock runs out, and exactly on its end value.
+        let (value, done) = phase_value(ease_in_out, PHASE_END);
+        assert!(done);
+        assert_eq!(value, 1.0);
+        let (value, done) = phase_value(ease_in_out, 1.0);
+        assert!(done && value == 1.0);
+        // And nothing is left over after it: past the end there is no more clock to
+        // spend, which is the whole point.
+        assert!(PHASE_END < 1.0);
+
+        // The fade, finished on the same fraction.
+        let (value, done) = phase_value(ease_in_out, PHASE_END);
+        assert!(done);
+        assert_eq!(value, 1.0);
+        assert_eq!((phase_value(ease_in_out, 0.0).0, false), (0.0, false));
+
+        // And the property the cubic ease-in failed, in the phase's own time: the
+        // middle of a fade has to be the middle of the fade. `1 - t^3` was still at
+        // 0.87 halfway through and gone three frames later, so most of the phase was
+        // spent looking like nothing was happening and the rest went at once — a
+        // wait, then a disappearance. A symmetric ease is at its own midpoint at its
+        // midpoint.
+        // `elapsed` is in the phase's own time and `phase_value` maps it through
+        // `PHASE_END`, so the phase's midpoint is half of that, not 0.5.
+        let halfway = 1.0 - phase_value(ease_in_out, PHASE_END / 2.0).0;
+        assert!(
+            (0.4..0.6).contains(&halfway),
+            "halfway through a fade it should be about half gone, got {halfway}"
+        );
+        // The last quarter of the phase has to actually do something too, or the
+        // fade is a wait with a different shape.
+        let three_quarters = 1.0 - phase_value(ease_in_out, PHASE_END * 0.75).0;
+        assert!(
+            three_quarters < 0.25,
+            "and the last quarter cannot be spent hanging there, got {three_quarters}"
+        );
+    }
+
+    #[test]
     fn a_phase_change_restarts_the_clock() {
         // The fade is timed off `elapsed`, so a phase entered with the clock still
         // reading 1.0 finishes in a single tick — which is exactly how the departure
@@ -3164,7 +3639,7 @@ mod tests {
 
         // A tick entered with a stale clock: one frame, straight to nothing.
         assert_eq!((elapsed + step).min(1.0), 1.0);
-        assert_eq!(1.0 - ease_in(1.0), alpha - 1.0);
+        assert_eq!(1.0 - ease_in_out(1.0), alpha - 1.0);
 
         // Restarted, as every change of phase now does, it takes the whole phase.
         elapsed = 0.0;
@@ -3172,7 +3647,7 @@ mod tests {
         let mut visible_for = 0;
         while elapsed < 1.0 {
             let running = elapsed < 1.0;
-            alpha = 1.0 - ease_in((elapsed + step).min(1.0));
+            alpha = 1.0 - ease_in_out((elapsed + step).min(1.0));
             elapsed += step;
             frames += 1;
             if running && alpha > 0.0 {
@@ -3188,23 +3663,47 @@ mod tests {
     }
 
     #[test]
-    fn a_fade_out_is_gradual_where_a_fade_in_is_quick() {
-        // Ease in and ease out are mirrors: what one gains the other loses.
+    fn a_fade_out_is_a_fade_in_played_backwards() {
+        // One curve for both directions, so the two are the same motion reversed.
+        // They used to be mirrors of each other — a cubic ease-out up and a cubic
+        // ease-in down — which is what made the departure read as a wait followed by
+        // a disappearance.
         for step in 0..=20 {
             let t = f64::from(step) / 20.0;
-            assert!((ease_in(t) + ease_out(1.0 - t) - 1.0).abs() < 1e-9);
+            assert!((1.0 - ease_in_out(t) - ease_in_out(1.0 - t)).abs() < 1e-9);
         }
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        // Out of range is clamped, so an overshooting tick lands on the end.
+        assert_eq!(ease_in_out(-0.5), 0.0);
+        assert_eq!(ease_in_out(1.5), 1.0);
+    }
 
-        // The point of using the other curve: a fade out must still be mostly opaque
-        // well into its phase. On the fade-in curve it was at a quarter opacity
-        // within one 16ms tick, which is why the departure looked like it had no
-        // fade at all and then hung while the width caught up.
-        let faded = |t: f64| 1.0 - ease_in(t);
-        assert!(faded(0.0) == 1.0);
-        assert!(faded(0.25) > 0.95, "a quarter in should still look open");
-        assert!(faded(0.5) > 0.85, "halfway should still be mostly there");
-        assert!(faded(0.75) < 0.6, "and it should be going by three quarters");
-        assert!(faded(1.0) == 0.0);
+    #[test]
+    fn a_fade_is_moving_for_the_whole_of_its_phase() {
+        // The complaint this curve replaced: the departure "waits a while, fades out
+        // one frame too late, then disappears". A cubic ease-in is still above 0.87
+        // halfway through the phase and gone three frames later, so most of the
+        // phase was spent looking like nothing was happening and the rest went at
+        // once.
+        let faded = |t: f64| 1.0 - ease_in_out(t);
+        assert_eq!(faded(0.0), 1.0);
+        assert_eq!(faded(1.0), 0.0);
+        // Moving on the first frame, not waiting for the phase to get going.
+        assert!(faded(0.1) < 1.0, "a fade starts immediately: {}", faded(0.1));
+        // And roughly linear — the whole point of a symmetric ease is no long
+        // stretch at either end where it has barely moved.
+        for (t, want) in [
+            (0.25, 0.84),
+            (0.5, 0.5),
+            (0.75, 0.16),
+        ] {
+            assert!(
+                (faded(t) - want).abs() < 0.02,
+                "at {t} expected about {want}, got {}",
+                faded(t)
+            );
+        }
         // Monotonic: it never comes back up.
         let mut previous = 1.0;
         for step in 0..=20 {
@@ -3215,17 +3714,19 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_grows_and_shrinks_on_an_ease_out() {
-        // The curve the motion uses: nothing at the start, most of the way there
-        // early, and it only ever reaches the ends at 0 and 1.
-        assert_eq!(ease_out(0.0), 0.0);
-        assert_eq!(ease_out(1.0), 1.0);
-        assert!(ease_out(0.5) > 0.5, "ease out is ahead of linear");
-        assert!(ease_out(0.25) < ease_out(0.75));
+    fn an_entry_grows_and_shrinks_on_a_symmetric_ease() {
+        // The curve the motion uses, the same one the fades use: nothing at the
+        // start, the end at 1, and the middle of the phase is the middle of the
+        // motion. A cubic ease out is more than half a cell wide after a few frames
+        // and then crawls for the rest of the phase.
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        assert!((0.49..0.51).contains(&ease_in_out(0.5)), "{}", ease_in_out(0.5));
+        assert!(ease_in_out(0.25) < ease_in_out(0.75));
         // Out of range is clamped rather than extrapolated, so a tick that
         // overshoots lands exactly on the end instead of past it.
-        assert_eq!(ease_out(-0.5), 0.0);
-        assert_eq!(ease_out(1.5), 1.0);
+        assert_eq!(ease_in_out(-0.5), 0.0);
+        assert_eq!(ease_in_out(1.5), 1.0);
 
         // A whole cell's worth of growth: from nothing, to its settled width, with
         // the border accounted for at both ends.
@@ -3236,7 +3737,7 @@ mod tests {
         assert_eq!(at(1.0), full);
         // Part way through it is a real width, so the surface is resized every step
         // rather than jumping between the two ends.
-        let half = at(ease_out(0.5));
+        let half = at(ease_in_out(0.5));
         assert!(half > 0 && half < full, "got {half} of {full}");
     }
 
