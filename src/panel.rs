@@ -422,7 +422,7 @@ impl MenuEntry {
             Motion::Settled => self.snap_to_full(),
             Motion::Growing | Motion::FadingIn => {
                 let to = self.full_width();
-                let f = phase_value(ease_in_out, self.elapsed.get()).0;
+                let f = phase_value(ease_out, self.elapsed.get()).0;
                 // Solve `from + (to - from) * f == width` for `from`, so the curve
                 // passes through the width that is on screen right now. At the end of
                 // the phase there is no curve left to bend and the motion simply
@@ -1113,6 +1113,21 @@ fn rounded_top_rectangle(
     let _ = context.close_path();
 }
 
+/// Ease out cubic: quick off the mark, then settling onto the target.
+///
+/// The curve the *widths* use, in both directions: growing into the row and
+/// closing back out of it. A width should commit — start moving on the first frame
+/// and most of the distance be gone in the first few — and then settle. A
+/// symmetric curve has zero slope at the start, so a cell grew at a crawl for the
+/// opening frames, which looks exactly like an ease in and reads as the width
+/// starting several frames late.
+///
+/// The opacity does not want this; see [`ease_in_out`].
+fn ease_out(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
 /// Ease in and out: slowest and fastest at the ends, quickest in the middle.
 ///
 /// What a fade uses, in both directions, so fading in and fading out are the same
@@ -1381,7 +1396,7 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
             // The same curve, and the same trimmed phase, as a cell's width. This one
             // had neither: it eased over the whole clock, so it spent its last third
             // moving nothing.
-            let (eased, arrived) = phase_value(ease_in_out, elapsed);
+            let (eased, arrived) = phase_value(ease_out, elapsed);
             menu.width_override.set(Some((from as f64 + span * eased).round() as i32));
             // The same fraction of the same motion, so the row never slides out from
             // under the icon it is meant to be sitting under.
@@ -1428,12 +1443,12 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
                 // Eased, so each phase starts briskly and settles. The value is read
                 // from the elapsed fraction rather than accumulated, so a dropped or
                 // doubled tick cannot leave the motion permanently adrift.
-                // One curve for the widths and the opacity, and it is symmetric. A
-                // cubic ease out is more than half a cell wide within a few frames
-                // and then crawls for the rest of the phase, which is the same
-                // complaint the fades had: the first half is over before the second
-                // one starts.
-                let (out, out_done) = phase_value(ease_in_out, elapsed);
+                // Two curves, because the two channels want opposite things. A width
+                // commits and settles, so it is a cubic ease out; an opacity has to
+                // be visibly moving for the whole phase, so it is symmetric. Putting
+                // the width on the symmetric curve as well left it crawling for the
+                // opening frames, which is an ease in by any reading.
+                let (out, out_done) = phase_value(ease_out, elapsed);
                 let (fade, fade_done) = phase_value(ease_in_out, elapsed);
                 // The width at this point of the phase. Every phase carries one, so a
                 // cell re-aimed mid-fade eases to its new width on the fade's own
@@ -3288,15 +3303,12 @@ mod tests {
         // What must not happen is the whole 100ms cap going in one frame, which is
         // most of the grow — and is what the log showed, 84%, from a clock read only
         // while a motion was running.
-        let one_frame = phase_value(ease_in_out, first / 0.22).0;
-        let a_capped_stall = phase_value(ease_in_out, frame_seconds(100_000) / 0.22).0;
-        assert!(one_frame < 0.1, "one frame, got {one_frame}");
-        // The cap bounds a stall; it must not complete the grow. A cubic ease out
-        // put that at 84%, and on the log the phase then finished in the next frame.
-        assert!(
-            a_capped_stall < 0.7,
-            "a stall must not run the grow to the end, got {a_capped_stall}"
-        );
+        // A grow commits, so one frame is a visible step of it. A quarter of the
+        // trimmed phase rather than a fifth of the whole one, because the phase ends
+        // early so its flat tail is not spent.
+        let one_frame = phase_value(ease_out, first / 0.22).0;
+        assert!((0.2..0.3).contains(&one_frame), "one frame, got {one_frame}");
+
         // A frame after a long idle is still one frame's worth of the cap, not the
         // whole gap: the cap is there to bound a stall, not to be spent deliberately.
         let after_idle = frame_seconds(4_000_000);
@@ -3382,7 +3394,7 @@ mod tests {
         let from_left = 600;
         let to_left = 180;
         let at = |t: f64| {
-            let eased = phase_value(ease_in_out, t).0;
+            let eased = phase_value(ease_out, t).0;
             (
                 (from_width as f64 + (to_width - from_width) as f64 * eased).round() as i32,
                 (from_left as f64 + (to_left - from_left) as f64 * eased).round() as i32,
@@ -3442,29 +3454,31 @@ mod tests {
             app_id: String::new(),
             title: String::new(),
         });
-        // Part way through, a cell 100px wide and heading for 200.
-        entry.width.set(93.0);
+        // Part way through: a cell growing out of nothing towards 200, sitting at
+        // the width its own curve says this point of its clock.
         entry.from.set(0.0);
         entry.to.set(200.0);
-        entry.elapsed.set(0.5);
+        entry.elapsed.set(0.3);
+        let f = phase_value(ease_out, 0.3).0;
+        entry.width.set(200.0 * f);
+        let on_screen = entry.width.get();
 
         // Its preview lands and says the settled width is 260, not 200.
         entry.target.set(260 - CELL_BORDER * 2);
         entry.reaim();
 
         // The cell has not moved...
-        assert_eq!(entry.width.get(), 93.0, "re-aiming must not move the cell");
+        assert_eq!(entry.width.get(), on_screen, "re-aiming must not move the cell");
         // ...and the curve still passes through where it was, so the next tick is
         // continuous with this one rather than a step.
-        let f = phase_value(ease_in_out, 0.5).0;
         let now = entry.from.get() + (entry.to.get() - entry.from.get()) * f;
-        assert!((now - 93.0).abs() < 0.001, "got {now}");
+        assert!((now - on_screen).abs() < 0.001, "got {now}, was {on_screen}");
         // It is now heading for the new width, and a little of a frame from here it
         // is closer to it than before.
         assert_eq!(entry.to.get(), 260.0);
-        let f_next = phase_value(ease_in_out, 0.52).0;
+        let f_next = phase_value(ease_out, 0.32).0;
         let later = entry.from.get() + (entry.to.get() - entry.from.get()) * f_next;
-        assert!(later > 93.0, "and still growing: {later}");
+        assert!(later > on_screen, "and still growing: {later}");
     }
 
     #[test]
@@ -3550,21 +3564,19 @@ mod tests {
 
     #[test]
     fn a_cell_commits_to_collapsing_rather_than_hanging_at_full_width() {
-        // Both phases of a departure are on the same curve. They used to be mirrors
-        // of each other — a cubic ease-in for the fade and a cubic ease-out for the
-        // collapse — and each was wrong in the same way: the fade hung where it
-        // started and the collapse hung at full width, each for half its phase.
-        let collapsed = |t: f64| 1.0 - phase_value(ease_in_out, t).0;
+        // The collapse is a cubic ease-out and the fade is not, and that difference
+        // is deliberate. A width should commit and settle; an opacity should be
+        // visibly moving for its whole phase. Put both on the symmetric curve and
+        // each did the wrong thing: the collapse crawled at full width for the first
+        // half of its phase, holding a cell that was already invisible open, and the
+        // grow crawled out of nothing, which is an ease in by any reading.
+        let collapsed = |t: f64| 1.0 - phase_value(ease_out, t).0;
         assert_eq!(collapsed(0.0), 1.0);
-        // Moving on the first frame rather than waiting: an invisible cell that sits
-        // at full width for the first half of its collapse reads as a stall.
-        assert!(collapsed(0.1) < 1.0, "got {}", collapsed(0.1));
-        assert!(
-            (0.4..0.6).contains(&collapsed(PHASE_END / 2.0)),
-            "got {}",
-            collapsed(PHASE_END / 2.0)
-        );
-        assert!(collapsed(0.9) < 0.1, "got {}", collapsed(0.9));
+        // Most of the width gone by the first frame or two.
+        assert!(collapsed(0.05) < 0.85, "got {}", collapsed(0.05));
+        assert!(collapsed(0.2) < 0.5, "got {}", collapsed(0.2));
+        // And settling at the end rather than arriving all at once.
+        assert!(collapsed(0.6) > collapsed(0.9));
         assert_eq!(collapsed(1.0), 0.0);
         // The fade is not a mirror of the collapse. It is symmetric, so unlike the
         // width it is still moving at the end rather than settling.
@@ -3584,16 +3596,19 @@ mod tests {
         // Both curves reach their end asymptotically, so the last of a phase moves the
         // value by nothing visible and the animation sits there doing nothing. The log
         // showed `growing 1.00` for five frames before the fade began.
-        let (value, done) = phase_value(ease_in_out, 0.0);
+        // On the width's cubic, which is where the dead tail came from: 1.00 to two
+        // decimals about a third of the way in, and then nothing visible for the rest
+        // of the phase.
+        let (value, done) = phase_value(ease_out, 0.0);
         assert_eq!((value, done), (0.0, false));
-        let (value, done) = phase_value(ease_in_out, PHASE_END / 2.0);
+        let (value, done) = phase_value(ease_out, 0.4);
         assert!(!done);
-        assert!((0.4..0.6).contains(&value), "got {value}");
+        assert!(value > 0.5, "ease out is ahead of linear");
         // Finished well before the clock runs out, and exactly on its end value.
-        let (value, done) = phase_value(ease_in_out, PHASE_END);
+        let (value, done) = phase_value(ease_out, PHASE_END);
         assert!(done);
         assert_eq!(value, 1.0);
-        let (value, done) = phase_value(ease_in_out, 1.0);
+        let (value, done) = phase_value(ease_out, 1.0);
         assert!(done && value == 1.0);
         // And nothing is left over after it: past the end there is no more clock to
         // spend, which is the whole point.
@@ -3714,19 +3729,21 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_grows_and_shrinks_on_a_symmetric_ease() {
-        // The curve the motion uses, the same one the fades use: nothing at the
-        // start, the end at 1, and the middle of the phase is the middle of the
-        // motion. A cubic ease out is more than half a cell wide after a few frames
-        // and then crawls for the rest of the phase.
-        assert_eq!(ease_in_out(0.0), 0.0);
-        assert_eq!(ease_in_out(1.0), 1.0);
-        assert!((0.49..0.51).contains(&ease_in_out(0.5)), "{}", ease_in_out(0.5));
-        assert!(ease_in_out(0.25) < ease_in_out(0.75));
+    fn an_entry_grows_and_shrinks_on_an_ease_out() {
+        // The curve the widths use: nothing at the start, most of the way there
+        // early, and it only ever reaches the ends at 0 and 1. A width commits.
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert!(ease_out(0.5) > 0.5, "ease out is ahead of linear");
+        assert!(ease_out(0.25) < ease_out(0.75));
+        // It is already moving on the first frame, which is the whole difference
+        // between it and the symmetric curve the fades use: that one has no slope
+        // here, and a cell growing on it looked like it started several frames late.
+        assert!(ease_out(0.02) > 0.05, "{}", ease_out(0.02));
         // Out of range is clamped rather than extrapolated, so a tick that
         // overshoots lands exactly on the end instead of past it.
-        assert_eq!(ease_in_out(-0.5), 0.0);
-        assert_eq!(ease_in_out(1.5), 1.0);
+        assert_eq!(ease_out(-0.5), 0.0);
+        assert_eq!(ease_out(1.5), 1.0);
 
         // A whole cell's worth of growth: from nothing, to its settled width, with
         // the border accounted for at both ends.
@@ -3737,7 +3754,7 @@ mod tests {
         assert_eq!(at(1.0), full);
         // Part way through it is a real width, so the surface is resized every step
         // rather than jumping between the two ends.
-        let half = at(ease_in_out(0.5));
+        let half = at(ease_out(0.5));
         assert!(half > 0 && half < full, "got {half} of {full}");
     }
 
