@@ -86,6 +86,14 @@ impl Backend for WinitData {
     fn reset_buffers(&mut self, _output: &Output) {}
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
     fn update_led_state(&mut self, _led_state: LedState) {}
+
+    fn panel_thumbnail(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        max: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Option<(smithay::utils::Size<i32, smithay::utils::Buffer>, Vec<u8>)> {
+        crate::shell::capture_thumbnail(self.backend.renderer(), window, max)
+    }
 }
 
 pub fn run_winit() {

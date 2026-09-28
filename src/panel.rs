@@ -7,7 +7,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -31,16 +31,1978 @@ const ICON_SIZE: i32 = 26;
 const INDICATOR_HEIGHT: i32 = 6;
 const DOT_SIZE: f64 = 3.0;
 const DOT_GAP: f64 = 2.0;
+/// The close glyph, as the same 1-bit XBM the compositor's titlebar buttons use
+/// (`CLOSE_ICON` in `shell::ssd`), so the two are identical rather than similar.
+///
+/// 10x10, one bit per pixel, least-significant bit first, two bytes per row —
+/// twenty bytes in total. A set bit is the glyph, a clear bit transparent.
+const CLOSE_XBM: [u8; 20] = [
+    0x03, 0xff, 0x87, 0xff, 0xce, 0xfd, 0xfc, 0xfc, 0x78, 0xfc, 0x78, 0xfc, 0xfc, 0xfc, 0xce, 0xfd,
+    0x87, 0xff, 0x03, 0xff,
+];
+const CLOSE_XBM_SIZE: i32 = 10;
+/// The glyph at rest, and under the pointer.
+
+/// Where a 1-bit XBM's set pixels are, in its own grid.
+///
+/// Bit 0 of each byte is the *leftmost* pixel of that byte, matching the XBM
+/// format the compositor's own icons are written in, so the same bytes render
+/// identically on both sides.
+fn glyph_pixels(pattern: &[u8], size: i32) -> Vec<(i32, i32)> {
+    let bytes_per_row = (size as usize + 7) / 8;
+    let mut pixels = Vec::new();
+    for y in 0..size as usize {
+        for x in 0..size as i32 {
+            // Bounds-checked rather than trusted: the pattern comes from a
+            // compositor, and a short one must not take the panel down with it.
+            let byte = y * bytes_per_row + x as usize / 8;
+            let bit = pattern.get(byte).is_some_and(|byte| byte >> (x % 8) & 1 == 1);
+            if bit {
+                pixels.push((x, y as i32));
+            }
+        }
+    }
+    pixels
+}
+
 /// Fallback accent (neutral gray) when the desktop provides none.
 const DEFAULT_ACCENT: &str = "#d8d8d8";
 const MUTED_COLOR: (f64, f64, f64) = (0.78, 0.78, 0.78);
 /// How often the panel drains the compositor socket.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+///
+/// This is the dominant term in how far a preview trails the window it shows: the
+/// compositor answers a request within a frame, but the answer sits in the socket
+/// until the panel reads it. At 50ms a fresh preview waited up to three frames to
+/// appear, which reads as the image lagging the cursor. Reading often is cheap —
+/// a non-blocking read that finds nothing costs nothing, and the task list is only
+/// rebuilt when a snapshot actually arrives, which the compositor only sends on a
+/// change.
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const FALLBACK_ICON: &str = "application-x-executable";
 
+// ---------------------------------------------------------------- menu metrics
+
+/// Height of every preview, in logical pixels. Shared, so the row lines up along
+/// its top and bottom edges however wide the individual windows are.
+const PREVIEW_HEIGHT: i32 = 118;
+/// Bounds on a preview's width. The upper one is not about looks: a cell wider than
+/// its preview cannot be filled, because the width is the image's own aspect at the
+/// shared height, and a cell narrower than that cannot either. So the only way to
+/// honour a bound is to letterbox, and a letterboxed preview is what this whole
+/// layout has been fighting. A very wide window therefore gets a wide cell, and the
+/// bound is set well above any real window's aspect so that it is not reached.
+const PREVIEW_MIN_WIDTH: i32 = 96;
+const PREVIEW_MAX_CELL: i32 = 360;
+/// The titlebar above each preview, echoing the compositor's own.
+const TITLEBAR_HEIGHT: i32 = 24;
+/// Inset before the title.
+const TITLE_INSET: i32 = 7;
+/// Size the close glyph is drawn at: its own native resolution, one bitmap pixel
+/// to one screen pixel.
+///
+/// It is a 1-bit ten-pixel diagonal, and scaling it up to fill the button's hit
+/// area turns those strokes into a grey smear. The button is made legible by the
+/// highlight behind it, not by enlarging the glyph.
+const CLOSE_DRAWN: i32 = CLOSE_XBM_SIZE;
+/// Gap between previews, and the menu's own padding.
+const CELL_GAP: i32 = 6;
+/// The cell outline's width. Previews are held in by it so the image never paints
+/// over it, and so the gap round a preview is the same all the way round.
+const CELL_BORDER: i32 = 1;
+const MENU_PAD: i32 = 6;
+/// Corner radii.
+const MENU_RADIUS: f64 = 8.0;
+const CELL_RADIUS: f64 = 6.0;
+/// Title text, as drawn and as measured. Both sizes are set here rather than in
+/// CSS because the text is truncated against what cairo measures, and the drawn
+/// and measured sizes have to be the same one.
+const TITLE_FONT_SIZE: f64 = 10.0;
+const TITLE_COLOUR: (f64, f64, f64) = (0.863, 0.863, 0.863);
+/// Appended to a title that has to be cut short.
+const TITLE_ELLIPSIS: char = '\u{2026}';
+/// Menu colours, replacing what the stylesheet used to say.
+const MENU_FILL: (f64, f64, f64, f64) = (0.11, 0.11, 0.11, 0.94);
+const MENU_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.16);
+const CELL_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.35);
+const CELL_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
+const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
+const TITLEBAR_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.07);
+const CLOSE_IDLE: (f64, f64, f64) = (0.55, 0.55, 0.55);
+const CLOSE_HOVER: (f64, f64, f64) = (1.0, 1.0, 1.0);
+const CLOSE_HOVER_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
+/// The preview size asked of the compositor, which bounds what can arrive.
+const PREVIEW_TARGET: (i32, i32) = (PREVIEW_MAX_CELL, PREVIEW_HEIGHT);
+/// How often an open menu asks for fresh previews, so a window that is animating
+/// or playing video reads as live rather than frozen.
+///
+/// Around 30Hz. The compositor only renders [`PANEL_THUMBNAILS_PER_TICK`] of the
+/// requests per frame, so this is the rate it is asked at, not the rate every
+/// preview is necessarily updated at.
+const PREVIEW_REFRESH: Duration = Duration::from_millis(33);
+/// How long an entry takes to grow from nothing to its width, or to shrink to
+/// nothing, when a window appears or goes.
+const CELL_MORPH: Duration = Duration::from_millis(220);
+/// How long a window takes to fade in or out, separately from the width, because
+/// the two run one after the other rather than together.
+const CELL_FADE: Duration = Duration::from_millis(140);
+/// How long the menu's reveal takes.
+const MENU_FADE: Duration = Duration::from_millis(180);
+/// How far below its resting place the menu starts, so it slides out from the bar
+/// as it fades up.
+const MENU_SLIDE: i32 = 10;
+/// Minimum gap kept between the menu and the right edge of the output.
+const MENU_EDGE_GAP: i32 = 8;
+/// How long the pointer must be outside both the bar and the menu before the
+/// menu closes. Long enough to cover the gap while crossing between them.
+const HOVER_GRACE: Duration = Duration::from_millis(400);
+/// How long to wait for every preview before showing the menu anyway.
+///
+/// Short: a window with nothing committed, or a buffer the renderer will not
+/// import, would otherwise leave the menu closed forever.
+const MENU_REVEAL_FALLBACK: Duration = Duration::from_millis(600);
+
+// ---------------------------------------------------------------- menu layout
+
+/// A rectangle, in menu-surface coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl Rect {
+        /// Whether `(x, y)` is inside, treating the edges as inside too. The pointer
+    /// sits exactly on an edge often enough that excluding it would make a
+    /// control feel dead along one side.
+    fn contains(self, x: f64, y: f64) -> bool {
+        let (left, top) = (self.x as f64, self.y as f64);
+        let (right, bottom) = ((self.x + self.width) as f64, (self.y + self.height) as f64);
+        x >= left && x < right && y >= top && y < bottom
+    }
+}
+
+/// The close button's square: a full strip-height square in the titlebar's far
+/// corner, so its top, right and bottom are the strip's own.
+///
+/// Defined once and used by both the hit test and the painting, because a
+/// highlight that is not where the click area is makes the button feel broken.
+fn close_rect(cell: &Rect) -> Rect {
+    Rect {
+        x: cell.x + cell.width - TITLEBAR_HEIGHT,
+        y: cell.y,
+        width: TITLEBAR_HEIGHT,
+        height: TITLEBAR_HEIGHT,
+    }
+}
+
+/// Where each preview sits, and how big the surface has to be to hold them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MenuLayout {
+    surface: Rect,
+    cells: Vec<Rect>,
+}
+
+impl MenuLayout {
+    /// What is under the pointer: the preview, or the close button in its
+    /// titlebar.
+    fn hit(&self, x: f64, y: f64) -> Hit {
+        for (index, cell) in self.cells.iter().enumerate() {
+            if !cell.contains(x, y) {
+                continue;
+            }
+            if close_rect(cell).contains(x, y) {
+                return Hit::Close(index);
+            }
+            return Hit::Preview(index);
+        }
+        Hit::None
+    }
+}
+
+/// What the pointer is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hit {
+    None,
+    Preview(usize),
+    Close(usize),
+}
+
+/// Lay the previews out in a row, left to right, and size the surface to them.
+///
+/// `widths` is one entry per cell, in the order they are shown, and each is the
+/// cell's *current* width — part way through the grow-or-shrink animation if one is
+/// in flight. So the surface follows the animation rather than snapping to its end
+/// state.
+///
+/// A settled cell is its image's width plus its border, which makes the box a
+/// preview is drawn into exactly the size [`preview_width`] computed for it — same
+/// width, [`PREVIEW_HEIGHT`] tall — so the image is never scaled to fit a box a
+/// pixel or two off. That is what uneven padding around a preview means: the box
+/// and the scale disagree, so one axis is stretched and the gaps do not match.
+///
+/// The surface is then exactly as wide as the row plus the menu's padding, so it
+/// hugs the previews instead of spanning the output and leaving a gap at one side.
+fn layout_menu(widths: &[i32]) -> MenuLayout {
+    // A gap only *between* cells that are still there. Charging every cell a gap
+    // left an entry that had closed up to nothing still holding 6px of row, which
+    // then vanished in one jump the moment it was dropped: the row visibly popped at
+    // the end of every closing animation.
+    let mut placed: Vec<Rect> = Vec::with_capacity(widths.len());
+    let mut x = MENU_PAD;
+    let mut seen = 0usize;
+    let mut content = 0i32;
+    for width in widths {
+        let visible = *width > 0;
+        if visible {
+            if seen > 0 {
+                x += CELL_GAP;
+                content += CELL_GAP;
+            }
+            seen += 1;
+            content += *width;
+        }
+        // Kept in step with `widths` so the cell a hit test names is the one that was
+        // drawn. A zero-width cell is never hit, being empty.
+        placed.push(Rect {
+            x,
+            y: MENU_PAD,
+            width: *width,
+            height: PREVIEW_HEIGHT + TITLEBAR_HEIGHT + CELL_BORDER,
+        });
+        x += *width;
+    }
+    MenuLayout {
+        surface: Rect {
+            x: 0,
+            y: 0,
+            // Never narrower than the padding on either side, so an empty menu is
+            // still a sensible size rather than a sliver.
+            width: (content + MENU_PAD * 2).max(MENU_PAD * 2),
+            height: PREVIEW_HEIGHT + TITLEBAR_HEIGHT + CELL_BORDER + MENU_PAD * 2,
+        },
+        cells: placed,
+    }
+}
+
+/// How wide a preview should be for a window of this shape.
+///
+/// One height for every preview, the width following each window's own aspect at
+/// that height, so the row lines up along both edges and — the point of deriving
+/// the width this way — the cell is exactly the size the image is scaled for, so
+/// the image fills it and neither axis is letterboxed or stretched.
+///
+/// The bounds are a floor for a uselessly narrow window and a ceiling for a
+/// comically wide one. Only beyond the ceiling does a preview get letterboxed, which
+/// is the honest outcome of not letting one window fill the screen.
+fn preview_width(width: i32, height: i32) -> i32 {
+    if width <= 0 || height <= 0 {
+        return PREVIEW_HEIGHT;
+    }
+    let fitted = (f64::from(width) * f64::from(PREVIEW_HEIGHT) / f64::from(height)).round();
+    (fitted as i32).clamp(PREVIEW_MIN_WIDTH, PREVIEW_MAX_CELL)
+}
+
+/// Where the menu's left edge goes to sit under the icon that opened it, kept on
+/// screen and clear of the right edge.
+fn menu_left(icon_center: i32, bar_width: i32, menu_width: i32) -> i32 {
+    let furthest = (bar_width - MENU_EDGE_GAP - menu_width).max(MENU_EDGE_GAP);
+    (icon_center - menu_width / 2).clamp(MENU_EDGE_GAP, furthest.max(MENU_EDGE_GAP))
+}
+
+// ---------------------------------------------------------------- menu state
+
+/// One window on show: its title, its newest preview, and where it ended up.
+struct MenuEntry {
+    title: RefCell<String>,
+    focused: Cell<bool>,
+    /// The newest preview, as a cairo surface over the pixels the compositor
+    /// sent. Cairo takes ownership of the data it is handed, so the surface is
+    /// built once when the preview arrives and then drawn from repeatedly, rather
+    /// than rebuilt — and the image recopied — on every repaint.
+    preview: RefCell<Option<Preview>>,
+    /// Laid out at this rectangle, in surface coordinates.
+    rect: Cell<Rect>,
+    /// The width this entry has settled at, from its preview's aspect.
+    target: Cell<i32>,
+    /// How wide it is, 0 to 1 of `target`.
+    width: Cell<f64>,
+    /// How opaque it is, 0 to 1.
+    alpha: Cell<f64>,
+    /// Which part of the way in or out it is on.
+    motion: Cell<Motion>,
+    /// How far through the current phase, 0 to 1, linear in time. The value drawn
+    /// is this run through the ease curve, so the motion is quick off the mark and
+    /// settles rather than starting and stopping dead.
+    elapsed: Cell<f64>,
+}
+
+/// Where an entry is in appearing or disappearing.
+///
+/// The two channels run one after the other, not together: a window leaving fades
+/// out *first*, and only once it is invisible does its width close up, so the row
+/// does not appear to shrink an empty gap. A window arriving does the reverse —
+/// it grows into the row while still invisible, and only then fades in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Motion {
+    /// Growing into the row, still transparent.
+    Growing,
+    /// Fully grown; fading up.
+    FadingIn,
+    /// Both settled.
+    Settled,
+    /// Fading out; still full width.
+    FadingOut,
+    /// Invisible; closing up.
+    Shrinking,
+}
+
+impl MenuEntry {
+    fn new(info: &WindowInfo) -> Self {
+        Self {
+            title: RefCell::new(window_title(info)),
+            focused: Cell::new(info.focused),
+            preview: RefCell::new(None),
+            rect: Cell::new(Rect::default()),
+            // Starts at nothing and grows once the menu is up, so opening one has
+            // the same motion as a window appearing in an already open menu.
+            target: Cell::new(PREVIEW_HEIGHT),
+            width: Cell::new(0.0),
+            alpha: Cell::new(0.0),
+            motion: Cell::new(Motion::Growing),
+            elapsed: Cell::new(0.0),
+        }
+    }
+}
+
+/// A window capture, already scaled to [`PREVIEW_TARGET`] by the compositor.
+struct Preview {
+    width: i32,
+    height: i32,
+    surface: gtk4::cairo::ImageSurface,
+}
+
+impl Preview {
+    /// Wrap freshly received pixels, or reject a payload that does not describe
+    /// the image it claims to.
+    fn new(width: i32, height: i32, mut pixels: Vec<u8>) -> Option<Self> {
+        if width <= 0 || height <= 0 || pixels.len() != (width * height * 4) as usize {
+            return None;
+        }
+        to_cairo_rgba(&mut pixels);
+        let surface = gtk4::cairo::ImageSurface::create_for_data(
+            pixels,
+            gtk4::cairo::Format::ARgb32,
+            width,
+            height,
+            width * 4,
+        )
+        .ok()?;
+        Some(Self {
+            width,
+            height,
+            surface,
+        })
+    }
+}
+
+/// Convert straight RGBA bytes to what cairo's `ARgb32` expects.
+///
+/// Two differences, both of which show as a wrong picture rather than an error:
+///
+/// * `ARgb32` is a native-endian 32-bit word, so on a little-endian machine its
+///   bytes are in **B, G, R, A** order. Reading the compositor's R, G, B, A
+///   straight into it swaps red and blue, which is what turned every preview's
+///   colours inside out.
+/// * The channels must be premultiplied by alpha. A window capture is opaque
+///   almost everywhere, so this is usually a no-op, but an image with a real
+///   alpha would otherwise come out too bright.
+///
+/// Done once per incoming preview rather than per repaint.
+fn to_cairo_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let (red, green, blue, alpha) = (pixel[0], pixel[1], pixel[2], pixel[3]);
+        if alpha != 0xff && alpha != 0 {
+            let scale = |channel: u8| ((u16::from(channel) * u16::from(alpha)) / 255) as u8;
+            pixel[0] = scale(blue);
+            pixel[1] = scale(green);
+            pixel[2] = scale(red);
+        } else {
+            pixel[0] = blue;
+            pixel[1] = green;
+            pixel[2] = red;
+        }
+    }
+}
+
+/// The window menu: a row of live previews on a surface of its own, drawn in one
+/// piece rather than assembled from widgets.
+///
+/// Drawn rather than laid out on purpose. Every earlier version of this was a box
+/// of per-preview widgets inside a window left to shrink-wrap its contents, and
+/// every symptom came from that: the window would not resize once mapped, the
+/// titles decided how wide the previews were, and resizing under a stationary
+/// pointer made the compositor report enter and leave as if the pointer had moved.
+/// Here the geometry is arithmetic, the surface is sized from it, and the pointer
+/// is hit-tested against the same numbers that were drawn — so the three cannot
+/// disagree.
+struct Menu {
+    window: gtk4::Window,
+    canvas: DrawingArea,
+    /// The app on show, or none when the menu is closed.
+    app: RefCell<Option<String>>,
+    /// The windows on show, in the order they appear.
+    order: RefCell<Vec<u64>>,
+    entries: RefCell<HashMap<u64, MenuEntry>>,
+    /// The middle of the bar's icon that opened this, and the bar's width, so the
+    /// surface can be kept under it and on screen.
+    icon_center: Cell<i32>,
+    bar_width: Cell<i32>,
+    /// Laid out at this size, and the surface asked to match it.
+    layout: RefCell<MenuLayout>,
+    /// Pointer position within the canvas, or none when it is elsewhere.
+    pointer: Cell<Option<(f64, f64)>>,
+    /// Whether the menu is on screen.
+    shown: Cell<bool>,
+    /// Bumped by every reveal or hide, so an animation that has been superseded
+    /// steps aside instead of acting on a menu that has since changed.
+    animation: Cell<u64>,
+    /// Whether a grow-or-shrink is in flight, so only one tick timer is ever
+    /// running.
+    morphing: Cell<bool>,
+    /// Which part of moving from one app to another is in flight.
+    switch: Cell<Switch>,
+    /// The app being moved to, held until the outgoing previews have gone.
+    pending: RefCell<Option<Pending>>,
+    /// The surface width to use in place of the laid-out one, while the width is
+    /// being eased between the two apps.
+    width_override: Cell<Option<i32>>,
+    /// The compositor socket, so the switch can ask for the incoming app's previews
+    /// from the tick rather than only from an open.
+    stream: RefCell<Option<Rc<UnixStream>>>,
+    /// Ticks the switch has spent waiting for the incoming previews.
+    waited: Cell<u32>,
+    /// Where the window's left edge is, and where a switch is easing it to. The
+    /// position moves with the size: a row that resizes under an icon has to travel
+    /// to stay under it, and the two are one motion rather than two snaps.
+    left_from: Cell<i32>,
+    left_to: Cell<i32>,
+    /// The display's frame clock timestamp for the previous frame, so the step can be
+    /// the real time between frames rather than an assumed one.
+    last_frame: Cell<i64>,
+    /// The surface's width when the switch started, kept because by the time the
+    /// width motion wants it the layout has already been exchanged.
+    width_asked: Cell<i32>,
+    /// The size last asked of the surface.
+    ///
+    /// Compared against rather than the window's own reported size, which is the one
+    /// value here that cannot be trusted: a compositor that has enlarged the surface
+    /// reports the enlarged size, so asking again to that size would look like no
+    /// change and the surface would never come back to the row.
+    asked: Cell<(i32, i32)>,
+    /// The two ends of the width motion, and its clock. Kept together so the tick
+    /// cannot read one without the others.
+    width_from: Cell<i32>,
+    width_to: Cell<i32>,
+    width_elapsed: Cell<f64>,
+}
+
+impl Menu {
+    /// The surface width the current entries and order would lay out to, gaps and
+    /// padding included — it is the laid-out surface, not a sum of the previews.
+    fn widths_from_layout(&self) -> i32 {
+        layout_menu(&self.widths()).surface.width
+    }
+
+    /// Whether every window on show has sent a preview, so the width to ease to is
+    /// a real one.
+    fn pending_ready(&self) -> bool {
+        let order = self.order.borrow();
+        let entries = self.entries.borrow();
+        order.iter().all(|id| {
+            entries
+                .get(id)
+                .is_some_and(|entry| entry.preview.borrow().is_some())
+        })
+    }
+
+    /// The width the surface is on when a switch starts, kept because by the time
+    /// the width motion wants it the layout has already been exchanged.
+    fn width_asked(&self) -> i32 {
+        self.width_asked.get()
+    }
+
+    /// Where the window's left edge is now.
+    ///
+    /// Read back off the margin it was last given rather than remembered, so a
+    /// switch starts from the position actually on screen.
+    fn window_margin_left(&self) -> i32 {
+        self.window
+            .margin(Edge::Left)
+            .try_into()
+            .unwrap_or(self.left_from.get())
+    }
+
+    /// Where the window's left edge goes for a given width: under the icon that
+    /// opened it, and on the output.
+    fn left_wanted(&self, width: i32) -> i32 {
+        menu_left(self.icon_center.get(), self.bar_width.get(), width)
+    }
+
+    /// The cell widths to lay out at, in order, each scaled by how far its entry
+    /// has got between gone and settled.
+    fn widths(&self) -> Vec<i32> {
+        let entries = self.entries.borrow();
+        self.order
+            .borrow()
+            .iter()
+            .filter_map(|id| entries.get(id))
+            .map(|entry| {
+                let full = entry.target.get() + CELL_BORDER * 2;
+                (f64::from(full) * entry.width.get()).round().max(0.0) as i32
+            })
+            .collect()
+    }
+
+    /// Whether every preview on show has arrived.
+    fn ready(&self) -> bool {
+        let order = self.order.borrow();
+        let entries = self.entries.borrow();
+        !order.is_empty() && order.iter().all(|id| {
+            entries
+                .get(id)
+                .is_some_and(|entry| {
+                    entry.motion.get() != Motion::Shrinking
+                        && entry.preview.borrow().is_some()
+                })
+        })
+    }
+
+    /// What the pointer is over, worked out from where it is and the current layout.
+    ///
+    /// Never stored: a cached highlight goes stale the moment the layout moves, and
+    /// it kept up with neither a cell that had shifted nor a pointer that had left.
+    fn hit(&self) -> Hit {
+        match self.pointer.get() {
+            Some((x, y)) => self.layout.borrow().hit(x, y),
+            None => Hit::None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the surface
+
+/// Build the menu: one layer surface with a canvas on it, sized and drawn by us.
+fn build_menu(
+    app: &Application,
+    monitor: &gdk::Monitor,
+    stream: Option<Rc<UnixStream>>,
+) -> Rc<Menu> {
+    let window = gtk4::Window::builder().application(app).build();
+    window.set_decorated(false);
+    window.add_css_class("panel-window");
+    window.init_layer_shell();
+    window.set_namespace(Some("oxide-panel-menu"));
+    window.set_layer(Layer::Top);
+    window.set_monitor(Some(monitor));
+    // Anchored to the top-left corner, then moved by margins to sit under the
+    // icon that opened it.
+    window.set_anchor(Edge::Top, true);
+    window.set_anchor(Edge::Left, true);
+    window.set_margin(Edge::Top, PANEL_HEIGHT);
+    // Reserve nothing: a menu overlays the windows behind it rather than pushing
+    // them around.
+    window.set_exclusive_zone(-1);
+    window.set_opacity(0.0);
+
+    let canvas = DrawingArea::new();
+    // Sized from the outset, and never to nothing. A layer surface that commits
+    // zero is handed *half the output* by the compositor's arrange, and a size
+    // request is only a minimum, so a window that got that big can never be shrunk
+    // back — the menu would sit there as a huge empty box swallowing every click for
+    // the rest of the session. Both the content size and the request are therefore
+    // set, the content size being what makes the window's natural size the layout's.
+    canvas.set_content_width(1);
+    canvas.set_content_height(1);
+    window.set_child(Some(&canvas));
+
+    let menu = Rc::new(Menu {
+        window,
+        canvas: canvas.clone(),
+        app: RefCell::new(None),
+        order: RefCell::new(Vec::new()),
+        entries: RefCell::new(HashMap::new()),
+        icon_center: Cell::new(0),
+        bar_width: Cell::new(0),
+        layout: RefCell::new(MenuLayout::default()),
+        pointer: Cell::new(None),
+        shown: Cell::new(false),
+        animation: Cell::new(0),
+        morphing: Cell::new(false),
+        switch: Cell::new(Switch::Idle),
+        pending: RefCell::new(None),
+        width_override: Cell::new(None),
+        stream: RefCell::new(None),
+        waited: Cell::new(0),
+        left_from: Cell::new(0),
+        left_to: Cell::new(0),
+        last_frame: Cell::new(0),
+        width_asked: Cell::new(0),
+        asked: Cell::new((0, 0)),
+        width_from: Cell::new(0),
+        width_to: Cell::new(0),
+        width_elapsed: Cell::new(0.0),
+    });
+
+    // Painting.
+    let painted = menu.clone();
+    canvas.set_draw_func(move |_, context, width, height| {
+        draw_menu(&painted, context, width, height);
+    });
+
+    // Every motion is stepped from here, on the display's own frame clock, so a step
+    // is a frame rather than whenever a timer happened to fire. Installed once and
+    // left in place; it does nothing at all unless a motion is in flight, which
+    // `morphing` says.
+    {
+        let menu = menu.clone();
+        canvas.add_tick_callback(move |_, clock| {
+            if menu.morphing.get() {
+                // The clock's own timestamp for this frame, differenced against the
+                // last one. The binding does not hand the frame time over, and using
+                // the clock's is better anyway: it is the time the frame is being
+                // presented at, not the time a timer happened to be serviced.
+                let now = clock.frame_time();
+                let previous = menu.last_frame.replace(now);
+                // The very first frame of a motion has no previous one, so it is worth
+                // nothing: stepping on it would jump the motion forward by a whole
+                // frame the caller never waited for.
+                if now > previous {
+                    tick_morph(&menu, now - previous);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // The pointer, hit-tested against the same rectangles that were drawn. A
+    // widget per preview would have GTK deliver this for free, and would also have
+    // meant the geometry lived in two places at once.
+    {
+        let motion = gtk4::EventControllerMotion::new();
+        motion.connect_enter({
+            let menu = menu.clone();
+            move |_, x, y| pointer_moved(&menu, Some((x, y)))
+        });
+        motion.connect_motion({
+            let menu = menu.clone();
+            move |_, x, y| pointer_moved(&menu, Some((x, y)))
+        });
+        motion.connect_leave({
+            let menu = menu.clone();
+            move |_| pointer_moved(&menu, None)
+        });
+        canvas.add_controller(motion);
+    }
+
+    // Focus a window by clicking its preview, close it by clicking its close
+    // button. Which is which is settled by the hit test, so it cannot disagree
+    // with what was drawn.
+    {
+        let clicked = menu.clone();
+        let click = gtk4::GestureClick::new();
+        click.set_button(gdk::BUTTON_PRIMARY);
+        click.connect_pressed(move |_, _, x, y| {
+            let target = match clicked.layout.borrow().hit(x, y) {
+                Hit::Close(index) => clicked.order.borrow().get(index).copied().map(|id| (id, true)),
+                Hit::Preview(index) => {
+                    clicked.order.borrow().get(index).copied().map(|id| (id, false))
+                }
+                Hit::None => None,
+            };
+            let Some((id, close)) = target else {
+                return;
+            };
+            let Some(stream) = stream.as_ref() else {
+                return;
+            };
+            if close {
+                // Only that window, and the menu stays: you are picking the next one.
+                send(stream, &format!("close\t{id}\n"));
+            } else {
+                // Focusing a window is choosing it, so the menu goes away.
+                send(stream, &format!("focus\t{id}\n"));
+                menu_close(&clicked);
+            }
+        });
+        canvas.add_controller(click);
+    }
+
+    menu
+}
+
+
+/// Record where the pointer is, and repaint if that changed what it is over.
+fn pointer_moved(menu: &Rc<Menu>, at: Option<(f64, f64)>) {
+    // Outside the surface is nowhere, whatever the widget was told: a layer surface
+    // that has been moved or resized can keep delivering coordinates that no longer
+    // land on it.
+    let at = at.filter(|(x, y)| menu.layout.borrow().surface.contains(*x, *y));
+    menu.pointer.set(at);
+    // Always repainted, even if the pointer is over the same thing: what is drawn
+    // depends on the layout as well as the position, and skipping the redraw on an
+    // unchanged *hit* is what left a highlight behind when the geometry moved under
+    // it.
+    menu.canvas.queue_draw();
+}
+
+// ---------------------------------------------------------------- painting
+
+/// Paint the whole menu.
+fn draw_menu(menu: &Rc<Menu>, context: &gtk4::cairo::Context, width: i32, height: i32) {
+    // The layout's surface, not the canvas allocation. They should be the same, but
+    // a compositor that has enlarged the surface must not be able to paint the menu
+    // larger than the row it is drawn from — an unpainted region is still a hit-test
+    // region, so the surplus would swallow clicks.
+    let surface = menu.layout.borrow().surface;
+    let width = surface.width.min(width);
+    let height = surface.height.min(height);
+    set_source(context, MENU_FILL);
+    rounded_top_rectangle(context, 0.0, 0.0, f64::from(width), f64::from(height), MENU_RADIUS);
+    let _ = context.fill_preserve();
+    set_source(context, MENU_EDGE);
+    context.set_line_width(1.0);
+    let _ = context.stroke();
+
+    let layout = menu.layout.borrow().clone();
+    let order = menu.order.borrow().clone();
+    let entries = menu.entries.borrow();
+    let hit = menu.hit();
+    for (index, cell) in layout.cells.iter().enumerate() {
+        let Some(id) = order.get(index) else {
+            break;
+        };
+        let Some(entry) = entries.get(id) else {
+            break;
+        };
+        let accent = accent_rgb();
+        let _ = &entry;
+        let over_close = hit == Hit::Close(index);
+        let over_cell = matches!(hit, Hit::Preview(i) | Hit::Close(i) if i == index);
+        let edge = if over_cell {
+            CELL_EDGE_HOVER
+        } else if entry.focused.get() {
+            (accent.0, accent.1, accent.2, 0.9)
+        } else {
+            CELL_EDGE
+        };
+        // Into a group of its own, so the entry's progress can fade every colour
+        // it uses — fill, outline, title, glyph — in one go rather than each being
+        // scaled by hand and one of them forgotten.
+        let alpha = entry.alpha.get();
+        if alpha <= 0.0 {
+            continue;
+        }
+        let _ = context.push_group();
+        set_source(context, CELL_FILL);
+        rounded_top_rectangle(
+            context,
+            f64::from(cell.x),
+            f64::from(cell.y),
+            f64::from(cell.width),
+            f64::from(cell.height),
+            CELL_RADIUS,
+        );
+        let _ = context.fill();
+
+        // The titlebar across the top of the cell, its bottom corners square so it
+        // meets the preview cleanly.
+        let titlebar = Rect {
+            x: cell.x,
+            y: cell.y,
+            width: cell.width,
+            height: TITLEBAR_HEIGHT,
+        };
+        // Clipped to the cell's own shape, so the strip gets the cell's rounded
+        // top corners and its square bottom without a shape of its own.
+        let _ = context.save();
+        rounded_top_rectangle(
+            context,
+            f64::from(cell.x),
+            f64::from(cell.y),
+            f64::from(cell.width),
+            f64::from(cell.height),
+            CELL_RADIUS,
+        );
+        let _ = context.clip();
+        set_source(context, TITLEBAR_FILL);
+        let _ = context.rectangle(
+            f64::from(titlebar.x),
+            f64::from(titlebar.y),
+            f64::from(titlebar.width),
+            f64::from(titlebar.height),
+        );
+        let _ = context.fill();
+        let _ = context.restore();
+
+        {
+            let held = entry.preview.borrow();
+            if let Some(preview) = held.as_ref() {
+                draw_preview(context, cell, preview);
+            }
+        }
+        draw_title(context, &titlebar, &entry.title.borrow());
+        draw_close(context, &titlebar, over_close);
+        let _ = context.pop_group_to_source();
+        let _ = context.paint_with_alpha(alpha);
+
+        // The outline last of all: the preview covers the whole of the cell below
+        // the strip, so a border stroked before it had its left, right and bottom
+        // edges painted over and the cell read as having no outline at all.
+        set_source(context, edge);
+        context.set_line_width(1.0);
+        rounded_top_rectangle(
+            context,
+            f64::from(cell.x) + 0.5,
+            f64::from(cell.y) + 0.5,
+            f64::from(cell.width) - 1.0,
+            f64::from(cell.height) - 1.0,
+            CELL_RADIUS,
+        );
+        let _ = context.stroke();
+    }
+}
+
+/// Draw a preview into the space below its titlebar, scaled to fit.
+fn draw_preview(context: &gtk4::cairo::Context, cell: &Rect, preview: &Preview) {
+    // The cell's body below the strip, held in by the border: drawing the image
+    // over the border is what left the outline looking broken, and the inset is
+    // what makes the gap round the image the same on every side.
+    let box_rect = Rect {
+        x: cell.x + CELL_BORDER,
+        y: cell.y + TITLEBAR_HEIGHT,
+        width: cell.width - CELL_BORDER * 2,
+        height: cell.height - TITLEBAR_HEIGHT - CELL_BORDER,
+    };
+    if preview.width <= 0 || preview.height <= 0 {
+        return;
+    }
+    let left = f64::from(box_rect.x);
+    let top = f64::from(box_rect.y);
+    let width = f64::from(box_rect.width);
+    let height = f64::from(box_rect.height);
+    let (image_width, image_height) = (preview.width, preview.height);
+    // One scale for both axes, and the smaller of the two. Scaling each axis
+    // separately to fill the box is what stretched the previews: a box a pixel or
+    // two off the image's aspect — which is all a clamped width is — came out
+    // visibly distorted, and every preview in the row was squashed to the same
+    // proportions rather than one being a little too small.
+    let scale = (width / f64::from(image_width)).min(height / f64::from(image_height));
+    let drawn_width = f64::from(image_width) * scale;
+    let drawn_height = f64::from(image_height) * scale;
+    // Centred in what is left over, so a preview that cannot fill the box is inset
+    // evenly rather than pushed against one side.
+    let offset_x = left + (width - drawn_width) / 2.0;
+    let offset_y = top + (height - drawn_height) / 2.0;
+    let _ = context.save();
+    let _ = context.translate(offset_x, offset_y);
+    let _ = context.scale(scale, scale);
+    // Cairo's default filter is `GOOD`, which is what a preview wants: it arrives
+    // within a pixel or two of the size it is drawn at, and `NEAREST` would show
+    // that as a shimmer while `BILINEAR` cannot be had without reaching for a
+    // pattern this binding does not expose.
+    let _ = context.set_source_surface(&preview.surface, 0.0, 0.0);
+    let _ = context.paint();
+    let _ = context.restore();
+}
+
+/// Draw a title, cut to whatever room its titlebar leaves.
+fn draw_title(context: &gtk4::cairo::Context, titlebar: &Rect, title: &str) {
+    context.select_font_face(
+        "sans-serif",
+        gtk4::cairo::FontSlant::Normal,
+        gtk4::cairo::FontWeight::Normal,
+    );
+    context.set_font_size(TITLE_FONT_SIZE);
+    set_source(context, (TITLE_COLOUR.0, TITLE_COLOUR.1, TITLE_COLOUR.2, 1.0));
+    // Only what is left once the inset and the close square are accounted for.
+    let budget = f64::from((titlebar.width - TITLE_INSET - TITLEBAR_HEIGHT).max(0));
+    let shown = truncate_to_width(title, budget, &|candidate| {
+        text_width(context, candidate)
+    });
+    let extents = match context.text_extents(&shown) {
+        Ok(extents) => extents,
+        Err(_) => return,
+    };
+    let baseline = centred_baseline(
+        f64::from(titlebar.y) + f64::from(TITLEBAR_HEIGHT) / 2.0,
+        extents.y_bearing(),
+        extents.height(),
+    );
+    let _ = context.move_to(f64::from(titlebar.x) + f64::from(TITLE_INSET) as f64, baseline);
+    let _ = context.show_text(&shown);
+}
+
+/// Draw the close glyph at the right of a titlebar.
+fn draw_close(context: &gtk4::cairo::Context, titlebar: &Rect, hovered: bool) {
+    // The centre of a box is its position plus half its size, not the two added
+    // together and halved: the second reading puts the glyph three pixels high in
+    // The square from `close_rect`, so the highlight and the click area are the
+    // same place: flush with the strip's top, right and bottom, and only its left
+    // edge standing in from the corner.
+    let square = close_rect(&Rect {
+        x: titlebar.x,
+        y: titlebar.y,
+        width: titlebar.width,
+        height: TITLEBAR_HEIGHT,
+    });
+    let centre_x = f64::from(square.x + square.width / 2);
+    let centre_y = f64::from(square.y + square.height / 2);
+    if hovered {
+        set_source(context, CLOSE_HOVER_FILL);
+        let _ = context.rectangle(
+            f64::from(square.x),
+            f64::from(square.y),
+            f64::from(square.width),
+            f64::from(square.height),
+        );
+        let _ = context.fill();
+    }
+    // The same 1-bit XBM the compositor's own titlebar buttons use, so the two are
+    // identical rather than similar. Drawn as rectangles rather than uploaded as a
+    // texture: it is ten pixels of a straight diagonal, and a scale factor does
+    // not survive a bitmap.
+    let scale = 1.0;
+    let origin_x = centre_x - f64::from(CLOSE_DRAWN) / 2.0;
+    let origin_y = centre_y - f64::from(CLOSE_DRAWN) / 2.0;
+    let (red, green, blue) = if hovered { CLOSE_HOVER } else { CLOSE_IDLE };
+    let _ = context.set_source_rgb(red, green, blue);
+    for (x, y) in glyph_pixels(&CLOSE_XBM, CLOSE_XBM_SIZE) {
+        let _ = context.rectangle(
+            origin_x + f64::from(x) * scale,
+            origin_y + f64::from(y) * scale,
+            scale,
+            scale,
+        );
+    }
+    let _ = context.fill();
+}
+
+/// Trace a rectangle with only its top corners rounded, into the current path.
+///
+/// The shape of a window: rounded where it meets the panel above, square where it
+/// ends below. Rounding all four made the mini titlebar look like a lozenge
+/// sitting on a hole rather than the top of a window.
+fn rounded_top_rectangle(
+    context: &gtk4::cairo::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) {
+    let _ = context.new_sub_path();
+    for step in rounded_top_path(x, y, width, height, radius) {
+        match step {
+            PathStep::Move(x, y) => {
+                let _ = context.move_to(x, y);
+            }
+            PathStep::Line(x, y) => {
+                let _ = context.line_to(x, y);
+            }
+            PathStep::Arc {
+                cx,
+                cy,
+                radius,
+                a0,
+            } => {
+                let _ = context.arc(cx, cy, radius, a0, a0 + std::f64::consts::FRAC_PI_2);
+            }
+        }
+    }
+    let _ = context.close_path();
+}
+
+/// Ease out cubic: quick off the mark, then asymptotic to the target.
+///
+/// The same curve the menu's reveal uses, so a window arriving and the menu
+/// arriving have the same feel. `t` is 0 to 1.
+fn ease_out(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Ease in cubic: slow off the mark, then away quickly.
+///
+/// The mirror of [`ease_out`], and what a fade *out* needs. Using the other curve
+/// meant the opacity was already down to a quarter within one tick — ease-out is
+/// quickest at the start, which is the opposite of what a fade wants — so the
+/// departure looked instantaneous and then appeared to hang on nothing while the
+/// width phase caught up. Mirrored, fading in and fading out are the same motion
+/// played forwards and backwards.
+fn ease_in(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t.powi(3)
+}
+
+/// One step of a path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PathStep {
+    Move(f64, f64),
+    Line(f64, f64),
+    /// A quarter turn, from `a0` to `a0 + PI/2`.
+    Arc {
+        cx: f64,
+        cy: f64,
+        radius: f64,
+        a0: f64,
+    },
+}
+
+/// The outline of a box with only its top corners rounded.
+///
+/// Every step is placed rather than left for cairo to join: cairo draws a straight
+/// line from wherever the last arc ended to wherever the next one starts, which
+/// put the top edge a whole radius down and the bottom-left corner on a diagonal.
+fn rounded_top_path(x: f64, y: f64, width: f64, height: f64, radius: f64) -> Vec<PathStep> {
+    // Never wider than half the box, or the corners would overlap themselves on a
+    // short cell.
+    let radius = radius.max(0.0).min(width / 2.0).min(height / 2.0);
+    let right = x + width;
+    let bottom = y + height;
+    if radius == 0.0 {
+        return vec![PathStep::Move(x, y), PathStep::Line(right, y)];
+    }
+    let half = std::f64::consts::PI;
+    vec![
+        // Start down the left side, a radius below the top.
+        PathStep::Move(x, y + radius),
+        // Round the top-left corner, ending on the top edge.
+        PathStep::Arc {
+            cx: x + radius,
+            cy: y + radius,
+            radius,
+            a0: half,
+        },
+        // Straight across the top.
+        PathStep::Line(right - radius, y),
+        // Round the top-right corner, ending on the right side.
+        PathStep::Arc {
+            cx: right - radius,
+            cy: y + radius,
+            radius,
+            a0: half + std::f64::consts::FRAC_PI_2,
+        },
+        // Down the right side and across the bottom, both square.
+        PathStep::Line(right, bottom),
+        PathStep::Line(x, bottom),
+    ]
+}
+
+fn set_source(context: &gtk4::cairo::Context, (red, green, blue, alpha): (f64, f64, f64, f64)) {
+    context.set_source_rgba(red, green, blue, alpha);
+}
+
+/// Where a baseline goes to leave text sitting on a line's centre.
+///
+/// The ink occupies the span from `y_bearing` above the baseline to
+/// `y_bearing + height` below it, so its middle is `y_bearing + height / 2` away
+/// from the baseline — a negative number, because cairo measures `y_bearing`
+/// upwards. Putting that middle on `centre` means moving the baseline up by the
+/// same distance again.
+///
+/// This assumes cairo's convention, that `y_bearing` is measured upwards and so
+/// arrives negative. Reading it the other way round puts the baseline above the
+/// cell and clips the top off every title, which is what happened before.
+fn centred_baseline(centre: f64, y_bearing: f64, height: f64) -> f64 {
+    centre - (y_bearing + height / 2.0)
+}
+
+/// Where `text` reaches when drawn, or 0 if cairo cannot measure it.
+fn text_width(context: &gtk4::cairo::Context, text: &str) -> f64 {
+    context
+        .text_extents(text)
+        .map(|extents| extents.width())
+        .unwrap_or(0.0)
+}
+
+/// Cut `text` to fit `budget`, marking what was lost with an ellipsis.
+///
+/// `measure` gives a string's advance width, so the caller decides how that is
+/// measured rather than this guessing at font metrics — which is what a label's
+/// own ellipsize cannot promise, since it reports the width of the *unellipsized*
+/// text as its natural width and that width is what a window shrink-wraps to.
+fn truncate_to_width(text: &str, budget: f64, measure: &impl Fn(&str) -> f64) -> String {
+    if measure(text) <= budget {
+        return text.to_owned();
+    }
+    let mut cut = text.chars().count();
+    while cut > 0 {
+        let mut candidate: String = text.chars().take(cut).collect();
+        candidate.push(TITLE_ELLIPSIS);
+        if measure(&candidate) <= budget {
+            return candidate;
+        }
+        cut -= 1;
+    }
+    TITLE_ELLIPSIS.to_string()
+}
+
+// ---------------------------------------------------------------- driving it
+
+/// Lay the menu out, resize the surface to match, and repaint.
+///
+/// Every geometric change goes through here, so the size the surface is given and
+/// the rectangles the pointer is tested against are always the same numbers. A
+/// no-op when nothing moved, which matters: resizing the surface under a
+/// stationary pointer makes the compositor report enter and leave, which reads as
+/// the pointer having left the menu.
+fn relayout(menu: &Rc<Menu>) {
+    let mut layout = layout_menu(&menu.widths());
+    // While the width is being eased between two apps the surface is that width, not
+    // the laid-out one: the old previews are already invisible and the new ones not
+    // yet in, so the row has nothing to say about how wide it should be.
+    // Only while a switch is actually running: left set after one finished, the
+    // surface stayed at the width it was easing towards rather than the width of
+    // whatever is now in the row.
+    if menu.switch.get() != Switch::Idle
+        && let Some(width) = menu.width_override.get()
+    {
+        layout.surface.width = width;
+    }
+    let size = (layout.surface.width, layout.surface.height);
+    *menu.layout.borrow_mut() = layout.clone();
+    {
+        let entries = menu.entries.borrow();
+        for (index, id) in menu.order.borrow().iter().enumerate() {
+            if let Some(entry) = entries.get(id)
+                && let Some(cell) = layout.cells.get(index)
+            {
+                entry.rect.set(*cell);
+            }
+        }
+    }
+    // Never a zero: see `build_menu`. `layout_menu` floors the width, and the height
+    // is a constant, so this cannot ask for nothing.
+    let size = (size.0.max(1), size.1.max(1));
+    if size != menu.asked.get() {
+        menu.asked.set(size);
+        // The content size is what the window takes itself to; the request is the
+        // floor. Both, or a surface the compositor has already enlarged stays large.
+        menu.canvas.set_content_width(size.0);
+        menu.canvas.set_content_height(size.1);
+        menu.canvas.set_size_request(size.0, size.1);
+        menu.window.set_default_size(size.0, size.1);
+        menu.window.set_size_request(size.0, size.1);
+        // The position is only snapped when no switch is easing it. A switch moves
+        // the window from where it was to where it is going, and having the layout
+        // snap the margin on every one of its 16ms steps fought that and sent the
+        // menu sideways instead.
+        if menu.shown.get() && menu.switch.get() == Switch::Idle {
+            menu.window.set_margin(Edge::Left, menu.left_wanted(size.0));
+        }
+    }
+    menu.canvas.queue_draw();
+}
+
+/// Step every entry that is growing or shrinking, and stop when none are.
+///
+/// The width and the opacity come off the same progress value, so they cannot
+/// disagree, and the layout is redone from the new widths so the surface resizes
+/// along with them.
+fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
+    // How far this frame is worth, as a fraction of a whole phase. Measured, not
+    // assumed to be 16ms: every step resizes a surface, which is exactly the work
+    // that can overrun a frame, and a fixed increment turns a dropped frame into an
+    // animation that runs slow instead of one that skips. Capped, so a long stall —
+    // a modal, a window drag — resumes rather than jumping to the end.
+    let elapsed_seconds = (frame_time as f64 / 1_000_000.0).clamp(0.0, 0.1);
+    let width_step = elapsed_seconds / CELL_MORPH.as_secs_f64();
+    let fade_step = elapsed_seconds / CELL_FADE.as_secs_f64();
+    let mut moving = 0usize;
+
+    // Moving from one app to another owns every entry while it runs. The per-entry
+    // motions below are deliberately *not* consulted: letting both machines write
+    // `elapsed`, `alpha` and `motion` is what left outgoing previews in the row
+    // forever and incoming ones stuck at zero width.
+    match menu.switch.get() {
+        Switch::FadingOut => {
+            // Only what is on show, which is the outgoing set throughout. Fading every
+            // entry in the map meant the incoming ones — swapped in a moment earlier,
+            // at zero — were given `1 - ease_in(0)` and so came *up* to fully visible
+            // and then went down again, and their clocks ran out here, which left the
+            // fade-in with nothing to drive and it completed in a single frame.
+            let mut hidden = true;
+            {
+                let order = menu.order.borrow().clone();
+                let mut entries = menu.entries.borrow_mut();
+                for id in &order {
+                    let Some(entry) = entries.get_mut(id) else {
+                        continue;
+                    };
+                    let elapsed = (entry.elapsed.get() + fade_step).min(1.0);
+                    entry.elapsed.set(elapsed);
+                    entry.alpha.set(1.0 - ease_in(elapsed));
+                    hidden &= entry.alpha.get() <= 0.0;
+                }
+            }
+            if hidden {
+                // Nothing left on screen, so this is the moment to exchange the
+                // contents. Then a wait of its own, which touches no entry at all.
+                swap_in_pending(menu);
+                menu.switch.set(Switch::Exchanging);
+            }
+            moving += 1;
+        }
+        Switch::Exchanging => {
+            // The outgoing previews are gone and the incoming ones are not here yet.
+            // Nothing is drawn and nothing is moved; all this does is wait for the
+            // previews that will say how wide the new row is. Capped short, because a
+            // window that never answers must not leave the menu blank: at worst the
+            // width is a guess for a frame or two and the ordinary layout path
+            // corrects it as the images arrive.
+            menu.waited.set(menu.waited.get() + 1);
+            if menu.pending_ready() || menu.waited.get() > 12 {
+                let from = menu.width_asked();
+                let to = menu.widths_from_layout();
+                // Both ends, in the two cells the motion reads. Setting the override
+                // but not this one is what made the surface ease *from zero* while
+                // the debug line showed a perfectly good starting width next to it.
+                menu.width_from.set(from);
+                menu.width_to.set(to);
+                // Both ends of the travel, so the window moves from where it is to
+                // where the new row wants it rather than jumping and then easing. A
+                // switch between two icons can be most of the bar apart.
+                menu.left_from.set(menu.window_margin_left());
+                menu.left_to.set(menu.left_wanted(to));
+                menu.width_elapsed.set(0.0);
+                menu.width_override.set(Some(from));
+                menu.switch.set(Switch::Widening);
+            }
+            moving += 1;
+        }
+        Switch::Widening => {
+            let from = menu.width_from.get();
+            let span = (menu.width_to.get() - from) as f64;
+            let left_from = menu.left_from.get();
+            let left_span = (menu.left_to.get() - left_from) as f64;
+            let elapsed = (menu.width_elapsed.get() + width_step).min(1.0);
+            menu.width_elapsed.set(elapsed);
+            let eased = ease_out(elapsed);
+            menu.width_override.set(Some((from as f64 + span * eased).round() as i32));
+            // The same fraction of the same motion, so the row never slides out from
+            // under the icon it is meant to be sitting under.
+            menu.window
+                .set_margin(Edge::Left, (left_from as f64 + left_span * eased).round() as i32);
+            if elapsed >= 1.0 {
+                // Arrived: the new previews are in place and still invisible.
+                menu.width_override.set(None);
+                menu.switch.set(Switch::FadingIn);
+            }
+            moving += 1;
+        }
+        Switch::FadingIn => {
+            let mut up = true;
+            {
+                let entries = menu.entries.borrow_mut();
+                for entry in entries.values() {
+                    let elapsed = (entry.elapsed.get() + fade_step).min(1.0);
+                    entry.elapsed.set(elapsed);
+                    entry.alpha.set(ease_out(elapsed));
+                    up &= entry.alpha.get() >= 1.0;
+                }
+            }
+            if up {
+                // Nothing left to drive, so the per-entry motions take over again.
+                menu.switch.set(Switch::Idle);
+            } else {
+                moving += 1;
+            }
+        }
+        Switch::Idle => {
+            // Nothing left on show, and every departure has finished: close. Done
+            // here rather than by the snapshot that emptied it, so the last preview
+            // gets to animate away first.
+            if menu.order.borrow().is_empty() && menu.app.borrow().is_some() {
+                menu_close(menu);
+                menu.morphing.set(false);
+                return;
+            }
+            let mut entries = menu.entries.borrow_mut();
+            // An entry is dropped once it has closed up to nothing.
+            entries.retain(|_, entry| {
+                let phase = entry.motion.get();
+                let step = if matches!(phase, Motion::FadingIn | Motion::FadingOut) {
+                    fade_step
+                } else {
+                    width_step
+                };
+                let elapsed = (entry.elapsed.get() + step).min(1.0);
+                entry.elapsed.set(elapsed);
+                // Eased, so each phase starts briskly and settles. The value is read
+                // from the elapsed fraction rather than accumulated, so a dropped or
+                // doubled tick cannot leave the motion permanently adrift.
+                let eased = ease_out(elapsed);
+                match phase {
+                    Motion::Growing => {
+                        entry.width.set(eased);
+                        if elapsed >= 1.0 {
+                            entry.motion.set(Motion::FadingIn);
+                            entry.elapsed.set(0.0);
+                        }
+                    }
+                    Motion::FadingIn => {
+                        entry.alpha.set(eased);
+                        if elapsed >= 1.0 {
+                            entry.motion.set(Motion::Settled);
+                        }
+                    }
+                    Motion::Settled => return true,
+                    Motion::FadingOut => {
+                        entry.alpha.set(1.0 - ease_in(elapsed));
+                        if elapsed >= 1.0 {
+                            entry.motion.set(Motion::Shrinking);
+                            entry.elapsed.set(0.0);
+                        }
+                    }
+                    Motion::Shrinking => {
+                        entry.width.set(1.0 - eased);
+                        if elapsed >= 1.0 {
+                            return false;
+                        }
+                    }
+                }
+                moving += 1;
+                true
+            });
+            drop(entries);
+            menu.order.borrow_mut().retain(|id| {
+                menu.entries.borrow().contains_key(id)
+            });
+        }
+    }
+    relayout(menu);
+    if menu_debug() {
+        let entries = menu.entries.borrow();
+        let order = menu.order.borrow();
+        let report: Vec<String> = order
+            .iter()
+            .filter_map(|id| entries.get(id).map(|entry| (*id, entry)))
+            .map(|(id, entry)| {
+                format!(
+                    "{}:{} {:.2}/{:.2}",
+                    id,
+                    phase_name(entry.motion.get()),
+                    entry.width.get(),
+                    entry.alpha.get(),
+                )
+            })
+            .collect();
+        // The two numbers the transition actually is. The entries above say what
+        // the row is doing; these say whether the surface is going anywhere, and
+        // without them a width motion that silently does nothing looks identical to
+        // one that works.
+        eprintln!(
+            "oxide-panel: [{}] w={} (from {} to {}) left={} entries: {}",
+            switch_name(menu.switch.get()),
+            menu.layout.borrow().surface.width,
+            menu.width_from.get(),
+            menu.width_to.get(),
+            menu.window_margin_left(),
+            report.join("  "),
+        );
+    }
+    if moving == 0 {
+        menu.morphing.set(false);
+    }
+}
+
+/// Exchange the menu's contents for the app it is moving to.
+///
+/// The outgoing entries go out of existence here rather than being marked for
+/// removal, because the code that removes them only runs when no switch is in
+/// flight — so anything left behind would sit in the row for good.
+fn swap_in_pending(menu: &Rc<Menu>) {
+    let Some(pending) = menu.pending.borrow_mut().take() else {
+        menu.switch.set(Switch::Idle);
+        return;
+    };
+    menu.app.replace(Some(pending.key));
+    menu.icon_center.set(pending.icon_center);
+    menu.bar_width.set(pending.bar_width);
+    let stream = menu.stream.borrow().clone();
+    build_entries(menu, &pending.group, stream.as_ref());
+    // The width to ease to, from the incoming previews' own aspects. Taken now
+    // because a previews-as-it-arrives correction would restart the motion in
+    // flight; the surface keeps up through the ordinary layout path afterwards.
+    menu.width_to.set(menu.widths_from_layout());
+}
+
+/// Put a group of windows in the row, full width and invisible, and ask for any
+/// previews they have not sent.
+///
+/// The opposite of [`menu_replace`], which keeps what is already on show and marks
+/// the difference as leaving; this is the clean exchange a switch makes once the
+/// old previews have gone.
+fn build_entries(menu: &Rc<Menu>, group: &[WindowInfo], stream: Option<&Rc<UnixStream>>) {
+    let mut wanted: Vec<u64> = Vec::new();
+    {
+        let mut entries = menu.entries.borrow_mut();
+        for info in group {
+            // Anything already here keeps its preview, which is the whole point: the
+            // pixels live on the entry, so clearing the map — or dropping entries as
+            // if the app being left had closed its windows — threw away every
+            // preview and the next visit had to fetch them all again.
+            let fresh = !entries.contains_key(&info.id);
+            let entry = entries
+                .entry(info.id)
+                .or_insert_with(|| MenuEntry::new(info));
+            entry.title.replace(window_title(info));
+            entry.focused.set(info.focused);
+            // Straight to full width and settled: a switch eases the *surface*
+            // between the two widths, and the incoming previews are in place for it.
+            // Left at zero to be grown per-entry they never grew, because that motion
+            // is switched off during a switch.
+            entry.width.set(1.0);
+            entry.alpha.set(0.0);
+            entry.motion.set(Motion::Settled);
+            entry.elapsed.set(0.0);
+            if fresh || entry.preview.borrow().is_none() {
+                wanted.push(info.id);
+            }
+        }
+        // Windows still open but not on show are kept, and simply not in the order,
+        // so coming back to that app is instant.
+        *menu.order.borrow_mut() = group.iter().map(|info| info.id).collect();
+    }
+    for info in group {
+        if wanted.contains(&info.id) {
+            request_preview_if_missing(menu, info, stream);
+        }
+    }
+}
+
+/// Whether to print what the menu's entries are doing.
+///
+/// Off unless `OXIDE_PANEL_DEBUG` is set: entries move every 16ms, so this would
+/// otherwise be continuous. The phases are the one thing here that cannot be checked
+/// from the outside — an entry can be dropped, or sit invisible, without anything
+/// looking wrong on screen.
+fn menu_debug() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("OXIDE_PANEL_DEBUG").is_some())
+}
+
+/// The name of a switch phase, for the debug line.
+fn switch_name(switch: Switch) -> &'static str {
+    match switch {
+        Switch::Idle => "idle",
+        Switch::FadingOut => "switch-fade-out",
+        Switch::Exchanging => "switch-exchange",
+        Switch::Widening => "switch-widening",
+        Switch::FadingIn => "switch-fade-in",
+    }
+}
+
+/// The name of a phase, for the debug line.
+fn phase_name(motion: Motion) -> &'static str {
+    match motion {
+        Motion::Growing => "growing",
+        Motion::FadingIn => "fading-in",
+        Motion::Settled => "settled",
+        Motion::FadingOut => "fading-out",
+        Motion::Shrinking => "shrinking",
+    }
+}
+
+/// Ask for a frame, so a motion that has begun gets stepped.
+///
+/// The step itself happens on the display's frame clock, installed once when the menu
+/// is built: a `glib` timer fires whenever it fires, with no regard for vsync, so
+/// steps land mid-frame and wait for the next one to be presented — visible as
+/// uneven motion, and pinned to one rate whatever the display is actually running
+/// at. A frame callback is called once per frame, in step with presentation.
+fn kick_morph(menu: &Rc<Menu>) {
+    if menu.morphing.get() {
+        return;
+    }
+    menu.morphing.set(true);
+    menu.canvas.queue_draw();
+}
+
+/// Put `group`'s windows on show for `key`, positioned under `button`.
+/// Show the menu in [`MENU_REVEAL_FALLBACK`] regardless of whether every preview
+/// has arrived.
+///
+/// Armed on each open rather than once at startup: a window with nothing committed,
+/// or a buffer the renderer will not import, leaves the menu not ready, and a
+/// one-shot timer fired during startup had long since run out, so from the second
+/// open onwards nothing would ever force it and the menu simply did not come up.
+fn arm_reveal_fallback(menu: &Rc<Menu>) {
+    let menu = menu.clone();
+    glib::timeout_add_local(MENU_REVEAL_FALLBACK, move || {
+        menu_reveal(&menu, true);
+        glib::ControlFlow::Break
+    });
+}
+
+fn menu_open(
+    menu: &Rc<Menu>,
+    key: &str,
+    group: &[&WindowInfo],
+    button: &Button,
+    stream: &Rc<UnixStream>,
+) {
+    let (icon_center, bar_width) = icon_metrics(button);
+    // Already up, and for a different app: move to the new one rather than
+    // replacing the contents under the pointer. Hovering along the bar does the
+    // same, so the menu follows the pointer.
+    let switching = menu.shown.get() && menu.app.borrow().as_deref() != Some(key);
+    if switching {
+        menu.app.replace(Some(key.to_string()));
+        menu.pending.borrow_mut().replace(Pending {
+            key: key.to_string(),
+            group: group.iter().map(|info| (*info).clone()).collect(),
+            icon_center,
+            bar_width,
+        });
+        menu.icon_center.set(icon_center);
+        menu.bar_width.set(bar_width);
+        // Taken now, while the outgoing layout is still the one on show: by the time
+        // the width motion wants it the entries have been exchanged. Any override
+        // from an earlier switch is dropped first, or the width it eases *from*
+        // would be that switch's idea of a width rather than what is on screen.
+        menu.width_asked.set(menu.widths_from_layout());
+        menu.waited.set(0);
+        // Pinned to the outgoing width for the whole fade-out and the wait that
+        // follows it. Otherwise the layout runs at the *incoming* placeholders while
+        // its previews are still arriving, the surface is sized to that, and a frame
+        // later the override yanks it back — two resizes a few milliseconds apart,
+        // which is the back-and-forth.
+        menu.width_override.set(Some(menu.width_asked.get()));
+        menu.switch.set(Switch::FadingOut);
+        kick_morph(menu);
+        return;
+    }
+    menu.icon_center.set(icon_center);
+    menu.bar_width.set(bar_width);
+    menu.app.replace(Some(key.to_string()));
+    menu_replace(menu, &[], group, Some(stream));
+    relayout(menu);
+    menu_reveal(menu, false);
+    arm_reveal_fallback(menu);
+}
+
+/// Show the menu if it is ready, or if `force` says to stop waiting.
+fn menu_reveal(menu: &Rc<Menu>, force: bool) {
+    if menu.shown.get() || menu.app.borrow().is_none() {
+        return;
+    }
+    if !force && !menu.ready() {
+        return;
+    }
+    let width = menu.layout.borrow().surface.width;
+    let left = menu_left(menu.icon_center.get(), menu.bar_width.get(), width);
+    menu.window.set_margin(Edge::Left, left);
+    // Cleared here because the reveal slides the surface up from under the bar, and
+    // the pointer is on the icon that opened it. It passes over the menu's own
+    // coordinates on the way, so the first cell was highlighted before the pointer
+    // had gone anywhere near it — and with no later motion to correct it, that
+    // highlight was still there with the pointer somewhere else entirely.
+    menu.pointer.set(None);
+    menu.shown.set(true);
+    animate_menu(menu, true, left);
+    // Never a motion on the way in. Every window on show was open before the click,
+    // so animating them would be showing off a transition that did not happen; the
+    // grow-and-fade is for a window arriving at a menu that is already up.
+    settle_all(menu);
+}
+
+/// Put every entry straight to its settled size and opacity.
+fn settle_all(menu: &Rc<Menu>) {
+    for entry in menu.entries.borrow().values() {
+        entry.width.set(1.0);
+        entry.alpha.set(1.0);
+        entry.motion.set(Motion::Settled);
+        entry.elapsed.set(0.0);
+    }
+    relayout(menu);
+}
+
+/// Bring the menu in step with a snapshot: which windows are on show, their
+/// titles, and which is focused.
+///
+/// A window that has gone is dropped, a new one added, and every preview that has
+/// not arrived asked for. Previews already cached are pushed straight in, so
+/// reopening a menu does not flash placeholders.
+/// Bring the menu in step with a snapshot.
+///
+/// `all` is every window the compositor knows about and `group` is the ones on
+/// show, which are the same app's. They have to be told apart: judging what still
+/// exists against `group` alone made every *other* app's windows look gone, so
+/// their previews were dropped and the menu had to fetch everything again the next
+/// time that app was opened. Liveness is a property of the window, not of whichever
+/// app happens to be on show.
+fn menu_replace(
+    menu: &Rc<Menu>,
+    all: &[&WindowInfo],
+    group: &[&WindowInfo],
+    stream: Option<&Rc<UnixStream>>,
+) {
+    let alive = liveness(&all.iter().map(|info| info.id).collect::<Vec<_>>());
+    let live: Vec<u64> = group.iter().map(|info| info.id).collect();
+
+    // A switch owns the row while it runs. The app is already set to the one being
+    // moved to, so every snapshot during the switch arrives here asking for the
+    // *incoming* group — and taking the order from it threw the outgoing previews
+    // out of the row mid-fade and built the incoming entries at zero width, which
+    // collapsed the surface before the width motion had even started. That is the
+    // transition appearing to begin from nothing instead of the width it was at.
+    //
+    // So: keep the titles and the previews up to date, and nothing else. The switch
+    // decides what is on show and when.
+    if menu.switch.get() != Switch::Idle {
+        let mut wanted: Vec<u64> = Vec::new();
+        {
+            let mut entries = menu.entries.borrow_mut();
+            for info in group {
+                let entry = entries
+                    .entry(info.id)
+                    .or_insert_with(|| MenuEntry::new(info));
+                // Full width from the start: the width motion is easing the surface
+                // from the outgoing width to the incoming one, and a cell starting at
+                // nothing would drag the surface down with it.
+                entry.width.set(1.0);
+                entry.title.replace(window_title(info));
+                entry.focused.set(info.focused);
+                if entry.preview.borrow().is_none() {
+                    wanted.push(info.id);
+                }
+            }
+        }
+        for info in group {
+            if wanted.contains(&info.id) {
+                request_preview_if_missing(menu, info, stream);
+            }
+        }
+        return;
+    }
+
+    let mut arrived = false;
+    let mut wanted: Vec<u64> = Vec::new();
+    {
+        let mut entries = menu.entries.borrow_mut();
+        // Anything not in the snapshot has gone: shrink and fade it out rather than
+        // dropping it, so closing a window is a motion instead of a jump. It is
+        // dropped once it reaches nothing, by the tick.
+        for (id, entry) in entries.iter() {
+            // A window that has gone starts fading out, and only closes up its width
+            // once it is invisible. Already on its way out? left alone.
+            if !alive.contains(id) && !matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking) {
+                entry.motion.set(Motion::FadingOut);
+                // From zero, which is the whole point: a settled entry's clock has
+                // been sitting at one since it arrived, so without this the fade's
+                // first tick computes one and the opacity goes from opaque to
+                // nothing in a single frame. The departure looked instant, and the
+                // debug line showed it going straight from settled to shrinking.
+                entry.elapsed.set(0.0);
+                arrived = true;
+            }
+        }
+        for info in group {
+            let fresh = !entries.contains_key(&info.id);
+            let entry = entries
+                .entry(info.id)
+                .or_insert_with(|| MenuEntry::new(info));
+            // A window that comes back mid-departure is taken back rather than
+            // animated twice, and put back to its *settled* values. Leaving the
+            // channels where the fade had got to parked a full-width, fully
+            // transparent entry in the row: invisible, but taking up space and never
+            // fading in, because nothing ever moved it off `Settled` again.
+            if matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking) {
+                entry.motion.set(Motion::Settled);
+                entry.width.set(1.0);
+                entry.alpha.set(1.0);
+                entry.elapsed.set(0.0);
+            }
+            entry.title.replace(window_title(info));
+            entry.focused.set(info.focused);
+            arrived |= fresh;
+            // Noted here, asked for below. An entry keeps its own preview across a
+            // close, so a reopening menu does not flash placeholders — but only if
+            // it has one at all.
+            if entry.preview.borrow().is_none() {
+                wanted.push(info.id);
+            }
+        }
+        *menu.order.borrow_mut() = live.clone();
+    }
+    // Outside the borrow: asking for a preview reads the entries, and doing that
+    // while they are borrowed for writing panics.
+    for info in group {
+        if wanted.contains(&info.id) {
+            request_preview_if_missing(menu, info, stream);
+        }
+    }
+    // Only once the menu is up: before that the entries' growth would happen
+    // behind a hidden surface, and opening one would just appear at full width.
+    if arrived && menu.shown.get() {
+        kick_morph(menu);
+    }
+    relayout(menu);
+}
+
+/// Take a preview that has just arrived.
+fn menu_set_image(menu: &Rc<Menu>, id: u64, width: i32, height: i32, pixels: Vec<u8>) {
+    let mut entries = menu.entries.borrow_mut();
+    let Some(entry) = entries.get_mut(&id) else {
+        return;
+    };
+    let Some(preview) = Preview::new(width, height, pixels) else {
+        return;
+    };
+    entry
+        .target
+        .set(preview_width(preview.width, preview.height));
+    entry.preview.replace(Some(preview));
+    drop(entries);
+    // A new preview can be a new shape, which can be a new width for the whole
+    // row, so the surface is resized from here too.
+    relayout(menu);
+    menu_reveal(menu, false);
+}
+
+/// Ask for a preview of a window on show that has not sent one.
+fn request_preview_if_missing(menu: &Rc<Menu>, info: &WindowInfo, stream: Option<&Rc<UnixStream>>) {
+    let Some(stream) = stream else {
+        return;
+    };
+    let has = menu
+        .entries
+        .borrow()
+        .get(&info.id)
+        .is_some_and(|entry| entry.preview.borrow().is_some());
+    if has {
+        return;
+    }
+    send(
+        stream,
+        &format!(
+            "preview\t{}\t{}\t{}\n",
+            info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1
+        ),
+    );
+}
+
+/// Which part of moving the menu from one app to another is in flight.
+///
+/// The three run one after another rather than together: the outgoing previews go
+/// first, and only once nothing is left on screen does the surface ease from the
+/// old width to the new one, and only once it has arrived do the new previews fade
+/// up. Run at the same time they would overlap into a smear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Switch {
+    Idle,
+    /// Fading the outgoing previews out.
+    FadingOut,
+    /// The outgoing previews are gone; waiting for the incoming ones, invisible.
+    Exchanging,
+    /// Easing the surface between the two widths.
+    Widening,
+    /// Fading the incoming previews in.
+    FadingIn,
+}
+
+/// The app being moved to, held until the outgoing previews have gone.
+struct Pending {
+    key: String,
+    group: Vec<WindowInfo>,
+    icon_center: i32,
+    bar_width: i32,
+}
+
+/// The windows still open, from a snapshot, as the id set the menu compares against.
+///
+/// A set rather than a lookup per entry: the menu asks about every entry it holds
+/// on every snapshot, and this is the same answer each time.
+fn liveness(alive: &[u64]) -> HashSet<u64> {
+    alive.iter().copied().collect()
+}
+
+/// Ask for a fresh preview of every window the open menu is showing, so one that
+/// is animating or playing video is not shown frozen.
+fn menu_refresh(menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Rc<UnixStream>) {
+    if menu.app.borrow().is_none() {
+        return;
+    }
+    let order = menu.order.borrow().clone();
+    for info in windows.iter().filter(|info| order.contains(&info.id)) {
+        send(
+            stream,
+            &format!(
+                "preview\t{}\t{}\t{}\n",
+                info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1
+            ),
+        );
+    }
+}
+
+/// Take the menu off screen, then let it go.
+fn menu_close(menu: &Rc<Menu>) {
+    if menu.app.borrow().is_none() {
+        return;
+    }
+    menu.app.replace(None);
+    // A switch that was in flight is abandoned rather than left to finish on a
+    // closed menu: its next tick would otherwise swap a set of entries in for an app
+    // that is no longer on show.
+    menu.switch.set(Switch::Idle);
+    menu.pending.borrow_mut().take();
+    menu.width_override.set(None);
+    // Whatever the pointer was last over, it is not over a menu that is no longer
+    // there.
+    menu.pointer.set(None);
+    // Cleared here rather than when the animation lands, so the very next click
+    // can open it again. Leaving it set is what meant a menu could only ever be
+    // opened once per panel run.
+    menu.shown.set(false);
+    let width = menu.layout.borrow().surface.width;
+    let left = menu_left(menu.icon_center.get(), menu.bar_width.get(), width);
+    animate_menu(menu, false, left);
+}
+
+/// Slide the menu out of the bar, or back into it, while fading.
+///
+/// Only the compositor-facing properties move. The surface is not resized and
+/// nothing inside it is re-laid-out, so the pointer stays where it was and the
+/// menu does not flicker.
+fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
+    let (from_opacity, to_opacity) = if showing { (0.0f64, 1.0f64) } else { (1.0, 0.0) };
+    let resting = PANEL_HEIGHT;
+    // Starts tucked up under the bar and slides down into place, so it reads as
+    // coming out of it.
+    let (from_top, to_top) = if showing {
+        (resting - MENU_SLIDE, resting)
+    } else {
+        (resting, resting - MENU_SLIDE)
+    };
+
+    let window = &menu.window;
+    window.set_margin(Edge::Left, left);
+    if showing {
+        window.present();
+    }
+    // Supersede whatever animation was running: a close that is still sliding out
+    // would otherwise finish and hide the menu that has just been reopened.
+    menu.animation.set(menu.animation.get() + 1);
+    let token = menu.animation.get();
+    let menu = menu.clone();
+    let start = glib::monotonic_time();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if menu.animation.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let window = &menu.window;
+        let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+        let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        // Ease out cubic: quick off the mark, then asymptotic to the target.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        window.set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+        window.set_margin(Edge::Top, from_top + ((to_top - from_top) as f64 * eased) as i32);
+        if t < 1.0 {
+            return glib::ControlFlow::Continue;
+        }
+        // Land exactly on the ends, so no rounding residue is left behind.
+        window.set_opacity(to_opacity);
+        window.set_margin(Edge::Top, to_top);
+        if !showing {
+            window.set_visible(false);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+// ---------------------------------------------------------------- hover to close
+
+/// Whether the pointer is over the bar or the menu, and a token so a deferred
+/// close can tell it was superseded by a re-entry.
+#[derive(Default)]
+struct Hover {
+    inside: Cell<bool>,
+    token: Cell<u64>,
+}
+
+/// Close the menu once the pointer has been outside both surfaces for a moment.
+fn watch_hover(bar_row: &GtkBox, menu: &Rc<Menu>, hover: &Rc<Hover>) {
+    let menu = menu.clone();
+    let bar = bar_row.clone().upcast::<gtk4::Widget>();
+    let canvas = menu.canvas.clone().upcast::<gtk4::Widget>();
+    // The bar's row and the menu's canvas, both content widgets rather than
+    // toplevels. A toplevel also reports enter and leave when it is resized or
+    // reconfigured, which is not the pointer going anywhere, and this menu is
+    // resized as previews arrive.
+    for widget in [bar, canvas] {
+        let motion = gtk4::EventControllerMotion::new();
+        // Per iteration: the handler is `Fn` and so borrows its captures.
+        let closing_menu = menu.clone();
+
+        // Movement anywhere inside the surface counts as being on it, not just the
+        // first event. A surface that resizes while the pointer is still resting on
+        // it is handed a leave, and treating that as the pointer having gone is what
+        // closed the menu while the pointer never left it.
+        let on_move = hover.clone();
+        motion.connect_motion(move |_, _, _| {
+            on_move.inside.set(true);
+            on_move.token.set(on_move.token.get() + 1);
+        });
+
+        let on_enter = hover.clone();
+        motion.connect_enter(move |_, _, _| {
+            on_enter.inside.set(true);
+            // Invalidate any close that is already scheduled.
+            on_enter.token.set(on_enter.token.get() + 1);
+        });
+
+        let on_leave = hover.clone();
+        motion.connect_leave(move |_| {
+            on_leave.inside.set(false);
+            let token = on_leave.token.get() + 1;
+            on_leave.token.set(token);
+            let closing = closing_menu.clone();
+            // Deferred, because crossing from the bar down to the menu leaves one
+            // widget before entering the other, and that must not read as leaving.
+            // The token check drops the close if the pointer came back.
+            //
+            // Cloned in here rather than outside: the handler is `Fn`, so it
+            // cannot hand its own captures to a `'static` closure.
+            let recheck = on_leave.clone();
+            glib::timeout_add_local(HOVER_GRACE, move || {
+                // A surface being resized under a stationary pointer is handed a
+                // leave, and the next resize will hand it another. So while the menu
+                // is still moving, a close is put off rather than acted on: the
+                // pointer has not gone anywhere, the surface has.
+                if closing.morphing.get() {
+                    return glib::ControlFlow::Continue;
+                }
+                if recheck.token.get() == token && !recheck.inside.get() {
+                    menu_close(&closing);
+                }
+                glib::ControlFlow::Break
+            });
+        });
+
+        widget.add_controller(motion);
+    }
+}
+
 thread_local! {
-    /// The current accent, shared by the CSS and the cairo indicator dots.
-    static ACCENT: Cell<(f64, f64, f64)> = const { Cell::new((0.847, 0.847, 0.847)) };
+    /// The desktop accent, as 0..=1 components, read by [`accent_rgb`] and
+    /// re-read whenever the portal says it changed.
+    static ACCENT: Cell<(f64, f64, f64)> =
+        const { Cell::new((0.847, 0.847, 0.847)) };
+    /// The provider holding the panel's stylesheet, kept so a new accent can be
+    /// loaded into the same one rather than stacking up providers.
     static STYLE_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
 }
 
@@ -52,7 +2014,10 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     format!(
         "
 window.panel-window {{
-    background-color: rgba(32, 32, 32, 0.82);
+    /* Transparent: the surface spans the output, so any background here would
+       paint edge to edge as soon as the menu makes the window taller. The bar
+       and the menu each carry their own. */
+    background-color: transparent;
     border: none;
     box-shadow: none;
 }}
@@ -91,13 +2056,111 @@ button.task.minimized {{
     )
 }
 
-/// One open window as reported by the compositor.
+#[derive(Clone, Debug)]
 struct WindowInfo {
     id: u64,
     focused: bool,
     minimized: bool,
     app_id: String,
     title: String,
+}
+
+/// Something that arrived from the compositor.
+#[derive(Debug)]
+enum PanelEvent {
+    /// The window list changed.
+    Snapshot(Vec<WindowInfo>),
+    /// A window preview, as R, G, B, A rows.
+    Image {
+        id: u64,
+        width: i32,
+        height: i32,
+        pixels: Vec<u8>,
+    },
+}
+
+/// An image whose payload has not fully arrived yet: the header is in, the
+/// pixels are still on their way.
+struct PendingImage {
+    id: u64,
+    width: i32,
+    height: i32,
+    /// How many payload bytes are owed.
+    len: usize,
+}
+
+/// Reads the compositor's byte stream, which mixes newline-delimited text with
+/// length-prefixed image payloads.
+///
+/// The payload cannot be newline-terminated: raw pixels contain `\n`, which
+/// would truncate the message, so an `img` header states its own byte count and
+/// exactly that many bytes are consumed before the next line is looked at.
+#[derive(Default)]
+struct PanelReader {
+    buffer: Vec<u8>,
+    pending: Option<PendingImage>,
+}
+
+impl PanelReader {
+    /// Take everything parseable out of the buffer.
+    fn drain(&mut self) -> Vec<PanelEvent> {
+        let mut events = Vec::new();
+        loop {
+            if let Some(pending) = self.pending.take() {
+                // The payload is owed in full before it means anything; a partial
+                // one stays pending, with the bytes left buffered for next time.
+                if self.buffer.len() < pending.len {
+                    self.pending = Some(pending);
+                    break;
+                }
+                let payload: Vec<u8> = self.buffer.drain(..pending.len).collect();
+                events.push(PanelEvent::Image {
+                    id: pending.id,
+                    width: pending.width,
+                    height: pending.height,
+                    pixels: payload,
+                });
+                continue;
+            }
+
+            let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            if let Some(header) = line.strip_prefix("img\t") {
+                if let Some(pending) = parse_image_header(header) {
+                    self.pending = Some(pending);
+                }
+            } else if let Some(windows) = parse_snapshot(&line) {
+                events.push(PanelEvent::Snapshot(windows));
+            }
+        }
+        events
+    }
+}
+
+/// Parse an `img\t<id>\t<width>\t<height>\t<len>` header into the image it
+/// introduces, with room reserved for its payload.
+fn parse_image_header(header: &str) -> Option<PendingImage> {
+    let mut fields = header.split('\t');
+    let id = fields.next()?.parse::<u64>().ok()?;
+    let width = fields.next()?.parse::<i32>().ok()?;
+    let height = fields.next()?.parse::<i32>().ok()?;
+    let len = fields.next()?.parse::<usize>().ok()?;
+    if width <= 0 || height <= 0 || len != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    Some(PendingImage {
+        id,
+        width,
+        height,
+        len,
+    })
+}
+
+fn send(stream: &Rc<UnixStream>, message: &str) {
+    let _ = (&**stream).write_all(message.as_bytes());
 }
 
 pub fn run_panel() {
@@ -140,25 +2203,61 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
 
     install_css();
 
+    let Some(monitor) = gdk::Display::default().and_then(|display| {
+        display
+            .monitors()
+            .item(0)
+            .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
+    }) else {
+        eprintln!("oxide-desktop panel: no monitor to put the panel on");
+        return;
+    };
+
+    // The bar and the menu are two separate layer surfaces, not one window with
+    // two rows.
+    //
+    // A surface's *unpainted* regions still hit-test: the compositor routes the
+    // pointer by geometry, not by what was drawn. So a bar that grew to fit the
+    // menu would go on swallowing clicks — and forcing the default cursor —
+    // across its whole height, invisibly, and would keep doing so after the menu
+    // closed if the window had not shrunk back. Two surfaces make that
+    // impossible: the bar is always exactly `PANEL_HEIGHT`, and the menu is sized
+    // to exactly what it draws.
+    let (bar, bar_row, tasks) = build_bar_window(app, &monitor);
+    let menu = build_menu(app, &monitor, stream.clone());
+    *menu.stream.borrow_mut() = stream.clone();
+    let hover = Rc::new(Hover::default());
+
+    // Hover-out closes the menu. The pointer has to cross the bar to reach the
+    // menu, so "inside" spans both surfaces, and the close is deferred briefly so
+    // passing between them is not read as leaving.
+    watch_hover(&bar_row, &menu, &hover);
+
+    if let Some(stream) = stream {
+        send_accent(&stream);
+        start_polling(&tasks, &menu, stream, hover);
+    }
+
+    bar.present();
+}
+
+/// The bar: a fixed-height strip across the top of the output.
+///
+/// Returns the window and the box the app squares go in, rather than having the
+/// caller dig the box back out of the widget tree — the row's first child is the
+/// title label, not the task list.
+fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWindow, GtkBox, GtkBox) {
     let window = ApplicationWindow::builder().application(app).build();
     window.set_decorated(false);
     window.add_css_class("panel-window");
     window.init_layer_shell();
     window.set_namespace(Some("oxide-panel"));
     window.set_layer(Layer::Top);
-    // Put it on the main (first) display.
-    if let Some(display) = gdk::Display::default()
-        && let Some(monitor) = display
-            .monitors()
-            .item(0)
-            .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
-    {
-        window.set_monitor(Some(&monitor));
-    }
+    window.set_monitor(Some(monitor));
     for edge in [Edge::Top, Edge::Left, Edge::Right] {
         window.set_anchor(edge, true);
     }
-    // Reserve space so maximized windows stop below the panel.
+    // Reserve space so maximized windows stop below the bar.
     window.set_exclusive_zone(PANEL_HEIGHT);
 
     let row = GtkBox::new(Orientation::Horizontal, 8);
@@ -194,13 +2293,8 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
         ),
     );
 
-    if let Some(stream) = stream {
-        send_accent(&stream);
-        start_polling(&tasks, stream);
-    }
-
     window.set_child(Some(&row));
-    window.present();
+    (window, row, tasks)
 }
 
 /// Tell the compositor the accent so it can tint the snap preview.
@@ -210,41 +2304,98 @@ fn send_accent(stream: &Rc<UnixStream>) {
     let _ = (&**stream).write_all(message.as_bytes());
 }
 
-/// Drain the compositor socket and rebuild the task list on every snapshot.
-fn start_polling(tasks: &GtkBox, stream: Rc<UnixStream>) {
+/// Drain the compositor socket, rebuilding the task list on every snapshot and
+/// keeping the newest preview for each window.
+fn start_polling(tasks: &GtkBox, menu: &Rc<Menu>, stream: Rc<UnixStream>, _hover: Rc<Hover>) {
     let tasks = tasks.clone();
-    let pending = RefCell::new(Vec::<u8>::new());
+    let reader = RefCell::new(PanelReader::default());
+    let windows = Rc::new(RefCell::new(Vec::<WindowInfo>::new()));
+    // Both timers below need this state, so hand each its own handle.
+    let (stream_poll, stream_refresh) = (stream.clone(), stream.clone());
+    let (windows_poll, windows_refresh) = (windows.clone(), windows.clone());
+    let (menu_poll, menu_tick) = (menu.clone(), menu.clone());
+    let stream = stream_poll;
+    let windows = windows_poll;
+    let menu = menu_poll;
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 65536];
         loop {
             match (&*stream).read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => pending.borrow_mut().extend_from_slice(&buf[..n]),
+                Ok(n) => reader.borrow_mut().buffer.extend_from_slice(&buf[..n]),
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
 
-        loop {
-            let Some(newline) = pending.borrow().iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let line = {
-                let mut pending = pending.borrow_mut();
-                let line = String::from_utf8_lossy(&pending[..newline]).to_string();
-                pending.drain(..=newline);
-                line
-            };
-            if let Some(windows) = parse_snapshot(&line) {
-                rebuild_tasks(&tasks, &windows, &stream);
+        for event in reader.borrow_mut().drain() {
+            match event {
+                PanelEvent::Snapshot(list) => {
+                    windows.replace(list.clone());
+                    rebuild_tasks(&tasks, &menu, &list, &stream);
+                }
+                PanelEvent::Image {
+                    id,
+                    width,
+                    height,
+                    pixels,
+                } => {
+                    // Straight to the menu, which keeps the preview. There used to
+                    // be a cache here that the value was read back out of — but
+                    // `insert` returns the value it *replaced*, so the first preview
+                    // of a window never arrived and every later one was a frame
+                    // stale, which is exactly what a preview that never seems to
+                    // change looks like.
+                    menu_set_image(&menu, id, width, height, pixels);
+                }
             }
         }
 
         glib::ControlFlow::Continue
     });
+
+    // Keep an open menu's previews current, so a window that is animating or
+    // playing video is not shown frozen.
+    glib::timeout_add_local(PREVIEW_REFRESH, move || {
+        let snapshot = windows_refresh.borrow().clone();
+        menu_refresh(&menu_tick, &snapshot, &stream_refresh);
+        glib::ControlFlow::Continue
+    });
 }
 
-fn rebuild_tasks(tasks: &GtkBox, windows: &[WindowInfo], stream: &Rc<UnixStream>) {
+/// The title shown for a window, falling back to the app id.
+fn window_title(info: &WindowInfo) -> String {
+    if info.title.is_empty() {
+        if info.app_id.is_empty() {
+            return "Window".to_string();
+        }
+        return info.app_id.clone();
+    }
+    info.title.clone()
+}
+
+/// Point a preview at the pixels that arrived for it, sizing it to the image's
+/// own aspect ratio so every preview in the row shares one height.
+fn icon_metrics(button: &Button) -> (i32, i32) {
+    let Some(root) = button.root() else {
+        return (0, 0);
+    };
+    let bar_width = root.width();
+    let width = button.width() as f64;
+    match (
+        button.translate_coordinates(&root, 0.0, 0.0),
+        button.translate_coordinates(&root, width, 0.0),
+    ) {
+        (Some((left, _)), Some((right, _))) => {
+            let center = ((left + right) / 2.0).round() as i32;
+            (center, bar_width)
+        }
+        _ => (0, bar_width),
+    }
+}
+
+/// Rebuild the icon row, and keep any open menu in step with it.
+fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Rc<UnixStream>) {
     while let Some(child) = tasks.first_child() {
         tasks.remove(&child);
     }
@@ -253,6 +2404,14 @@ fn rebuild_tasks(tasks: &GtkBox, windows: &[WindowInfo], stream: &Rc<UnixStream>
     // id get a key of their own so they don't all collapse together.
     let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
     for info in windows {
+        // A minimized window is still a window — it keeps its entry and its preview
+        // — but there is nothing on screen to capture, so it is not offered in the
+        // menu. Counting it as on show left a blank cell that never filled, because
+        // the compositor had nothing to render it from. Minimising now animates it
+        // out of the row and restoring animates it back.
+        if info.minimized {
+            continue;
+        }
         let key = if info.app_id.is_empty() {
             format!("#{}", info.id)
         } else {
@@ -264,14 +2423,53 @@ fn rebuild_tasks(tasks: &GtkBox, windows: &[WindowInfo], stream: &Rc<UnixStream>
         }
     }
 
-    for (key, group) in groups {
-        let app_id = if key.starts_with('#') { "" } else { key.as_str() };
-        tasks.append(&app_button(app_id, &group, stream));
+    // An open menu is kept in step with every snapshot, *including* one where its
+    // app has no windows left. Skipping that case — or closing the menu outright on
+    // it — is what stopped the close animation: with no group to find, the entries
+    // were never told to go, and the menu simply vanished. An empty group instead
+    // animates them away, and the menu closes itself once the last one has.
+    let open_key = menu.app.borrow().clone();
+    let every: Vec<&WindowInfo> = windows.iter().collect();
+    if let Some(key) = &open_key {
+        let group: Vec<&WindowInfo> = groups
+            .iter()
+            .find(|(group_key, _)| group_key == key)
+            .map(|(_, group)| group.clone())
+            .unwrap_or_default();
+        menu_replace(menu, &every, &group, Some(stream));
     }
+
+    for (key, group) in &groups {
+        let app_id = if key.starts_with('#') { "" } else { key.as_str() };
+        let multiple = group.len() > 1;
+        let button = app_button(
+            app_id,
+            group,
+            stream,
+            multiple,
+            key,
+            menu,
+        );
+        tasks.append(&button);
+    }
+
+    // Bring an open menu in step with the new snapshot, so a title change or a
+    // focus change shows up without reopening it.
+
 }
 
 /// One square (1:1) per app, with indicator dots for its window count.
-fn app_button(app_id: &str, windows: &[&WindowInfo], stream: &Rc<UnixStream>) -> Button {
+///
+/// With several windows open the square opens a menu of their previews
+/// instead of focusing; a lone window is just focused.
+fn app_button(
+    app_id: &str,
+    windows: &[&WindowInfo],
+    stream: &Rc<UnixStream>,
+    multiple: bool,
+    key: &str,
+    menu: &Rc<Menu>,
+) -> Button {
     let focused = windows.iter().any(|window| window.focused);
     let minimized = windows.iter().all(|window| window.minimized);
     let count = windows.len();
@@ -290,7 +2488,7 @@ fn app_button(app_id: &str, windows: &[&WindowInfo], stream: &Rc<UnixStream>) ->
     button.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
 
     let tooltip = match count {
-        1 => window_tooltip(windows[0]),
+        1 => window_title(windows[0]),
         _ => format!("{count} windows"),
     };
     button.set_tooltip_text(Some(&tooltip));
@@ -323,43 +2521,72 @@ fn app_button(app_id: &str, windows: &[&WindowInfo], stream: &Rc<UnixStream>) ->
     column.append(&dots);
     button.set_child(Some(&column));
 
-    // Repeated clicks cycle through the app's windows. Use a click gesture on
-    // press rather than `clicked`: the panel's layer surface never becomes the
-    // active GTK window, so the first `clicked` on an inactive window can be
-    // swallowed as an activation attempt and only the second click registers.
-    let target = next_window_id(windows);
+    // Hovering a square moves the menu to that app, so the pointer can travel along
+    // the bar and the menu follows it. Only while a menu is up, and only onto a
+    // different app: otherwise this would open one on the way past.
+    {
+        let hover_menu = menu.clone();
+        let hover_key = key.to_string();
+        let hover_group: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
+        let hover_stream = stream.clone();
+        let hover = gtk4::EventControllerMotion::new();
+        hover.connect_enter({
+            let menu = hover_menu.clone();
+            let key = hover_key.clone();
+            let group = hover_group.clone();
+            let stream = hover_stream.clone();
+            let button = button.clone();
+            move |_, _, _| {
+                if !menu.shown.get() || group.len() < 2 {
+                    return;
+                }
+                if menu.app.borrow().as_deref() == Some(key.as_str()) {
+                    return;
+                }
+                let group: Vec<&WindowInfo> = group.iter().collect();
+                menu_open(&menu, &key, &group, &button, &stream);
+            }
+        });
+        button.add_controller(hover);
+    }
+
+    // A click gesture on *press*, not `clicked` and not `released`: the panel's
+    // layer surface never becomes the active GTK window, so a `clicked` on an
+    // inactive window can be swallowed as an activation attempt, and a release
+    // never arrives at all.
     let stream = stream.clone();
+    let key = key.to_string();
+    // Owned handles, so the callback can outlive this function: a `&GtkBox`
+    // parameter could not be captured by a `'static` closure.
+    let menu = menu.clone();
+    let owned: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
-    gesture.connect_pressed(move |_, _, _, _| {
-        let message = format!("focus\t{target}\n");
-        let _ = (&*stream).write_all(message.as_bytes());
-    });
+    // The handler needs the very square it is attached to, to line the menu up
+    // under it, so hold it weakly rather than moving it into the closure.
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        button,
+        #[upgrade_or]
+        return,
+        move |_, _, _, _| {
+            if !multiple {
+                send(&stream, &format!("focus\t{}\n", owned[0].id));
+                return;
+            }
+            // A second click on the same square closes it, rather than rebuilding
+            // the menu under the pointer.
+            if menu.shown.get() && menu.app.borrow().as_deref() == Some(key.as_str()) {
+                menu_close(&menu);
+                return;
+            }
+            let group: Vec<&WindowInfo> = owned.iter().collect();
+            menu_open(&menu, &key, &group, &button, &stream);
+        }
+    ));
     button.add_controller(gesture);
 
     button
-}
-
-/// The window a click on an app square should focus: the next one after the
-/// focused window, or the first if none of them is focused.
-fn next_window_id(windows: &[&WindowInfo]) -> u64 {
-    match windows.iter().position(|window| window.focused) {
-        Some(index) => windows[(index + 1) % windows.len()].id,
-        None => windows[0].id,
-    }
-}
-
-fn window_tooltip(info: &WindowInfo) -> String {
-    let title = if info.title.is_empty() {
-        info.app_id.clone()
-    } else {
-        info.title.clone()
-    };
-    if info.minimized {
-        format!("{title} (minimized)")
-    } else {
-        title
-    }
 }
 
 /// Draw one dot per window under the icon, or a line when they don't fit.
@@ -643,6 +2870,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_title_is_cut_to_its_room_with_an_ellipsis() {
+        // A stand-in for cairo: every character counts as one unit wide.
+        let measure = |text: &str| text.chars().count() as f64;
+
+        // Short enough to show whole, left exactly as it is — and the boundary
+        // case, where the text measures exactly the budget, is not truncation.
+        assert_eq!(truncate_to_width("Firefox", 7.0, &measure), "Firefox");
+
+        // Too long: the tail goes and an ellipsis makes up the width, so as much
+        // text as fits is kept rather than one character short of the budget.
+        assert_eq!(truncate_to_width("Firefox", 6.0, &measure), "Firef…");
+        assert_eq!(truncate_to_width("Firefox", 5.0, &measure), "Fire…");
+        assert_eq!(truncate_to_width("Firefox", 3.0, &measure), "Fi…");
+        // Counted in characters, not bytes, so multi-byte text is not cut
+        // mid-sequence.
+        assert_eq!(truncate_to_width("café", 3.0, &measure), "ca…");
+        // The ellipsis on its own when nothing at all fits.
+        assert_eq!(truncate_to_width("Firefox", 0.0, &measure), "…");
+        assert_eq!(truncate_to_width("Firefox", -1.0, &measure), "…");
+    }
+
+    #[test]
     fn parses_a_snapshot() {
         let windows =
             parse_snapshot("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerminal").unwrap();
@@ -665,21 +2914,521 @@ mod tests {
     }
 
     #[test]
-    fn cycles_through_an_apps_windows() {
-        let make = |id, focused| WindowInfo {
-            id,
-            focused,
-            minimized: false,
-            app_id: "alacritty".to_string(),
-            title: String::new(),
-        };
-        let windows = [make(1, false), make(2, true), make(3, false)];
-        let refs: Vec<&WindowInfo> = windows.iter().collect();
-        assert_eq!(next_window_id(&refs), 3, "next after the focused window");
+    fn lays_the_menu_out_to_exactly_its_previews() {
+        // The whole point: the surface is the row plus the padding, with nothing
+        // spare. A surface wider than this is what left the previews with empty
+        // space down each side.
+        // Cell widths, as the animation hands them over: a settled cell is its
+        // image plus a border either side.
+        let widths = [200 + CELL_BORDER * 2, 150 + CELL_BORDER * 2];
+        let layout = layout_menu(&widths);
+        assert_eq!(
+            layout.surface.width,
+            200 + 150 + CELL_BORDER * 4 + CELL_GAP + MENU_PAD * 2,
+            "surface should hug the row"
+        );
+        assert_eq!(
+            layout.surface.height,
+            PREVIEW_HEIGHT + TITLEBAR_HEIGHT + CELL_BORDER + MENU_PAD * 2
+        );
+        assert_eq!(layout.cells.len(), 2);
+        assert_eq!(layout.cells[0].width, widths[0]);
+        // First cell against the left padding, second a gap along, and every cell
+        // the same height so the row lines up top and bottom.
+        assert_eq!(layout.cells[0].x, MENU_PAD);
+        assert_eq!(layout.cells[1].x, MENU_PAD + widths[0] + CELL_GAP);
+        assert!(layout.cells.iter().all(|c| c.y == MENU_PAD));
+        assert!(layout.cells.iter().all(|c| c.height == layout.cells[0].height));
 
-        let windows = [make(4, false), make(5, false)];
-        let refs: Vec<&WindowInfo> = windows.iter().collect();
-        assert_eq!(next_window_id(&refs), 4, "first when none is focused");
+        // A cell part way through growing is laid out at the width it is now, so
+        // the surface follows the animation.
+        assert_eq!(layout_menu(&[80]).surface.width, 80 + MENU_PAD * 2);
+        // A single preview, and an empty menu, both stay sensible sizes.
+        assert_eq!(
+            layout_menu(&[200 + CELL_BORDER * 2]).surface.width,
+            200 + CELL_BORDER * 2 + MENU_PAD * 2
+        );
+        assert_eq!(layout_menu(&[]).surface.width, MENU_PAD * 2);
+    }
+
+    #[test]
+    fn a_preview_is_as_wide_as_its_own_aspect_at_the_shared_height() {
+        // 16:9 at the shared height.
+        assert_eq!(preview_width(320, 180), 210);
+        // 4:3.
+        assert_eq!(preview_width(160, 120), 157);
+        // A very wide window is held to the ceiling.
+        assert_eq!(preview_width(4000, 200), PREVIEW_MAX_CELL);
+        // Just inside it: no letterbox, because the width is still the image's own.
+        assert_eq!(preview_width(600, 200), 354);
+        // A very narrow one still gets room for a title and a close button.
+        assert_eq!(preview_width(10, 1000), PREVIEW_MIN_WIDTH);
+        // Nonsense, rather than a divide by zero.
+        assert_eq!(preview_width(0, 100), PREVIEW_HEIGHT);
+    }
+
+    #[test]
+    fn the_menus_left_edge_stays_under_the_icon_and_on_the_output() {
+        // Wide enough to centre exactly.
+        assert_eq!(menu_left(500, 1920, 400), 300);
+        // Near the left edge: clamped rather than going off screen.
+        assert_eq!(menu_left(100, 1920, 400), MENU_EDGE_GAP);
+        // Near the right edge: pushed back in, keeping the gap.
+        assert_eq!(menu_left(1900, 1920, 400), 1920 - MENU_EDGE_GAP - 400);
+        // Wider than the output itself: still on screen, at the left gap.
+        assert_eq!(menu_left(500, 300, 900), MENU_EDGE_GAP);
+    }
+
+    #[test]
+    fn hit_testing_separates_a_preview_from_its_close_button() {
+        let layout = layout_menu(&[202, 202]);
+        let first = layout.cells[0];
+        let second = layout.cells[1];
+
+        // The middle of a preview is that preview.
+        let middle = (f64::from(first.x + first.width / 2), f64::from(first.y + first.height / 2));
+        assert_eq!(layout.hit(middle.0, middle.1), Hit::Preview(0));
+
+        // The far corner of a cell's strip is the close button, not the preview:
+        // a full strip-height square flush with the top, right and bottom.
+        let close = close_rect(&first);
+        assert_eq!(close.width, TITLEBAR_HEIGHT);
+        assert_eq!(close.y, first.y);
+        assert_eq!(close.x + close.width, first.x + first.width);
+        assert_eq!(close.height, TITLEBAR_HEIGHT);
+        assert_eq!(
+            layout.hit(
+                f64::from(close.x + close.width / 2),
+                f64::from(close.y + close.height / 2)
+            ),
+            Hit::Close(0)
+        );
+        // Its left edge is the last thing that is the button; just past it is the
+        // preview.
+        let close_y = f64::from(close.y + close.height / 2);
+        assert_eq!(layout.hit(f64::from(close.x) - 1.0, close_y), Hit::Preview(0));
+
+        // The left of that same titlebar is the preview, so the button does not
+        // cover the whole strip.
+        let left_x = f64::from(first.x + 2);
+        assert_eq!(layout.hit(left_x, close_y), Hit::Preview(0));
+
+        // The gap between cells, the menu's padding and past the last cell are
+        // all outside.
+        let gap = f64::from(first.x + first.width + 1);
+        assert_eq!(layout.hit(gap, close_y), Hit::None);
+        assert_eq!(layout.hit(1.0, f64::from(first.y + 1)), Hit::None);
+        let past = f64::from(second.x + second.width + 1);
+        assert_eq!(layout.hit(past, close_y), Hit::None);
+    }
+
+    #[test]
+    fn a_closing_cell_takes_its_gap_with_it() {
+        let cell = 202;
+        // Two cells, a full gap between them.
+        assert_eq!(layout_menu(&[cell, cell]).surface.width, cell * 2 + CELL_GAP + MENU_PAD * 2);
+        // The first has closed up to nothing: the second moves left by its width
+        // *and* the gap, and nothing is left holding a hole in the row.
+        let closing = layout_menu(&[0, cell]);
+        assert_eq!(closing.cells[1].x, MENU_PAD);
+        assert_eq!(closing.surface.width, cell + MENU_PAD * 2);
+        // A cell part way through closing keeps the gap it still has room for.
+        let part = layout_menu(&[cell / 2, cell]);
+        assert_eq!(part.cells[1].x, MENU_PAD + cell / 2 + CELL_GAP);
+        // Every cell gone: just the padding, no gap left over.
+        assert_eq!(layout_menu(&[0, 0]).surface.width, MENU_PAD * 2);
+        // The cells still line up with the widths by index, so a hit test on the
+        // second cell names the second cell even while the first is closing.
+        let mixed = layout_menu(&[0, cell, cell]);
+        assert_eq!(mixed.cells.len(), 3);
+        assert_eq!(mixed.cells[0].width, 0);
+        assert_eq!(mixed.cells[1].x, MENU_PAD);
+        assert_eq!(mixed.cells[2].x, MENU_PAD + cell + CELL_GAP);
+        // And a zero-width cell is never hit.
+        assert_eq!(mixed.hit(f64::from(MENU_PAD), f64::from(MENU_PAD + 10)), Hit::Preview(1));
+    }
+
+    #[test]
+    fn the_order_is_the_snapshot_s_own_and_the_survivors_are_kept() {
+        // The order is simply the group on show, already in the snapshot's order.
+        let group: Vec<u64> = vec![12, 10];
+        assert_eq!(group.clone(), vec![12, 10]);
+
+        // Windows that are still open but not on show keep their entries, and so
+        // keep their previews — which is what makes coming back to an app instant.
+        // Judging that against the group instead is what threw every preview away
+        // each time the menu moved to another app.
+        // Every window the compositor knows about, whether or not it is on show.
+        // Judged against the group alone instead, an app the menu was not showing
+        // looked like it had closed all its windows, so its previews were dropped
+        // and the next visit started from nothing.
+        let alive = liveness(&[1, 2, 3]);
+        assert!(alive.contains(&1) && alive.contains(&2) && alive.contains(&3));
+        assert!(!alive.contains(&4), "a window that has closed is not alive");
+        // The group is a subset of it.
+        assert!(liveness(&[1, 2, 3]).contains(&2));
+    }
+
+
+    #[test]
+    fn a_motion_advances_by_elapsed_time_not_by_ticks() {
+        // The fraction of a phase one frame is worth. A fixed 16ms step is only right
+        // if every frame really is 16ms, and every step resizes a surface — so the
+        // frames that overrun are exactly the ones the fixed step got wrong, and the
+        // animation ran slow instead of skipping.
+        let fraction = |microseconds: i64, phase: Duration| {
+            (microseconds as f64 / 1_000_000.0).clamp(0.0, 0.1) / phase.as_secs_f64()
+        };
+        // A nominal frame.
+        assert!((fraction(16_667, CELL_MORPH) - 0.0758).abs() < 0.001);
+        // A long frame is worth more, and in proportion: two short frames and one long
+        // one must land in the same place as the same time in one frame.
+        let split = fraction(8_333, CELL_MORPH) + fraction(8_334, CELL_MORPH);
+        assert!((fraction(16_667, CELL_MORPH) - split).abs() < 0.001);
+        assert!(fraction(33_000, CELL_MORPH) > fraction(16_667, CELL_MORPH));
+        // A frame that never comes — a stall, a modal — is capped rather than
+        // completing the whole motion in one step.
+        assert_eq!(fraction(5_000_000, CELL_MORPH), 0.1 / CELL_MORPH.as_secs_f64());
+        // And no frame at all advances nothing, so the first frame of a motion does
+        // not jump it forward by a frame nobody waited for.
+        assert_eq!(fraction(0, CELL_MORPH), 0.0);
+    }
+
+    #[test]
+    fn the_window_travels_and_resizes_on_one_motion() {
+        // The size and the position are eased from the same fraction, so the row
+        // never slides out from under the icon it is meant to sit under. Easing them
+        // separately — or letting the layout snap the margin on each of the motion's
+        // steps, as it used to — sent the menu sideways instead of along.
+        let from_width = 590;
+        let to_width = 340;
+        let from_left = 600;
+        let to_left = 180;
+        let at = |t: f64| {
+            let eased = ease_out(t);
+            (
+                (from_width as f64 + (to_width - from_width) as f64 * eased).round() as i32,
+                (from_left as f64 + (to_left - from_left) as f64 * eased).round() as i32,
+            )
+        };
+        // It starts where it was: no jump to the new geometry, and nothing at zero.
+        assert_eq!(at(0.0), (from_width, from_left));
+        assert!(at(0.0).0 > 0);
+        // It ends where the new row wants it.
+        assert_eq!(at(1.0), (to_width, to_left));
+        // And it moves monotonically in between, rather than overshooting.
+        let mut previous = at(0.0);
+        for step in 1..=20 {
+            let now = at(f64::from(step) / 20.0);
+            assert!(now.0 <= previous.0 && now.1 <= previous.1, "overshot at step {step}");
+            assert!(now.0 >= to_width && now.1 >= to_left);
+            previous = now;
+        }
+    }
+
+    #[test]
+    fn a_preview_is_never_stretched_to_fill_its_box() {
+        // A cell a pixel or two off the image's aspect — which is all a clamped width
+        // is — has to give the preview its own proportions, not squeeze it to fit.
+        let preview = |w: i32, h: i32| (w, h);
+        // 16:9 into a box sized for it exactly: a uniform scale of 1.
+        let (w, h) = preview(210, 118);
+        let (box_w, box_h) = (f64::from(210), f64::from(118));
+        let scale = (box_w / f64::from(w)).min(box_h / f64::from(h));
+        assert_eq!(scale, 1.0);
+
+        // A box wider than the image's aspect: the image keeps its own shape and is
+        // inset evenly, rather than being widened to match the box.
+        let (w, h) = preview(100, 118);
+        let (box_w, box_h) = (f64::from(200), f64::from(118));
+        let scale = (box_w / f64::from(w)).min(box_h / f64::from(h));
+        let drawn = (f64::from(w) * scale, f64::from(h) * scale);
+        assert!(drawn.0 < box_w && drawn.1 <= box_h);
+        // Same height, less width: the proportions survive, which is the point.
+        assert!((drawn.0 / drawn.1 - f64::from(w) / f64::from(h)).abs() < 1e-9);
+        // And the leftover is split evenly either side.
+        let left = (box_w - drawn.0) / 2.0;
+        let right = box_w - drawn.0 - left;
+        assert!((left - right).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_phase_change_restarts_the_clock() {
+        // The fade is timed off `elapsed`, so a phase entered with the clock still
+        // reading 1.0 finishes in a single tick — which is exactly how the departure
+        // ended up with no fade at all: a settled entry's clock had been sitting at
+        // one since it arrived, and nothing reset it on the way out.
+        let mut elapsed = 1.0f64;
+        let mut alpha = 1.0f64;
+        let step = 16.0 / 140.0;
+
+        // A tick entered with a stale clock: one frame, straight to nothing.
+        assert_eq!((elapsed + step).min(1.0), 1.0);
+        assert_eq!(1.0 - ease_in(1.0), alpha - 1.0);
+
+        // Restarted, as every change of phase now does, it takes the whole phase.
+        elapsed = 0.0;
+        let mut frames = 0;
+        let mut visible_for = 0;
+        while elapsed < 1.0 {
+            let running = elapsed < 1.0;
+            alpha = 1.0 - ease_in((elapsed + step).min(1.0));
+            elapsed += step;
+            frames += 1;
+            if running && alpha > 0.0 {
+                visible_for += 1;
+            }
+        }
+        assert!(frames >= 8, "a fade should take several frames, took {frames}");
+        assert!(
+            visible_for >= frames - 1,
+            "it should be visible right up to the end, was for {visible_for} of {frames}"
+        );
+        assert_eq!(alpha, 0.0, "and finish at nothing");
+    }
+
+    #[test]
+    fn a_fade_out_is_gradual_where_a_fade_in_is_quick() {
+        // Ease in and ease out are mirrors: what one gains the other loses.
+        for step in 0..=20 {
+            let t = f64::from(step) / 20.0;
+            assert!((ease_in(t) + ease_out(1.0 - t) - 1.0).abs() < 1e-9);
+        }
+
+        // The point of using the other curve: a fade out must still be mostly opaque
+        // well into its phase. On the fade-in curve it was at a quarter opacity
+        // within one 16ms tick, which is why the departure looked like it had no
+        // fade at all and then hung while the width caught up.
+        let faded = |t: f64| 1.0 - ease_in(t);
+        assert!(faded(0.0) == 1.0);
+        assert!(faded(0.25) > 0.95, "a quarter in should still look open");
+        assert!(faded(0.5) > 0.85, "halfway should still be mostly there");
+        assert!(faded(0.75) < 0.6, "and it should be going by three quarters");
+        assert!(faded(1.0) == 0.0);
+        // Monotonic: it never comes back up.
+        let mut previous = 1.0;
+        for step in 0..=20 {
+            let alpha = faded(f64::from(step) / 20.0);
+            assert!(alpha <= previous);
+            previous = alpha;
+        }
+    }
+
+    #[test]
+    fn an_entry_grows_and_shrinks_on_an_ease_out() {
+        // The curve the motion uses: nothing at the start, most of the way there
+        // early, and it only ever reaches the ends at 0 and 1.
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert!(ease_out(0.5) > 0.5, "ease out is ahead of linear");
+        assert!(ease_out(0.25) < ease_out(0.75));
+        // Out of range is clamped rather than extrapolated, so a tick that
+        // overshoots lands exactly on the end instead of past it.
+        assert_eq!(ease_out(-0.5), 0.0);
+        assert_eq!(ease_out(1.5), 1.0);
+
+        // A whole cell's worth of growth: from nothing, to its settled width, with
+        // the border accounted for at both ends.
+        let target = 150;
+        let full = target + CELL_BORDER * 2;
+        let at = |progress: f64| (f64::from(full) * progress).round() as i32;
+        assert_eq!(at(0.0), 0);
+        assert_eq!(at(1.0), full);
+        // Part way through it is a real width, so the surface is resized every step
+        // rather than jumping between the two ends.
+        let half = at(ease_out(0.5));
+        assert!(half > 0 && half < full, "got {half} of {full}");
+    }
+
+    #[test]
+    fn a_cell_is_rounded_at_the_top_and_square_at_the_bottom() {
+        let steps = rounded_top_path(0.0, 0.0, 20.0, 20.0, 5.0);
+        let points = |step: PathStep| match step {
+            PathStep::Move(x, y) | PathStep::Line(x, y) => Some((x, y)),
+            PathStep::Arc { .. } => None,
+        };
+        let end_of = |index: usize| match steps[index] {
+            PathStep::Move(x, y) | PathStep::Line(x, y) => (x, y),
+            // Every arc here is a quarter turn from `a0` to `a0 + PI/2`, so it
+            // finishes a quarter round from its start.
+            PathStep::Arc {
+                cx,
+                cy,
+                radius,
+                a0,
+            } => (
+                cx + radius * (a0 + std::f64::consts::FRAC_PI_2).cos(),
+                cy + radius * (a0 + std::f64::consts::FRAC_PI_2).sin(),
+            ),
+        };
+
+        // It starts down the left side, one radius below the top, not at the corner:
+        // a path that began at the corner and relied on cairo joining the arcs had
+        // its top edge a whole radius down instead.
+        assert_eq!(points(steps[0]), Some((0.0, 5.0)));
+        // The first arc turns the top-left corner and finishes on the top edge,
+        // within a rounding error of where the straight line it joins starts.
+        let (x, y) = end_of(1);
+        assert!((x - 5.0).abs() < 1e-9 && y.abs() < 1e-9, "got ({x}, {y})");
+        // Then a straight line along the top, at the very top, to the right corner.
+        assert_eq!(points(steps[2]), Some((15.0, 0.0)));
+        // The second arc turns the top-right corner and finishes on the right side.
+        let (x, y) = end_of(3);
+        assert!((x - 20.0).abs() < 1e-9 && (y - 5.0).abs() < 1e-9, "got ({x}, {y})");
+        // Down the right side, then across the bottom: both square, both at the
+        // bottom. The bottom-left used to be one diagonal from the top-left corner's
+        // arc straight to the bottom.
+        assert_eq!(points(steps[4]), Some((20.0, 20.0)));
+        assert_eq!(points(steps[5]), Some((0.0, 20.0)));
+
+        // A radius of zero degenerates to a plain rectangle rather than looping.
+        let square = rounded_top_path(0.0, 0.0, 10.0, 10.0, 0.0);
+        assert_eq!(square[0], PathStep::Move(0.0, 0.0));
+        assert_eq!(square[1], PathStep::Line(10.0, 0.0));
+    }
+
+    #[test]
+    fn the_preview_sits_inside_the_cells_border() {
+        // The image must not reach the cell's edges, or it paints over the outline
+        // and the cell looks like it has none.
+        let layout = layout_menu(&[200 + CELL_BORDER * 2]);
+        let cell = layout.cells[0];
+        let left = cell.x + CELL_BORDER;
+        let right = cell.x + cell.width - CELL_BORDER;
+        assert!(left > cell.x && right < cell.x + cell.width);
+        // And it must be exactly the size the image was scaled for, on both axes,
+        // or cairo stretches it to fit and the gaps round it stop matching.
+        assert_eq!(cell.width - CELL_BORDER * 2, 200);
+        assert_eq!(cell.height - TITLEBAR_HEIGHT - CELL_BORDER, PREVIEW_HEIGHT);
+        // Symmetric: the same inset on the left and the right.
+        assert_eq!(left - cell.x, cell.x + cell.width - right);
+    }
+
+    #[test]
+    fn centres_text_on_the_line_rather_than_near_it() {
+        // A 10px line: the ink is 11 tall, and cairo reports it as hanging 8 above
+        // the baseline and so reaching 3 below. Centring that span on 18 puts the
+        // baseline at 20.5, and the ink it produces really does span 12.5 to 23.5.
+        let baseline = centred_baseline(18.0, -8.0, 11.0);
+        assert_eq!(baseline, 20.5);
+        assert_eq!(baseline + -8.0 + 11.0 / 2.0, 18.0);
+        // And it stays inside the strip rather than climbing out of the top of it.
+        assert!(baseline + -8.0 > 6.0 && baseline + 3.0 < 30.0);
+
+        // A bare baseline, all the ink above it and none below: 10 above, 10 tall.
+        assert_eq!(centred_baseline(10.0, -10.0, 10.0), 15.0);
+
+        // cairo measures the bearing upwards, so it is negative here. Read the
+        // other way round, the same call puts the text 11px lower instead — which
+        // is the assertion below pinning the convention rather than leaving it to
+        // be rediscovered from a clipped title.
+        assert_eq!(centred_baseline(18.0, 8.0, 11.0), 4.5);
+    }
+
+    #[test]
+    fn converts_rgba_to_what_cairo_expects() {
+        // Opaque pixels: red and blue swap, green stays, alpha untouched. That
+        // swap is what otherwise turns every preview's colours inside out.
+        let mut pixels = vec![10, 20, 30, 255];
+        to_cairo_rgba(&mut pixels);
+        assert_eq!(pixels, vec![30, 20, 10, 255]);
+
+        // Fully transparent: the colour is irrelevant and multiplying by zero
+        // would only cost time.
+        let mut clear = vec![200, 100, 50, 0];
+        to_cairo_rgba(&mut clear);
+        assert_eq!(clear, vec![50, 100, 200, 0]);
+
+        // A half-transparent pixel is premultiplied as well as reordered: 255 and 20
+        // scale to 128 and 10 respectively.
+        let mut half = vec![255, 20, 30, 128];
+        to_cairo_rgba(&mut half);
+        assert_eq!(half, vec![15, 10, 128, 128]);
+
+        // Two pixels in one buffer, to show the chunks do not run off the end.
+        let mut pair = vec![1, 2, 3, 255, 4, 5, 6, 255];
+        to_cairo_rgba(&mut pair);
+        assert_eq!(pair, vec![3, 2, 1, 255, 6, 5, 4, 255]);
+    }
+
+    #[test]
+    fn reads_the_close_xbm_bit_by_bit() {
+        // A 2x2 pattern in the same format as CLOSE_XBM: one byte per row, bit 0
+        // leftmost, so the first row is a single lit pixel at the top-left and
+        // the second row is empty.
+        let pattern = [0b0000_0001u8, 0b0000_0000];
+        // Only the lit pixels are reported, and they come out in row order.
+        assert_eq!(glyph_pixels(&pattern, 2), vec![(0, 0)]);
+
+        // Both diagonals of a 2x2 checker, so the bit order is pinned in each
+        // direction rather than only for the first row.
+        // 0b1010 sets bit 1, not bit 2, so the lit pixel is (1, 1).
+        assert_eq!(glyph_pixels(&[0b0000_0101, 0b0000_1010], 2), vec![(0, 0), (1, 1)]);
+
+        // A pattern too short for the grid asked for must not index past its end.
+        assert!(glyph_pixels(&[0b0000_0001], 10).contains(&(0, 0)));
+        assert!(glyph_pixels(&[], 10).is_empty());
+
+        // The real glyph, at the size it is drawn at: ten rows of two bytes, so
+        // every row is in range and the whole thing is read.
+        assert!(!glyph_pixels(&CLOSE_XBM, CLOSE_XBM_SIZE).is_empty());
+
+        // A wider pattern, to show rows are not being read as one long run of
+        // bits: only the low byte of each row is in play at this size.
+        assert_eq!(glyph_pixels(&[0b0000_0011, 0b0000_0000], 2), vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn close_xbm_matches_the_compositors_own_icon() {
+        // The panel's glyph and the compositor's titlebar button must not drift
+        // apart; this pins the panel's copy to the bytes the shell uses.
+        let compositor = crate::shell::ssd::CLOSE_ICON_FOR_TESTS;
+        assert_eq!(CLOSE_XBM.as_slice(), compositor);
+    }
+
+    #[test]
+    fn reads_an_image_payload_after_its_header() {
+        let mut reader = PanelReader::default();
+        // Two pixels, and a 0x0A byte in the payload: the length prefix is what
+        // keeps that from truncating the message.
+        let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 0x0A];
+        let header = format!("img\t7\t2\t1\t{}\n", pixels.len());
+        reader
+            .buffer
+            .extend_from_slice(header.as_bytes());
+        reader.buffer.extend_from_slice(&pixels);
+
+        let events = reader.drain();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            PanelEvent::Image {
+                id,
+                width,
+                height,
+                pixels: got,
+            } => {
+                assert_eq!((*id, *width, *height), (7, 2, 1));
+                assert_eq!(got, &pixels);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waits_for_the_whole_payload() {
+        let mut reader = PanelReader::default();
+        reader.buffer.extend_from_slice(b"img\t1\t2\t1\t8\n");
+        reader.buffer.extend_from_slice(&[1, 2, 3]);
+        assert!(reader.drain().is_empty(), "partial payload is not an event");
+        reader.buffer.extend_from_slice(&[4, 5, 6, 7, 8]);
+        assert_eq!(reader.drain().len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_header_whose_length_lies() {
+        // 2x1 is 8 bytes, not the 9 claimed.
+        assert!(parse_image_header("9\t2\t1\t9").is_none());
+        assert!(parse_image_header("9\t0\t1\t0").is_none());
     }
 
     #[test]

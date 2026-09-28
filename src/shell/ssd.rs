@@ -66,6 +66,17 @@ pub struct WindowState {
     /// at, so its first commit can finish centering it. See
     /// [`SpawnPlacement`].
     pub spawn: Option<SpawnPlacement>,
+    /// Bumped every time the client commits a new buffer.
+    ///
+    /// The panel's window picker asks for previews on a timer to look live, but
+    /// rendering one means reading the whole window back off the GPU, so it is
+    /// only worth doing for a window whose contents actually changed. This
+    /// counter is what makes that check cheap.
+    pub content_generation: u64,
+    /// The [`content_generation`](Self::content_generation) the panel's current
+    /// preview was rendered from, if any. A request matching it is answered with
+    /// nothing, leaving the panel to keep showing the image it has.
+    pub previewed_generation: Option<u64>,
     /// An in-flight maximize/unmaximize transition, if any. While set, the
     /// window is drawn at the sampled geometry instead of its committed size.
     pub animation: Option<WindowAnimation>,
@@ -532,6 +543,11 @@ pub fn content_offset() -> Point<i32, Logical> {
 pub fn fullscreen_content_offset() -> Point<i32, Logical> {
     Point::from((0, HEADER_BAR_HEIGHT))
 }
+
+/// The compositor's close glyph, published so the panel can assert its own copy
+/// of these bytes stays identical.
+#[cfg(test)]
+pub const CLOSE_ICON_FOR_TESTS: [u8; 20] = CLOSE_ICON;
 
 const CLOSE_ICON: [u8; 20] = [
     0x03, 0xFF, 0x87, 0xFF, 0xCE, 0xFD, 0xFC, 0xFC, 0x78, 0xFC, 0x78, 0xFC, 0xFC, 0xFC, 0xCE, 0xFD,
@@ -1107,6 +1123,8 @@ impl WindowElement {
                 relative: None,
                 pre_move: None,
                 spawn: None,
+                content_generation: 0,
+                previewed_generation: None,
                 animation: None,
                 visibility: VisibilityState::default(),
                 last_frame: None,

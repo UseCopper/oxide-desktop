@@ -189,6 +189,9 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             }
             if let Some(window) = self.window_for_surface(&root) {
                 window.0.on_commit();
+                // Mark the contents as changed, so the panel's preview of this
+                // window is worth re-rendering.
+                window.decoration_state().content_generation += 1;
                 // Keep the buffers the client just committed alive, so an
                 // app-triggered close can be drawn from them after the surface
                 // is gone. This is a cheap `Arc` clone per surface, not a GPU
@@ -226,6 +229,21 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                 }
             }
         }
+        // A layer surface that has just moved or resized needs the layer map
+        // re-arranged and the space refreshed.
+        //
+        // `arrange()` is what turns a layer surface's anchors and margins into a
+        // position, and `Space` caches every element's location — which is where
+        // both its drawn position and its hit region come from. Without this, a
+        // layer surface that moves keeps its old position *and* its old hit
+        // region, so pointer events go to whatever is cached there instead of to
+        // it. The panel's picker moves on every frame of its open animation, so
+        // this is also what lets the pointer reach the menu at all.
+        if let Some(output) = self.layer_surface_output(surface) {
+            layer_map_for_output(&output).arrange();
+            self.space.refresh();
+        }
+
         self.popups.commit(surface);
 
         if matches!(&self.cursor_status, CursorImageStatus::Surface(cursor_surface) if cursor_surface == surface)
@@ -320,6 +338,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, Some(window.into()), SERIAL_COUNTER.next_serial());
         }
+    }
+
+    /// The output a layer surface belongs to, if the given surface is one.
+    fn layer_surface_output(&self, surface: &WlSurface) -> Option<Output> {
+        self.space.outputs().find(|output| {
+            layer_map_for_output(output)
+                .layers()
+                .any(|layer| layer.layer_surface().wl_surface() == surface)
+        })
+        .cloned()
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {

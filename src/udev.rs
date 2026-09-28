@@ -209,6 +209,18 @@ impl Backend for UdevData {
         }
     }
 
+    fn panel_thumbnail(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        max: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Option<(smithay::utils::Size<i32, smithay::utils::Buffer>, Vec<u8>)> {
+        // The primary GPU's renderer, as the other backends use. A window whose
+        // buffers live on another node may fail to import, in which case the
+        // picker just shows no preview for it.
+        let mut renderer = self.gpus.single_renderer(&self.primary_gpu).ok()?;
+        crate::shell::capture_thumbnail(&mut renderer, window, max)
+    }
+
     fn update_led_state(&mut self, led_state: LedState) {
         for keyboard in self.keyboards.iter_mut() {
             keyboard.led_update(led_state.into());

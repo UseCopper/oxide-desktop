@@ -210,6 +210,22 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
     /// Counter for assigning stable panel ids to windows.
     pub next_panel_id: u64,
+    /// Windows the panel has asked a preview of that have not been rendered yet.
+    ///
+    /// Coalesced by window, oldest first, and served a couple per frame. Requests
+    /// used to be answered straight out of the socket with whatever fitted in the
+    /// frame's budget and the rest thrown away — and since the panel asks for every
+    /// window on a timer, the same first few were served over and over and the rest
+    /// were never answered at all.
+    pub panel_preview_queue: std::collections::VecDeque<u64>,
+    /// Which of those are already queued, so a window asked for again while it
+    /// waits is not queued twice.
+    pub panel_preview_queued: std::collections::HashSet<u64>,
+    /// The size each queued window was asked for, carried with it rather than
+    /// remembered per tick: a window can be queued on one tick and come up for
+    /// service several ticks later, and keeping the size only for the tick it
+    /// arrived on meant it was dropped unanswered when it came up.
+    pub panel_preview_sizes: std::collections::HashMap<u64, (i32, i32)>,
 }
 
 #[derive(Debug)]
@@ -854,6 +870,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             snap_candidate_since: Instant::now(),
             panel_ipc: None,
             next_panel_id: 1,
+        panel_preview_queue: std::collections::VecDeque::new(),
+        panel_preview_queued: std::collections::HashSet::new(),
+        panel_preview_sizes: std::collections::HashMap::new(),
         };
 
         crate::panel_ipc::spawn_panel(&mut state);
@@ -1282,4 +1301,19 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
+
+    /// Render a scaled-down preview of `window` for the panel's window picker,
+    /// fitted inside `max`. Returns the size it was rendered at, which is the
+    /// fit rather than `max` and so depends on the window's aspect ratio, along
+    /// with tightly packed R, G, B, A rows.
+    ///
+    /// Defaults to "no preview": a backend that cannot spare a renderer just
+    /// leaves the picker showing titles without images.
+    fn panel_thumbnail(
+        &mut self,
+        _window: &WindowElement,
+        _max: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Option<(smithay::utils::Size<i32, smithay::utils::Buffer>, Vec<u8>)> {
+        None
+    }
 }
