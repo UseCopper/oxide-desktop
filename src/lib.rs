@@ -8,6 +8,7 @@
 )]
 
 pub mod cursor;
+pub mod desktop;
 pub mod drawing;
 pub mod focus;
 pub mod input_handler;
