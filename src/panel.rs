@@ -2204,6 +2204,13 @@ struct ContextMenu {
 /// Symbolic names from the icon theme, so they follow the desktop's theme rather
 /// than being drawn here. A name the installed theme does not have simply shows
 /// nothing, which is why each row's label is never an icon alone.
+/// How big a row's icon is drawn.
+///
+/// Smaller than the bar's [`ICON_SIZE`] on purpose: there the icon *is* the button,
+/// and here it is a mark beside a label. At 26px a symbolic glyph filled the row and
+/// the label beside it looked like the caption.
+const CONTEXT_ICON_SIZE: i32 = 18;
+
 const ICON_CLOSE_ONE: &str = "window-close-symbolic";
 const ICON_CLOSE_ALL: &str = "edit-clear-all-symbolic";
 const ICON_PIN: &str = "starred-symbolic";
@@ -2257,7 +2264,7 @@ fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
     row.set_has_frame(false);
 
     let icon = gtk4::Image::from_icon_name(icon_name);
-    icon.set_pixel_size(ICON_SIZE);
+    icon.set_pixel_size(CONTEXT_ICON_SIZE);
     let text = gtk4::Label::new(Some(label));
     text.set_xalign(0.0);
     // The row is as wide as its widest label, and a name can be long; this is where
@@ -2360,7 +2367,38 @@ fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
     }
 }
 
-/// Open the context menu for an app, or move an open one onto it.
+/// Put an open app menu on a different app, as the pointer moves along the bar.
+///
+/// No fade: the menu is already up, and re-running the reveal would take it off
+/// screen and put it back for every square the pointer crosses. Only the position
+/// changes, so only the margin is touched.
+fn context_move(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    button: &Button,
+) {
+    let (icon_center, bar_width) = icon_metrics(button);
+    context.icon_center.set(icon_center);
+    context.bar_width.set(bar_width);
+    context.app.replace(Some(key.to_string()));
+    context_fill(context, key, windows);
+    if menu_debug() {
+        eprintln!("oxide-panel: context move to {key:?}, {} windows", windows.len());
+    }
+    // The width is whatever the new app's rows just measured to, so the margin is
+    // recomputed from that rather than from the old one.
+    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
+    context
+        .window
+        .set_margin(Edge::Left, menu_left(icon_center, bar_width, width));
+    // And the hover clock starts over, so the grace period is measured from arriving
+    // here rather than from whenever the menu happened to open.
+    context.hover.inside.set(true);
+    context.hover.token.set(context.hover.token.get().wrapping_add(1));
+}
+
+/// Open the app menu for an app, or move an open one onto it.
 fn context_open(
     context: &Rc<ContextMenu>,
     key: &str,
@@ -3422,7 +3460,15 @@ fn app_button(
         1 => window_title(windows[0]),
         _ => format!("{count} windows"),
     };
-    button.set_tooltip_text(Some(&tooltip));
+    // A tooltip says what a square is, and a menu under the pointer is about to say it
+    // better. Left on, it came up underneath the app menu and drew through it: the
+    // menus are 35% black over whatever is behind them, so anything behind shows.
+    if menu.shown.get() || context.shown.get() {
+        button.set_has_tooltip(false);
+    } else {
+        button.set_has_tooltip(true);
+        button.set_tooltip_text(Some(&tooltip));
+    }
 
     let icon = resolve_icon(app_id);
     let image = if icon.starts_with('/') {
@@ -3486,10 +3532,16 @@ fn app_button(
                 if group.is_empty() {
                     return;
                 }
-                // One menu at a time. A right click puts the app menu up, and
-                // hovering a square after that must not open the previews on top of
-                // it — two surfaces in the same place, fighting over the pointer.
+                // One menu at a time: the app menu is up, so this must not open the
+                // previews on top of it. But it should *follow* — the previews move
+                // along the bar with the pointer, and an app menu that stayed on the
+                // app it was opened for meant resting on one square and moving to
+                // another left it offering to close three windows that were not the
+                // ones under the pointer.
                 if context.shown.get() {
+                    if context.app.borrow().as_deref() != Some(key.as_str()) {
+                        context_move(&context, &key, &group, &button);
+                    }
                     return;
                 }
                 // Already following the pointer along the bar: come across at once.
