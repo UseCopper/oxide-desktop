@@ -184,6 +184,12 @@ const HOVER_GRACE: Duration = Duration::from_millis(400);
 /// How long the pointer must rest on a square before its menu opens. Long enough
 /// that travelling along the bar does not open a menu for every square crossed.
 const HOVER_OPEN: Duration = Duration::from_millis(250);
+/// How long a press on a square is armed before it acts.
+///
+/// Long enough that a press which becomes a drag is not also a click — a square
+/// cannot be brought forward and picked up at once — and short enough that a click is
+/// not left feeling slow. A release beats it, so a plain click acts immediately.
+const CLICK_ARM: Duration = Duration::from_millis(180);
 /// How long to wait for every preview before showing the menu anyway.
 ///
 /// Short: a window with nothing committed, or a buffer the renderer will not
@@ -2874,6 +2880,11 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
     let context = build_context_menu(app, &monitor);
     let hover = Rc::new(Hover::default());
 
+    // Squares can be dragged along the bar to reorder them. The drag carries the app
+    // id and the row decides which gap it landed in, so the gesture itself needs to
+    // know nothing about the bar.
+    watch_reorder(&tasks);
+
     // Hover-out closes the menu. The pointer has to cross the bar to reach the
     // menu, so "inside" spans both surfaces, and the close is deferred briefly so
     // passing between them is not read as leaving.
@@ -3175,6 +3186,97 @@ fn rebuild_tasks(
 
 }
 
+/// What a click on a square does: bring one window forward, or show the previews.
+///
+/// A square with nothing behind it is a pinned app's, and starts it — there is no
+/// window to bring forward.
+#[allow(clippy::too_many_arguments)]
+fn activate(
+    stream: &Rc<UnixStream>,
+    key: &str,
+    windows: &[WindowInfo],
+    menu: &Rc<Menu>,
+    button: &Button,
+    multiple: bool,
+) {
+    if !multiple {
+        match windows.first() {
+            None => send(stream, &format!("launch\t{key}\n")),
+            Some(window) => send(stream, &format!("focus\t{}\n", window.id)),
+        }
+        return;
+    }
+    // A second click on the same square closes it, rather than rebuilding the menu
+    // under the pointer.
+    if menu.shown.get() && menu.app.borrow().as_deref() == Some(key) {
+        menu_close(menu);
+        return;
+    }
+    let group: Vec<&WindowInfo> = windows.iter().collect();
+    menu_open(menu, key, &group, button, stream);
+}
+
+/// Let a square be dropped anywhere on the row of squares to give it a new place.
+fn watch_reorder(tasks: &GtkBox) {
+    let target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+    let row = tasks.clone();
+    target.connect_drop(move |_, value, x, _| {
+        let Some(id) = value.get::<String>().ok() else {
+            return false;
+        };
+        if !crate::desktop::is_app_id(&id) {
+            // A window that never said what it was has no place in the order; there
+            // is nothing to remember about it between runs.
+            return false;
+        }
+        place_at(&id, drop_index(&row, x));
+        // The bar is rebuilt on an idle rather than here: this runs inside the drop,
+        // while the square being dragged is still on screen, and taking the widgets
+        // out from under it mid-gesture loses the drag.
+        glib::idle_add_local_once(|| rebuild_bar());
+        true
+    });
+    tasks.add_controller(target);
+}
+
+/// Which gap in the bar a drop at this x lands in, given where its squares are.
+///
+/// The bar is a row, so the gap is decided by which squares' middles the pointer is
+/// past: left of the first square's middle is before it, right of the last is after
+/// it, and in between it is whichever side of that square's middle the pointer is on.
+///
+/// Separated from the widget walking so the arithmetic can be tested without a
+/// display, which is the part that can be off by one and put a square dropped
+/// between two of them one place out.
+fn gap_at(middles: &[f64], x: f64) -> usize {
+    middles.iter().filter(|middle| x > **middle).count()
+}
+
+/// [`gap_at`], for a drop on the real row.
+fn drop_index(tasks: &GtkBox, x: f64) -> usize {
+    let mut middles = Vec::new();
+    let mut child = tasks.first_child();
+    while let Some(widget) = child {
+        let square = widget.upcast::<gtk4::Widget>();
+        if let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0) {
+            middles.push(left + f64::from(square.width()) / 2.0);
+        }
+        child = square.next_sibling();
+    }
+    gap_at(&middles, x)
+}
+
+/// Move an app's square to a place in the bar, and remember it.
+fn place_at(id: &str, index: usize) {
+    LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        layout.order.retain(|entry| entry != id);
+        let index = index.min(layout.order.len());
+        layout.order.insert(index, id.to_string());
+    });
+    save_layout();
+}
+
 /// One square (1:1) per app, with indicator dots for its window count.
 ///
 /// With several windows open the square opens a menu of their previews
@@ -3311,13 +3413,18 @@ fn app_button(
         button.add_controller(hover);
     }
 
-    // A click gesture on *press*, not `clicked` and not `released`: the panel's
-    // layer surface never becomes the active GTK window, so a `clicked` on an
-    // inactive window can be swallowed as an activation attempt, and a release
-    // never arrives at all.
+    // A click gesture on *press*, not `clicked`: the panel's layer surface never
+    // becomes the active GTK window, so a `clicked` on an inactive window can be
+    // swallowed as an activation attempt.
+    //
+    // Armed on the press but run a moment later, so a press that turns into a drag
+    // never runs it. A square cannot both be pressed and picked up, and acting on
+    // the press meant every drag first focused or started the app it was
+    // rearranging. A release runs it at once, so a plain click is not left waiting.
     // Scoped, because the handles it shadows are the ones the right click below
     // takes its own copies from.
     let owned: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
+    let press = Rc::new(Cell::new(0u64));
     let primary = {
     let stream = stream.clone();
     let key = key.to_string();
@@ -3328,33 +3435,53 @@ fn app_button(
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     // The handler needs the very square it is attached to, to line the menu up
     // under it, so hold it weakly rather than moving it into the closure.
+    // The token is copied in first, because the release handler and the drag below
+    // share it and a closure that moved it would leave them holding a moved value.
+    let press_here = press.clone();
+    // The release handler needs the same handles, and a closure that took them would
+    // leave it holding moved values.
+    let (rel_stream, rel_key, rel_menu) = (stream.clone(), key.clone(), menu.clone());
+    let (rel_owned, rel_button) = (owned.clone(), button.clone());
     gesture.connect_pressed(glib::clone!(
         #[weak]
         button,
         #[upgrade_or]
         return,
         move |_, _, _, _| {
-            if !multiple {
-                match owned.first() {
-                    // Nothing open: the square is a pinned app's, and it starts it.
-                    // There is no window to bring forward, so focusing is not an
-                    // option — `owned[0]` here used to be a panic waiting for the
-                    // first pinned app with nothing running.
-                    None => send(&stream, &format!("launch\t{key}\n")),
-                    Some(window) => send(&stream, &format!("focus\t{}\n", window.id)),
+            let ticket = press_here.get().wrapping_add(1);
+            press_here.set(ticket);
+            let stream = stream.clone();
+            let key = key.clone();
+            let menu = menu.clone();
+            let owned = owned.clone();
+            let button = button.clone();
+            let press_here = press_here.clone();
+            glib::timeout_add_local(CLICK_ARM, move || {
+                if press_here.get() != ticket {
+                    // Released already, or a drag took this press instead.
+                    return glib::ControlFlow::Break;
                 }
-                return;
-            }
-            // A second click on the same square closes it, rather than rebuilding
-            // the menu under the pointer.
-            if menu.shown.get() && menu.app.borrow().as_deref() == Some(key.as_str()) {
-                menu_close(&menu);
-                return;
-            }
-            let group: Vec<&WindowInfo> = owned.iter().collect();
-            menu_open(&menu, &key, &group, &button, &stream);
+                press_here.set(press_here.get().wrapping_add(1));
+                activate(&stream, &key, &owned, &menu, &button, multiple);
+                glib::ControlFlow::Break
+            });
         }
     ));
+    {
+        let press = press.clone();
+        gesture.connect_released(move |_, _, _, _| {
+            let ticket = press.get().wrapping_add(1);
+            press.set(ticket);
+            activate(
+                &rel_stream,
+                &rel_key,
+                &rel_owned,
+                &rel_menu,
+                &rel_button,
+                multiple,
+            );
+        });
+    }
     gesture
     };
     button.add_controller(primary);
@@ -3362,6 +3489,24 @@ fn app_button(
     // A right click is the app's own menu, never its previews: what to do with the
     // app is a different question from which of its windows to show, and the
     // previews are already a hover away.
+    // Dragging this square somewhere else in the bar. The drag content is the app
+    // id, so a drop knows which square it is being given a place to, and the drop
+    // target is the row the squares are in.
+    let drag = gtk4::DragSource::new();
+    drag.connect_drag_begin({
+        let id = key.to_string();
+        let press = press.clone();
+        move |source, _| {
+            // This press is a drag, not a click. Bumping the token stops the armed
+            // click from running, so rearranging the bar does not also focus or
+            // start the app being moved.
+            press.set(press.get().wrapping_add(1));
+            let value = id.to_value();
+            source.set_content(Some(&gdk::ContentProvider::for_value(&value)));
+        }
+    });
+    button.add_controller(drag);
+
     let right_stream = stream.clone();
     let right_key = key.to_string();
     let right_menu = menu.clone();
@@ -4479,6 +4624,45 @@ mod tests {
     fn with_empty_layout(body: impl FnOnce()) {
         LAYOUT.with(|layout| *layout.borrow_mut() = Layout::default());
         body();
+    }
+
+    #[test]
+    fn a_drop_lands_in_the_gap_it_was_released_over() {
+        // Four squares, 36px each: middles at 18, 54, 90, 126. Off by one in this
+        // arithmetic and a square dropped between two of them lands one place out.
+        let middles = [18.0, 54.0, 90.0, 126.0];
+        // Left of the first: before everything.
+        assert_eq!(gap_at(&middles, 4.0), 0);
+        // Exactly on the first square's middle: not past it, so still before it.
+        assert_eq!(gap_at(&middles, 18.0), 0);
+        // Just past it: after it.
+        assert_eq!(gap_at(&middles, 20.0), 1);
+        // On the second square, before its middle: still after the first.
+        assert_eq!(gap_at(&middles, 50.0), 1);
+        assert_eq!(gap_at(&middles, 56.0), 2);
+        // Past the last: after everything, and not off the end of the list.
+        assert_eq!(gap_at(&middles, 140.0), 4);
+        // An empty bar has exactly one gap, and it is that one.
+        assert_eq!(gap_at(&[], 10.0), 0);
+    }
+
+    #[test]
+    fn moving_a_square_moves_it_and_nothing_else() {
+        with_empty_layout(|| {
+            arrange(
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+            );
+            // `c` to the front.
+            place_at("c", 0);
+            let keys: Vec<String> = ["a", "b", "c"].iter().map(|k| k.to_string()).collect();
+            assert_eq!(arrange(&keys), [2, 0, 1]);
+            // Somewhere in the middle.
+            place_at("a", 1);
+            assert_eq!(arrange(&keys), [2, 0, 1]);
+            // And to the end, which must not push it past the ones already there.
+            place_at("c", 99);
+            assert_eq!(arrange(&keys), [0, 1, 2]);
+        });
     }
 
     #[test]
