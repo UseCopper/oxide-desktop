@@ -1922,9 +1922,21 @@ fn menu_replace(
             request_preview_if_missing(menu, info, stream);
         }
     }
-    // Only once the menu is up: before that the entries' growth would happen
-    // behind a hidden surface, and opening one would just appear at full width.
-    if arrived && menu.shown.get() {
+    // Anything on its way out needs the tick, not just something this snapshot
+    // started. `arrived` alone meant a window that closed while a motion was already
+    // running — or one caught mid-departure by a snapshot that had nothing new to
+    // say — was never ticked again, so it sat in the row at full opacity for good
+    // instead of being dropped once it had closed up to nothing. A closed window
+    // with its preview still in the menu, permanently, was this.
+    //
+    // Only once the menu is up: before that the entries' growth would happen behind a
+    // hidden surface, and opening one would just appear at full width.
+    let unsettled = menu
+        .entries
+        .borrow()
+        .values()
+        .any(|entry| !matches!(entry.motion.get(), Motion::Settled));
+    if (arrived || unsettled) && menu.shown.get() {
         kick_morph(menu);
     }
     relayout(menu);
@@ -2161,6 +2173,8 @@ struct ContextMenu {
     rows: GtkBox,
     /// The app it is open for, or none while it is closed.
     app: RefCell<Option<String>>,
+    /// Whether the app menu is up *or on its way out*. Only cleared once the fade has
+    /// finished, so nothing else can put another menu in the same place mid-fade.
     shown: Cell<bool>,
     animation: Rc<Cell<u64>>,
     /// Where the square that opened it is, so the menu can sit under it.
@@ -2372,20 +2386,34 @@ fn context_open(
 
 /// Take the context menu off screen, then let it go.
 fn context_close(context: &Rc<ContextMenu>) {
-    if !context.shown.replace(false) {
+    if !context.shown.get() {
         return;
     }
-    context.app.replace(None);
     // Whatever the pointer was last over, it is not over a menu that is no longer
     // there, so a close cannot be left scheduled against it.
     context.hover.inside.set(false);
     context.hover.token.set(context.hover.token.get().wrapping_add(1));
+    context.app.replace(None);
     let left = menu_left(
         context.icon_center.get(),
         context.bar_width.get(),
         context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
     );
+    let token = context.animation.get();
+    let fading = context.clone();
     animate_surface(&context.window, context.animation.clone(), false, left);
+    // `shown` is not cleared here. It is cleared when the fade lands, below, so that
+    // a hover arriving in the next 180ms cannot open the previews behind a menu that
+    // is still on screen — which is two surfaces in the same place, each closing the
+    // other.
+    glib::timeout_add_local(MENU_FADE, move || {
+        if fading.animation.get() != token {
+            // Superseded by a reopen.
+            return glib::ControlFlow::Break;
+        }
+        fading.shown.set(false);
+        glib::ControlFlow::Break
+    });
 }
 
 /// Close the context menu once the pointer has been off it for a moment.
@@ -2707,17 +2735,21 @@ button.task {{
 button.task:hover {{
     background-color: rgba(255, 255, 255, 0.10);
 }}
+/* Deliberately not dimmed. Minimized and closed are different things, and dimming
+   the square conflates them with a pinned app that has nothing open at all. */
 button.task.minimized {{
-    opacity: 0.45;
+    background-color: rgba(255, 255, 255, 0.04);
 }}
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
-/* The app menu, opened by a right click. Widgets rather than cairo, so it is
-   styled here like the rest of the panel. */
+/* The app menu, opened by a right click. Widgets, so it is styled here; the colours
+   are the preview menu's own, because two menus belonging to the same panel should
+   not be two different greys. The previews are cairo-drawn over whatever is behind
+   them at 35% black, so this is the same fill and the same edge — the same
+   transparency, not a different one that happens to look similar. */
 window.context {{
-    background-color: rgba(32, 32, 32, 0.92) !important;
-    background-image: none !important;
+    background-color: rgba(0, 0, 0, 0.35);
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
 }}
@@ -2725,26 +2757,22 @@ window.context {{
     padding: 4px;
 }}
 button.context-row {{
-    background: transparent !important;
-    background-image: none !important;
-    border: none !important;
-    box-shadow: none !important;
+    background: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
     padding: 7px 10px;
     border-radius: 7px;
     color: #e8e8e8;
     font-weight: 500;
 }}
-button.context-row label {{
-    color: #e8e8e8;
-    font-weight: 500;
-}}
 button.context-row:hover {{
-    background-color: rgba(255, 255, 255, 0.10) !important;
+    background-color: rgba(255, 255, 255, 0.10);
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
 button.context-row label {{
-    color: #e8e8e8 !important;
-    background: transparent !important;
+    color: #e8e8e8;
+    background: transparent;
 }}
 /* The app itself, which is the one row that is not a command. */
 button.context-row.app label {{
@@ -3209,7 +3237,9 @@ fn rebuild_tasks(
     // depends on the window count — one window is closed by name, several are closed
     // together, none means no row at all — so a window opened or closed underneath
     // it has to change what is on screen.
-    if let Some(key) = context.app.borrow().clone() {
+    // `shown` rather than `app`: the app key outlives the fade now, so refilling a
+    // menu that is on its way out would be work for nothing.
+    if let Some(key) = context.shown.get().then(|| context.app.borrow().clone()).flatten() {
         let group: Vec<WindowInfo> = groups
             .iter()
             .find(|(group_key, _)| *group_key == key)
@@ -4834,10 +4864,9 @@ mod tests {
         ] {
             assert!(sheet.contains(rule), "missing from the sheet: {rule}");
         }
-        // And the rules that decide it are not merely present but marked, because
-        // the theme carries its own button rules at the same priority.
-        assert!(sheet.contains("background: transparent !important;"));
-        assert!(sheet.contains("color: #e8e8e8 !important;"));
+        // And the two rules that decide how it looks, rather than just existing.
+        assert!(sheet.contains("background: transparent;"));
+        assert!(sheet.contains("color: #e8e8e8;"));
     }
 
     #[test]

@@ -514,8 +514,23 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        let spawned = Command::new(&program)
-            .args(&arguments)
+        let mut command = Command::new(&program);
+        command.args(&arguments);
+        // The app has to land on *this* compositor, not on whatever this process
+        // inherited. A nested session's compositor is itself a Wayland client of the
+        // one above it, so its `WAYLAND_DISPLAY` is the outer display and an app
+        // launched with it would open a window somewhere else entirely.
+        //
+        // Unless the entry sets one itself — `Exec=env WAYLAND_DISPLAY=foo app` is a
+        // thing people write, and overriding that would break it.
+        if !crate::desktop::split_command(&app.exec)
+            .iter()
+            .any(|word| word.starts_with("WAYLAND_DISPLAY="))
+            && let Some(socket_name) = self.socket_name.clone()
+        {
+            command.env("WAYLAND_DISPLAY", &socket_name);
+        }
+        let spawned = command
             // Nothing of ours on its standard streams: the app would otherwise
             // inherit this process's terminal and be killed with it.
             .stdin(Stdio::null())
