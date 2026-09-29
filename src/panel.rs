@@ -2716,7 +2716,8 @@ button.task.focused {{
 /* The app menu, opened by a right click. Widgets rather than cairo, so it is
    styled here like the rest of the panel. */
 window.context {{
-    background-color: rgba(32, 32, 32, 0.92);
+    background-color: rgba(32, 32, 32, 0.92) !important;
+    background-image: none !important;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
 }}
@@ -2724,18 +2725,26 @@ window.context {{
     padding: 4px;
 }}
 button.context-row {{
-    background: transparent;
-    border: none;
-    box-shadow: none;
+    background: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    box-shadow: none !important;
     padding: 7px 10px;
     border-radius: 7px;
+    color: #e8e8e8;
+    font-weight: 500;
 }}
 button.context-row label {{
     color: #e8e8e8;
     font-weight: 500;
 }}
 button.context-row:hover {{
-    background-color: rgba(255, 255, 255, 0.10);
+    background-color: rgba(255, 255, 255, 0.10) !important;
+}}
+/* The label is its own node, and the theme has an opinion about its colour. */
+button.context-row label {{
+    color: #e8e8e8 !important;
+    background: transparent !important;
 }}
 /* The app itself, which is the one row that is not a command. */
 button.context-row.app label {{
@@ -4806,6 +4815,29 @@ mod tests {
             assert!(!toggle_pin("editor"), "and again, unpinned");
             assert!(!is_pinned("editor"));
         });
+    }
+
+    #[test]
+    fn the_app_menus_own_rules_reach_the_stylesheet() {
+        // The app menu is widgets, so its whole look is this stylesheet, and there
+        // are two ways it can come out looking like whatever the desktop's theme
+        // does to buttons: the rules never reach the provider, or they reach it and
+        // lose. Which of the two it is, decides what to do next, so the first is
+        // pinned here and the second is left to be looked at.
+        let sheet = style_sheet((1, 2, 3));
+        for rule in [
+            "window.context {",
+            "button.context-row {",
+            "button.context-row:hover {",
+            "button.context-row label {",
+            ".context-rows {",
+        ] {
+            assert!(sheet.contains(rule), "missing from the sheet: {rule}");
+        }
+        // And the rules that decide it are not merely present but marked, because
+        // the theme carries its own button rules at the same priority.
+        assert!(sheet.contains("background: transparent !important;"));
+        assert!(sheet.contains("color: #e8e8e8 !important;"));
     }
 
     #[test]
