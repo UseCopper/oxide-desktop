@@ -2100,6 +2100,30 @@ fn menu_close(menu: &Rc<Menu>) {
     animate_menu(menu, false, left);
 }
 
+/// Take the preview menu off screen at once, with no animation.
+///
+/// For when something else is taking its place in the same spot. A fade here is 180ms
+/// of this surface and the next one overlapping, and two translucent menus on top of
+/// each other is worse than either on its own.
+fn menu_hide(menu: &Rc<Menu>) {
+    if menu.app.borrow().is_none() {
+        return;
+    }
+    menu.app.replace(None);
+    // A switch in flight is abandoned, as `menu_close` abandons it: its next tick
+    // would swap a set of entries in for an app that is no longer on show.
+    menu.switch.set(Switch::Idle);
+    menu.pending.borrow_mut().take();
+    menu.width_override.set(None);
+    menu.pointer.set(None);
+    menu.shown.set(false);
+    // Supersede anything already animating this surface, so a fade already in flight
+    // cannot run on and put it back.
+    menu.animation.set(menu.animation.get().wrapping_add(1));
+    menu.window.set_opacity(0.0);
+    menu.window.set_visible(false);
+}
+
 /// Slide the menu out of the bar, or back into it, while fading.
 ///
 /// Only the compositor-facing properties move. The surface is not resized and
@@ -2286,12 +2310,33 @@ fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
 /// there is anything to close and whether that is one window or all of them, and
 /// pinning is the panel's own state.
 fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
+    context_install(context, context_rows_for(context, key, windows));
+}
+
+/// Put a built set of rows on screen, replacing whatever was there.
+///
+/// Separate from building them because a move has to know how wide the incoming rows
+/// will be — to slide the menu to the right place — without showing them arriving
+/// early, underneath the outgoing app's menu.
+fn context_install(context: &Rc<ContextMenu>, rows: Vec<gtk4::Widget>) {
     while let Some(child) = context.rows.first_child() {
         context.rows.remove(&child);
     }
+    for row in rows {
+        context.rows.append(&row);
+    }
+}
+
+/// The rows for one app, built but not yet on screen.
+fn context_rows_for(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+) -> Vec<gtk4::Widget> {
     let Some(stream) = context.stream.borrow().clone() else {
-        return;
+        return Vec::new();
     };
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
 
     // The app itself, which starts a new instance even when it has windows open —
     // unlike the square in the bar, which brings the app forward. Two rows that do
@@ -2305,7 +2350,7 @@ fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
             send(&stream, &format!("launch\t{id}\n"));
             context_close(&owned);
         });
-        context.rows.append(&row);
+        rows.push(row.upcast());
     }
 
     match windows.len() {
@@ -2321,7 +2366,7 @@ fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
                 send(&stream, &format!("close\t{id}\n"));
                 context_close(&owned);
             });
-            context.rows.append(&row);
+            rows.push(row.upcast());
         }
         count if count > 1 => {
             // Every window it has, closed. Sent one at a time because the protocol
@@ -2337,7 +2382,7 @@ fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
                 }
                 context_close(&owned);
             });
-            context.rows.append(&row);
+            rows.push(row.upcast());
         }
         // Nothing open: there is nothing to close, so the row is not there at all.
         // A disabled one would be a dead square to aim at.
@@ -2363,15 +2408,23 @@ fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
             // And the bar, which has just gained or lost a square.
             rebuild_bar();
         });
-        context.rows.append(&row);
+        rows.push(row.upcast());
     }
+    rows
 }
 
-/// Put an open app menu on a different app, as the pointer moves along the bar.
+/// Move an open app menu onto a different app, as the pointer travels along the bar.
 ///
-/// No fade: the menu is already up, and re-running the reveal would take it off
-/// screen and put it back for every square the pointer crosses. Only the position
-/// changes, so only the margin is touched.
+/// The same shape as the previews' app switch, and for the same reason: two apps'
+/// rows have nothing in common, so anything that keeps the surface on screen across
+/// the exchange shows both at once. Fade out over what is there, exchange, fade back
+/// in — and slide to the square the pointer is on, which
+/// [`animate_surface`] cannot do because an open and a close have nowhere to slide
+/// to.
+///
+/// The incoming rows are built up front but *not* installed: the width they will want
+/// is what the slide is aimed at, and installing them before the fade out would show
+/// the new app's rows sitting there under the outgoing app's menu.
 fn context_move(
     context: &Rc<ContextMenu>,
     key: &str,
@@ -2379,23 +2432,118 @@ fn context_move(
     button: &Button,
 ) {
     let (icon_center, bar_width) = icon_metrics(button);
+    let from_left = context.window.margin(Edge::Left);
+    let rows = context_rows_for(context, key, windows);
+    let to_left = menu_left(
+        icon_center,
+        bar_width,
+        measure_rows(context, &rows),
+    );
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: context move to {key:?}, {} windows, {from_left} to {to_left}",
+            windows.len()
+        );
+    }
+
+    // The app key is the new one from here: the fade out belongs to the transition, and
+    // a landing that finds a different key under it has been superseded by another
+    // square crossed.
+    context.app.replace(Some(key.to_string()));
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
-    context.app.replace(Some(key.to_string()));
-    context_fill(context, key, windows);
-    if menu_debug() {
-        eprintln!("oxide-panel: context move to {key:?}, {} windows", windows.len());
-    }
-    // The width is whatever the new app's rows just measured to, so the margin is
-    // recomputed from that rather than from the old one.
-    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
-    context
-        .window
-        .set_margin(Edge::Left, menu_left(icon_center, bar_width, width));
-    // And the hover clock starts over, so the grace period is measured from arriving
-    // here rather than from whenever the menu happened to open.
+    // The hover clock starts over, so the grace period is measured from arriving here
+    // rather than from whenever the menu happened to open.
     context.hover.inside.set(true);
     context.hover.token.set(context.hover.token.get().wrapping_add(1));
+
+    let token = context_ease(context, 1.0, 0.0, from_left, to_left);
+    let landing = context.clone();
+    // Behind an Option because the timer may be called again before it breaks, and
+    // the rows cannot be given away twice.
+    let mut incoming: Option<Vec<gtk4::Widget>> = Some(rows);
+    glib::timeout_add_local(MENU_FADE, move || {
+        let Some(rows) = incoming.take() else {
+            return glib::ControlFlow::Break;
+        };
+        // Superseded: another square crossed, or the menu closed underneath.
+        if landing.animation.get() != token || !landing.shown.get() {
+            return glib::ControlFlow::Break;
+        }
+        context_install(&landing, rows);
+        // Straight back up, from wherever the slide had got to.
+        let _ = context_ease(&landing, 0.0, 1.0, to_left, to_left);
+        glib::ControlFlow::Break
+    });
+}
+
+/// How wide a set of rows wants the menu to be.
+///
+/// The rows are not in the box yet, so they are measured by putting them in, asking,
+/// and taking them out again. Doing it the other way round — installing first and
+/// fading afterwards — is what showed the incoming app's rows under the outgoing
+/// app's menu, which is the thing this is all about not doing.
+fn measure_rows(context: &Rc<ContextMenu>, rows: &[gtk4::Widget]) -> i32 {
+    if rows.is_empty() {
+        return context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
+    }
+    // Measured in a box of their own rather than by installing them and asking. A
+    // widget has one parent, so they are parented to the scratch box, measured, and
+    // unparented again — and crucially the real box is never touched, because the
+    // whole point is that the outgoing app's rows are what the fade out is over.
+    let scratch = GtkBox::new(Orientation::Vertical, 2);
+    for row in rows {
+        scratch.append(row);
+    }
+    let width = scratch.measure(gtk4::Orientation::Horizontal, -1).1;
+    for row in rows {
+        scratch.remove(row);
+    }
+    width
+}
+
+/// Fade the app menu between two opacities while sliding it from one x to another.
+///
+/// The one thing [`animate_surface`] does not do, which a move needs.
+fn context_ease(
+    context: &Rc<ContextMenu>,
+    from_opacity: f64,
+    to_opacity: f64,
+    from_left: i32,
+    to_left: i32,
+) -> u64 {
+    let context = context.clone();
+    context.animation.set(context.animation.get().wrapping_add(1));
+    let token = context.animation.get();
+    let start = glib::monotonic_time();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if context.animation.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+        let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        // The same ease the reveal uses, so a move feels like this menu arriving
+        // rather than some other one.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        context
+            .window
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+        context
+            .window
+            .set_margin(Edge::Left, ease_margin(from_left, to_left, eased));
+        if t < 1.0 {
+            return glib::ControlFlow::Continue;
+        }
+        context.window.set_opacity(to_opacity);
+        context.window.set_margin(Edge::Left, to_left);
+        glib::ControlFlow::Break
+    });
+    token
+}
+
+/// Where the menu's left edge is at this point of a slide.
+fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
+    (f64::from(from) + (f64::from(to) - f64::from(from)) * f).round() as i32
 }
 
 /// Open the app menu for an app, or move an open one onto it.
@@ -3705,9 +3853,11 @@ fn app_button(
         #[upgrade_or]
         return,
         move |_, _, _, _| {
-            // The previews are not wanted here, and leaving one up behind the app
-            // menu would put two surfaces in the same place.
-            menu_close(&right_menu);
+            // The previews are replaced, not faded out from under. The app menu goes
+            // up in the same place a frame later, and a preview menu still fading out
+            // beneath it is two surfaces in the same place — which is what "the menu
+            // just opens over it" was. Cut, and let the app menu do the fading.
+            menu_hide(&right_menu);
             // A second right click on the same square closes it, as a second left
             // click on the previews does.
             if context.shown.get()
@@ -4958,6 +5108,24 @@ mod tests {
         // The mini-CSD is the same fill as the cell it is drawn in, so a preview is
         // one surface rather than a cell with a second background under its title.
         assert_eq!(TITLEBAR_FILL, CELL_FILL);
+    }
+
+    #[test]
+    fn a_moving_menu_slides_from_where_it_was_to_where_it_is_going() {
+        // A move eases the left margin, which `animate_surface` cannot do because an
+        // open and a close have nowhere to slide to.
+        assert_eq!(ease_margin(100, 400, 0.0), 100);
+        assert_eq!(ease_margin(100, 400, 1.0), 400);
+        // Halfway is halfway: this is the lerp, and the easing is the caller's, so
+        // that a move and the reveal can share the same curve without this one
+        // knowing what it is for.
+        assert_eq!(ease_margin(100, 400, 0.5), 250);
+        assert_eq!(ease_margin(100, 400, 0.25), 175);
+        // And it works backwards, for a menu that has to go left.
+        assert_eq!(ease_margin(400, 100, 0.0), 400);
+        assert_eq!(ease_margin(400, 100, 1.0), 100);
+        // Landed exactly on the end, so no residue is left behind.
+        assert_eq!(ease_margin(7, 7, 0.3), 7);
     }
 
     #[test]
