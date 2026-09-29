@@ -1742,7 +1742,15 @@ fn menu_open(
     menu.icon_center.set(icon_center);
     menu.bar_width.set(bar_width);
     menu.app.replace(Some(key.to_string()));
-    menu_replace(menu, &[], group, Some(stream));
+    // The whole snapshot, not just this app's windows. With an empty list every
+    // entry left over from the app that was on show before looked like a window that
+    // had gone, and was animated out *inside* the menu that had just opened — so
+    // hovering from one app to another left the previous app's previews sitting in
+    // the row beside the new one's, until the switch had finished and something
+    // rebuilt it.
+    let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
+    let all: Vec<&WindowInfo> = snapshot.iter().collect();
+    menu_replace(menu, &all, group, Some(stream));
     relayout(menu);
     menu_reveal(menu, false);
     arm_reveal_fallback(menu);
@@ -2207,7 +2215,6 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor) -> Rc<ContextMe
         stream: RefCell::new(None),
         hover: Rc::new(Hover::default()),
     });
-    watch_context_hover(&context);
     context
 }
 
@@ -2338,6 +2345,19 @@ fn context_open(
     *context.stream.borrow_mut() = Some(stream.clone());
     context.app.replace(Some(key.to_string()));
     context_fill(context, key, windows);
+    if menu_debug() {
+        let mut count = 0;
+        let mut child = context.rows.first_child();
+        while child.is_some() {
+            count += 1;
+            child = child.and_then(|widget| widget.next_sibling());
+        }
+        let rows = count;
+        eprintln!(
+            "oxide-panel: context open {key:?} with {} windows, {rows} rows",
+            windows.len()
+        );
+    }
     context.shown.set(true);
     context.window.present();
     // Under the square, measured from the rows that were just built. Measured rather
@@ -2373,9 +2393,16 @@ fn context_close(context: &Rc<ContextMenu>) {
 /// The same treatment the preview menu gets, and for the same reason: the pointer
 /// has to cross the bar to reach the menu, so a leave on one surface is not the
 /// pointer leaving both.
-fn watch_context_hover(context: &Rc<ContextMenu>) {
+fn watch_context_hover(context: &Rc<ContextMenu>, bar_row: &GtkBox) {
     let context = context.clone();
-    let rows = context.rows.clone().upcast::<gtk4::Widget>();
+    // The bar as well as the menu, and for the same reason the preview menu watches
+    // both: the pointer has to cross the bar to reach the menu, so a leave on one is
+    // not the pointer leaving both. Without the bar here, walking back up to the bar
+    // left the app menu on screen with nothing to dismiss it but another right click.
+    let widgets: Vec<gtk4::Widget> =
+        vec![bar_row.clone().upcast(), context.rows.clone().upcast()];
+    for rows in widgets {
+    let context = context.clone();
     let motion = gtk4::EventControllerMotion::new();
 
     let on_move = context.hover.clone();
@@ -2410,6 +2437,13 @@ fn watch_context_hover(context: &Rc<ContextMenu>) {
     });
 
     rows.add_controller(motion);
+    }
+}
+
+thread_local! {
+    /// The last snapshot, for the paths that are handed one app's windows and still
+    /// need to know what else exists.
+    static SNAPSHOT: RefCell<Vec<WindowInfo>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -2494,6 +2528,12 @@ fn toggle_pin(id: &str) -> bool {
     // Both ways, not just pinning: an unpin that did not outlive the next restart
     // would pin the app again for no reason.
     save_layout();
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: {} {id:?}",
+            if pinned { "pinned" } else { "unpinned" }
+        );
+    }
     pinned
 }
 
@@ -2878,6 +2918,8 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
     // The app menu, opened by a right click. A third surface for the same reason
     // the menu is a second: an unpainted region of a surface still takes clicks.
     let context = build_context_menu(app, &monitor);
+    // Watching needs the bar, so it is wired here rather than at the build.
+    watch_context_hover(&context, &bar_row);
     let hover = Rc::new(Hover::default());
 
     // Squares can be dragged along the bar to reorder them. The drag carries the app
@@ -3068,6 +3110,7 @@ fn rebuild_tasks(
 ) {
     // Remembered before anything else, so a rebuild asked for by the panel's own
     // state — a pin, an unpin — can be served without waiting for a snapshot.
+    SNAPSHOT.with(|cell| *cell.borrow_mut() = windows.to_vec());
     LAST_BAR.with(|cell| {
         *cell.borrow_mut() = Some((
             tasks.clone(),
@@ -3229,7 +3272,11 @@ fn watch_reorder(tasks: &GtkBox) {
             // is nothing to remember about it between runs.
             return false;
         }
-        place_at(&id, drop_index(&row, x));
+        let index = drop_index(&row, x);
+        place_at(&id, index);
+        if menu_debug() {
+            eprintln!("oxide-panel: dropped {id:?} at {index}");
+        }
         // The bar is rebuilt on an idle rather than here: this runs inside the drop,
         // while the square being dragged is still on screen, and taking the widgets
         // out from under it mid-gesture loses the drag.
@@ -3367,6 +3414,7 @@ fn app_button(
         let hover_key = key.to_string();
         let hover_group: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
         let hover_stream = stream.clone();
+        let hover_context = context.clone();
         // Shared with the timeout, so leaving the square or moving to another one
         // cancels the open that was about to happen.
         let token = Rc::new(Cell::new(0u64));
@@ -3379,8 +3427,26 @@ fn app_button(
             let group = hover_group.clone();
             let stream = hover_stream.clone();
             let button = button.clone();
+            let context = hover_context.clone();
             move |_, _, _| {
                 if group.is_empty() {
+                    return;
+                }
+                // One menu at a time. A right click puts the app menu up, and
+                // hovering a square after that must not open the previews on top of
+                // it — two surfaces in the same place, fighting over the pointer.
+                if context.shown.get() {
+                    return;
+                }
+                // Already following the pointer along the bar: come across at once.
+                // The delay below is for *opening* a menu, and a quarter of a second
+                // to move from one square to the next, with the menu open the whole
+                // time, made the bar feel broken.
+                if menu.shown.get() {
+                    if menu.app.borrow().as_deref() != Some(key.as_str()) {
+                        let group: Vec<&WindowInfo> = group.iter().collect();
+                        menu_open(&menu, &key, &group, &button, &stream);
+                    }
                     return;
                 }
                 let ticket = on_enter.get().wrapping_add(1);
@@ -3438,6 +3504,8 @@ fn app_button(
     // The token is copied in first, because the release handler and the drag below
     // share it and a closure that moved it would leave them holding a moved value.
     let press_here = press.clone();
+    // Two copies, one per closure below.
+    let (press_context, release_context) = (context.clone(), context.clone());
     // The release handler needs the same handles, and a closure that took them would
     // leave it holding moved values.
     let (rel_stream, rel_key, rel_menu) = (stream.clone(), key.clone(), menu.clone());
@@ -3456,12 +3524,19 @@ fn app_button(
             let owned = owned.clone();
             let button = button.clone();
             let press_here = press_here.clone();
+            let context = press_context.clone();
             glib::timeout_add_local(CLICK_ARM, move || {
                 if press_here.get() != ticket {
                     // Released already, or a drag took this press instead.
                     return glib::ControlFlow::Break;
                 }
                 press_here.set(press_here.get().wrapping_add(1));
+                // One menu at a time: the app menu is up, so this click dismisses it
+                // rather than opening the previews behind it.
+                if context.shown.get() {
+                    context_close(&context);
+                    return glib::ControlFlow::Break;
+                }
                 activate(&stream, &key, &owned, &menu, &button, multiple);
                 glib::ControlFlow::Break
             });
@@ -3472,6 +3547,10 @@ fn app_button(
         gesture.connect_released(move |_, _, _, _| {
             let ticket = press.get().wrapping_add(1);
             press.set(ticket);
+            if release_context.shown.get() {
+                context_close(&release_context);
+                return;
+            }
             activate(
                 &rel_stream,
                 &rel_key,
