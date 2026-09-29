@@ -2073,6 +2073,28 @@ fn menu_close(menu: &Rc<Menu>) {
 /// nothing inside it is re-laid-out, so the pointer stays where it was and the
 /// menu does not flicker.
 fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
+    if showing {
+        menu.window.present();
+    }
+    let animation = Rc::new(Cell::new(menu.animation.get()));
+    animate_surface(&menu.window, animation, showing, left);
+}
+
+/// Slide a surface out of the bar, or back into it, while fading.
+///
+/// Shared by the preview menu and the context menu so that both arrive and leave the
+/// same way. Only the compositor-facing properties move: a surface is not resized and
+/// nothing inside it is re-laid-out, so a pointer resting on one of them stays where
+/// it is and the surface does not flicker.
+///
+/// `token` is the caller's own counter, so a second animation on the same surface
+/// supersedes the first.
+fn animate_surface(
+    window: &gtk4::Window,
+    token_cell: Rc<Cell<u64>>,
+    showing: bool,
+    left: i32,
+) {
     let (from_opacity, to_opacity) = if showing { (0.0f64, 1.0f64) } else { (1.0, 0.0) };
     let resting = PANEL_HEIGHT;
     // Starts tucked up under the bar and slides down into place, so it reads as
@@ -2083,22 +2105,17 @@ fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
         (resting, resting - MENU_SLIDE)
     };
 
-    let window = &menu.window;
     window.set_margin(Edge::Left, left);
-    if showing {
-        window.present();
-    }
     // Supersede whatever animation was running: a close that is still sliding out
-    // would otherwise finish and hide the menu that has just been reopened.
-    menu.animation.set(menu.animation.get() + 1);
-    let token = menu.animation.get();
-    let menu = menu.clone();
+    // would otherwise finish and hide the surface that has just been reopened.
+    token_cell.set(token_cell.get().wrapping_add(1));
+    let token = token_cell.get();
+    let window = window.clone();
     let start = glib::monotonic_time();
     glib::timeout_add_local(Duration::from_millis(16), move || {
-        if menu.animation.get() != token {
+        if token_cell.get() != token {
             return glib::ControlFlow::Break;
         }
-        let window = &menu.window;
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
         // Ease out cubic: quick off the mark, then asymptotic to the target.
@@ -2877,7 +2894,7 @@ fn resolve_icon(app_id: &str) -> String {
     }
 
     let mut candidates = Vec::new();
-    if let Some(icon) = desktop_icon(app_id) {
+    if let Some(icon) = crate::desktop::cached(app_id).map(|app| app.icon) {
         candidates.push(icon);
     }
     candidates.push(app_id.to_string());
@@ -2901,102 +2918,6 @@ fn resolve_icon(app_id: &str) -> String {
         }
     }
     FALLBACK_ICON.to_string()
-}
-
-thread_local! {
-    /// Desktop-file id -> `Icon=` value, loaded once from the XDG data dirs.
-    static DESKTOP_ICONS: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };
-}
-
-fn desktop_icon(app_id: &str) -> Option<String> {
-    DESKTOP_ICONS.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        let icons = cache.get_or_insert_with(load_desktop_icons);
-        icons
-            .get(app_id)
-            .or_else(|| icons.get(&app_id.to_lowercase()))
-            .cloned()
-    })
-}
-
-/// Build the desktop-file id -> icon map from every XDG applications dir.
-/// Earlier dirs win, matching the freedesktop lookup order.
-fn load_desktop_icons() -> HashMap<String, String> {
-    let mut icons = HashMap::new();
-    for dir in application_dirs() {
-        collect_desktop_icons(&dir, &dir, &mut icons);
-    }
-    icons
-}
-
-fn application_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        dirs.push(PathBuf::from(data_home).join("applications"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    let data_dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    for dir in data_dirs.split(':').filter(|dir| !dir.is_empty()) {
-        dirs.push(PathBuf::from(dir).join("applications"));
-    }
-    dirs
-}
-
-fn collect_desktop_icons(root: &Path, dir: &Path, icons: &mut HashMap<String, String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_desktop_icons(root, &path, icons);
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let id = relative.to_string_lossy().replace('/', "-");
-        let id = id.strip_suffix(".desktop").unwrap_or(&id).to_string();
-        if icons.contains_key(&id) {
-            continue;
-        }
-        if let Some(icon) = desktop_file_icon(&path) {
-            icons.entry(id.clone()).or_insert_with(|| icon.clone());
-            icons.entry(id.to_lowercase()).or_insert(icon);
-        }
-    }
-}
-
-/// Read the `Icon=` key from a desktop file's `[Desktop Entry]` group.
-fn desktop_file_icon(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut in_entry = false;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            in_entry = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_entry {
-            continue;
-        }
-        // Ignore localized keys like `Icon[de]=...`.
-        if let Some(value) = line.strip_prefix("Icon=") {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Parse a `list\t<count>\t<id>\t<focused>\t<app_id>\t<title>...` line.
@@ -4015,26 +3936,32 @@ mod tests {
 
     #[test]
     fn reads_icon_from_desktop_entry() {
-        let path = std::env::temp_dir().join(format!("oxide-panel-{}.desktop", std::process::id()));
-        std::fs::write(
-            &path,
-            "[Desktop Entry]\nName=Foo\nIcon[de]=lokal\nIcon=foo-icon\n",
+        // The panel asks for an app's icon every time it rebuilds the bar, and a
+        // localised `Icon[de]` winning would put a German icon in an English panel.
+        let app = crate::desktop::parse_entry(
+            "konsole",
+            "[Desktop Entry]\nName=Konsole\nIcon=konsole\nIcon[de]=konsole-de\nExec=konsole\nType=Application\n",
         )
-        .unwrap();
-        assert_eq!(desktop_file_icon(&path).as_deref(), Some("foo-icon"));
-        let _ = std::fs::remove_file(&path);
+        .expect("an entry");
+        assert_eq!(app.icon, "konsole");
     }
 
     #[test]
     fn maps_nested_desktop_files_to_ids() {
+        // Entries are grouped in subdirectories in the wild. The id a client sends is
+        // the file name, not a flattened path, so a nested entry is found by the name
+        // inside it rather than under a name invented from the directory it is in.
         let dir = std::env::temp_dir().join(format!("oxide-panel-dirs-{}", std::process::id()));
-        let nested = dir.join("sub");
+        let nested = dir.join("kde4");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("foo.desktop"), "[Desktop Entry]\nIcon=foo\n").unwrap();
+        std::fs::write(
+            nested.join("konsole.desktop"),
+            "[Desktop Entry]\nName=Konsole\nExec=konsole\nType=Application\n",
+        )
+        .unwrap();
 
-        let mut icons = HashMap::new();
-        collect_desktop_icons(&dir, &dir, &mut icons);
-        assert_eq!(icons.get("sub-foo").map(String::as_str), Some("foo"));
+        let app = crate::desktop::lookup_in(&dir, "konsole");
+        assert_eq!(app.map(|app| app.label().to_string()), Some("Konsole".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

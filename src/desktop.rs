@@ -17,7 +17,8 @@
 //! application.
 
 use std::{
-    collections::HashSet,
+    cell::RefCell,
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
@@ -143,88 +144,98 @@ pub fn lookup(id: &str) -> Option<DesktopApp> {
         return None;
     }
     for name in candidate_names(id) {
-        if let Some(app) = find_file(id, &search_dirs(), &name, 0) {
+        if let Some(app) = find_file(id, &search_dirs(), &name) {
             return Some(app);
         }
     }
     None
 }
 
-/// Every app with a visible desktop entry, in the order the directories are searched.
+thread_local! {
+    /// What each app id resolved to, so a bar rebuilt on every snapshot does not
+    /// read the filesystem once per square per snapshot.
+    static MEMO: RefCell<HashMap<String, Option<DesktopApp>>> = RefCell::new(HashMap::new());
+}
+
+/// [`lookup`], remembered per id.
 ///
-/// This is what a "pin an app" list has to be built from: the panel can only offer to
-/// pin an app it knows how to start.
-pub fn installed() -> Vec<DesktopApp> {
-    let mut seen = HashSet::new();
-    let mut apps = Vec::new();
-    for dir in search_dirs() {
-        collect(&dir, &mut apps, &mut seen, 0);
+/// The panel asks for an app's icon and name every time it rebuilds the bar, which
+/// is every snapshot, and the answer cannot change while the process runs in any way
+/// that matters — an entry is installed or it is not. An app installed while the
+/// panel is up is picked up by [`forget`], which the panel calls when the set of app
+/// ids it has not seen before appears.
+pub fn cached(id: &str) -> Option<DesktopApp> {
+    if !is_app_id(id) {
+        return None;
     }
-    apps
+    MEMO.with(|memo| memo.borrow().get(id).cloned().flatten())
+        .or_else(|| {
+            let app = lookup(id);
+            MEMO.with(|memo| {
+                memo.borrow_mut().insert(id.to_string(), app.clone());
+            });
+            app
+        })
 }
 
-fn collect(dir: &Path, apps: &mut Vec<DesktopApp>, seen: &mut HashSet<String>, depth: u32) {
-    // Entries are grouped in subdirectories in the wild (`kde4/`, `gnome/`), so this
-    // goes a little way into them. Bounded, because a search that can walk a whole
-    // filesystem is a search that can hang the panel.
-    const MAX_DEPTH: u32 = 2;
-    let Ok(children) = std::fs::read_dir(dir) else {
-        return;
-    };
-    // Sorted, so the order of apps in a menu is the same on every run rather than
-    // whatever order the filesystem happened to hand back.
-    let mut paths: Vec<PathBuf> = children.filter_map(|child| child.ok().map(|c| c.path())).collect();
-    paths.sort();
-    for path in paths {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if path.is_dir() {
-            if depth < MAX_DEPTH {
-                collect(&path, apps, seen, depth + 1);
-            }
-            continue;
-        }
-        if !name.ends_with(".desktop") {
-            continue;
-        }
-        let id = name.trim_end_matches(".desktop");
-        if !seen.insert(id.to_string()) {
-            continue;
-        }
-        if let Some(app) = read_entry(id, &path) {
-            apps.push(app);
-        }
-    }
+/// Drop what is remembered, so an app installed since the last lookup is found.
+pub fn forget() {
+    MEMO.with(|memo| memo.borrow_mut().clear());
 }
 
-/// Look for one file name across the search path, and the shallow subdirectories of
-/// each, and read it if it is there.
-fn find_file(id: &str, dirs: &[PathBuf], name: &str, depth: u32) -> Option<DesktopApp> {
-    const MAX_DEPTH: u32 = 2;
-    for dir in dirs {
-        let path = dir.join(name);
-        if path.is_file()
-            && let Some(app) = read_entry(id, &path)
-        {
+/// Look an id up under one directory only, and the subdirectories below it.
+///
+/// [`lookup`] is over the whole search path; this is the same search with the path
+/// given, so an entry in a directory of the caller's choosing can be resolved without
+/// touching the process's environment.
+pub fn lookup_in(dir: &Path, id: &str) -> Option<DesktopApp> {
+    if !is_app_id(id) {
+        return None;
+    }
+    for name in candidate_names(id) {
+        if let Some(app) = find_file(id, &[dir.to_path_buf()], &name) {
             return Some(app);
-        }
-        if depth >= MAX_DEPTH {
-            continue;
-        }
-        let Ok(children) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> =
-            children.filter_map(|child| child.ok().map(|c| c.path())).collect();
-        paths.sort();
-        for path in paths {
-            if path.is_dir() && find_file(id, dirs, name, depth + 1).is_some() {
-                return find_file(id, dirs, name, depth + 1);
-            }
         }
     }
     None
+}
+
+/// Find a file of this name anywhere in the search path, or in a subdirectory of one.
+///
+/// Each directory is searched on its own terms, and the subdirectories of it after
+/// that. Recursing over the whole list again at each level would only re-find what
+/// the top-level pass already looked at, and would never reach the entry that is
+/// actually in `kde4/`.
+fn find_file(id: &str, dirs: &[PathBuf], name: &str) -> Option<DesktopApp> {
+    dirs.iter().find_map(|dir| find_in_dir(id, dir, name, 0))
+}
+
+fn find_in_dir(id: &str, dir: &Path, name: &str, depth: u32) -> Option<DesktopApp> {
+    // Bounded, because a search that can walk a filesystem is a search that can hang
+    // the panel. Two levels is where `kde4/` and `gnome/` live.
+    const MAX_DEPTH: u32 = 2;
+    let path = dir.join(name);
+    if path.is_file()
+        && let Some(app) = read_entry(id, &path)
+    {
+        return Some(app);
+    }
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+    let Ok(children) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    // Sorted, so which entry wins where two directories hold the same name is the
+    // same on every run.
+    let mut subdirs: Vec<PathBuf> = children
+        .filter_map(|child| child.ok().map(|c| c.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort();
+    subdirs
+        .iter()
+        .find_map(|subdir| find_in_dir(id, subdir, name, depth + 1))
 }
 
 /// Read one desktop entry, if it is an application that wants to be shown.
@@ -487,6 +498,18 @@ Icon=document-new
         let app = parse("konsole", KONSOLE);
         assert_eq!(app.name, "Konsole");
     }
+
+    #[test]
+    fn a_translated_icon_is_not_the_apps_icon() {
+        // The panel asks for an app's icon every time it rebuilds the bar, so a
+        // localised `Icon[de]` winning would put a German icon in an English panel.
+        let app = parse(
+            "konsole",
+            "[Desktop Entry]\nName=Konsole\nIcon=konsole\nIcon[de]=konsole-de\nExec=konsole\nType=Application\n",
+        );
+        assert_eq!(app.icon, "konsole");
+    }
+
 
     #[test]
     fn a_name_from_another_group_is_not_the_apps_name() {
