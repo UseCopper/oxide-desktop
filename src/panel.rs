@@ -2457,7 +2457,9 @@ fn context_move(
     context.hover.inside.set(true);
     context.hover.token.set(context.hover.token.get().wrapping_add(1));
 
-    let token = context_ease(context, 1.0, 0.0, from_left, to_left);
+    // The top does not move during a move — it is already out of the bar.
+    let top = PANEL_HEIGHT;
+    let token = context_ease(context, 1.0, 0.0, from_left, to_left, top, top);
     let landing = context.clone();
     // Behind an Option because the timer may be called again before it breaks, and
     // the rows cannot be given away twice.
@@ -2472,7 +2474,7 @@ fn context_move(
         }
         context_install(&landing, rows);
         // Straight back up, from wherever the slide had got to.
-        let _ = context_ease(&landing, 0.0, 1.0, to_left, to_left);
+        let _ = context_ease(&landing, 0.0, 1.0, to_left, to_left, top, top);
         glib::ControlFlow::Break
     });
 }
@@ -2502,15 +2504,25 @@ fn measure_rows(context: &Rc<ContextMenu>, rows: &[gtk4::Widget]) -> i32 {
     width
 }
 
-/// Fade the app menu between two opacities while sliding it from one x to another.
+/// Move the app menu: its rows fade while the panel they sit in does not.
 ///
-/// The one thing [`animate_surface`] does not do, which a move needs.
+/// The one thing [`animate_surface`] does not do, which a move needs: that eases the
+/// *window's* opacity and the top margin, and sets the left one outright, because an
+/// open and a close have nowhere to slide to. A move has two squares between them.
+///
+/// The rows are what fade, and the window's opacity is not touched at all. Fading the
+/// window took the panel with it, so the menu dissolved as a whole and the surface
+/// was plainly there and gone; this keeps the menu and fades everything in it, which
+/// is what a panel whose contents change should look like.
+#[allow(clippy::too_many_arguments)]
 fn context_ease(
     context: &Rc<ContextMenu>,
-    from_opacity: f64,
-    to_opacity: f64,
+    from_rows: f64,
+    to_rows: f64,
     from_left: i32,
     to_left: i32,
+    from_top: i32,
+    to_top: i32,
 ) -> u64 {
     let context = context.clone();
     context.animation.set(context.animation.get().wrapping_add(1));
@@ -2526,16 +2538,20 @@ fn context_ease(
         // rather than some other one.
         let eased = 1.0 - (1.0 - t).powi(3);
         context
-            .window
-            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+            .rows
+            .set_opacity(from_rows + (to_rows - from_rows) * eased);
         context
             .window
             .set_margin(Edge::Left, ease_margin(from_left, to_left, eased));
+        context
+            .window
+            .set_margin(Edge::Top, ease_margin(from_top, to_top, eased));
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
-        context.window.set_opacity(to_opacity);
+        context.rows.set_opacity(to_rows);
         context.window.set_margin(Edge::Left, to_left);
+        context.window.set_margin(Edge::Top, to_top);
         glib::ControlFlow::Break
     });
     token
@@ -2575,14 +2591,31 @@ fn context_open(
     }
     context.shown.set(true);
     context.window.present();
+    // The panel is up before anything fades and never fades; only the rows do. Fading
+    // the window took the menu with it, so the surface was plainly there and gone
+    // rather than a panel whose contents arrived in it.
+    context.window.set_opacity(1.0);
+    context.rows.set_opacity(0.0);
     // Under the square, measured from the rows that were just built. Measured rather
     // than waited for: a surface that has not been mapped has no width yet, and by
     // the time it does the menu has been in the wrong place.
-    let (_, natural, _, _) = context
-        .rows
-        .measure(gtk4::Orientation::Horizontal, -1);
-    let left = menu_left(icon_center, bar_width, natural);
-    animate_surface(&context.window, context.animation.clone(), true, left);
+    let left = menu_left(
+        icon_center,
+        bar_width,
+        context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
+    );
+    // And the slide out of the bar, which `animate_surface` would have done along
+    // with the window's opacity.
+    let resting = PANEL_HEIGHT;
+    let _ = context_ease(
+        context,
+        0.0,
+        1.0,
+        left,
+        left,
+        resting - MENU_SLIDE,
+        resting,
+    );
 }
 
 /// Take the context menu off screen, then let it go.
@@ -2601,17 +2634,28 @@ fn context_close(context: &Rc<ContextMenu>) {
         context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
     );
     let fading = context.clone();
-    // The token this animation is tagged with, from the call that started it.
-    let token = animate_surface(&context.window, context.animation.clone(), false, left);
-    // `shown` is not cleared here. It is cleared when the fade lands, below, so that
-    // a hover arriving in the next 180ms cannot open the previews behind a menu that
-    // is still on screen — which is two surfaces in the same place, each closing the
-    // other.
+    // The rows fade and the panel slides back up into the bar; the window's own
+    // opacity is not touched, because the panel is not what is leaving.
+    let resting = PANEL_HEIGHT;
+    let token = context_ease(
+        context,
+        1.0,
+        0.0,
+        left,
+        left,
+        resting,
+        resting - MENU_SLIDE,
+    );
+    // `shown` is not cleared here. It is cleared when the fade lands, so that a hover
+    // arriving in the next 180ms cannot put the previews into a menu that is still on
+    // screen.
     glib::timeout_add_local(MENU_FADE, move || {
         if fading.animation.get() != token {
             // Superseded by a reopen.
             return glib::ControlFlow::Break;
         }
+        // Now it really is gone: the surface itself, not just its contents.
+        fading.window.set_visible(false);
         fading.shown.set(false);
         glib::ControlFlow::Break
     });
@@ -2951,6 +2995,11 @@ button.task.focused {{
    transparency, not a different one that happens to look similar. */
 window.context {{
     background-color: rgba(0, 0, 0, 0.35);
+    /* The theme paints a window background *image* — a shadow, and on some themes a
+       fill of its own — on top of the background colour, which is what made this
+       menu read as a more solid panel than the previews even though the two are the
+       same 35% black. Told to stop, and the colour is the whole of it. */
+    background-image: none;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
 }}
@@ -3711,12 +3760,24 @@ fn app_button(
                 let stream = stream.clone();
                 let button = button.clone();
                 let token = on_enter.clone();
+                let context = context.clone();
                 glib::timeout_add_local(HOVER_OPEN, move || {
                     if token.get() != ticket {
                         // Left, or moved to another square, before it was due.
                         return glib::ControlFlow::Break;
                     }
                     if menu.app.borrow().as_deref() == Some(key.as_str()) {
+                        return glib::ControlFlow::Break;
+                    }
+                    // An app menu is up. Checked *here* and not only where the timer
+                    // was armed: the pointer can arrive on a square, and be right
+                    // clicked, inside the quarter of a second before this fires — and
+                    // then this opened the previews straight over the app menu that
+                    // the right click had just put there.
+                    if context.shown.get() {
+                        if context.app.borrow().as_deref() != Some(key.as_str()) {
+                            context_move(&context, &key, &group, &button);
+                        }
                         return glib::ControlFlow::Break;
                     }
                     let group: Vec<&WindowInfo> = group.iter().collect();
@@ -5103,6 +5164,13 @@ mod tests {
         assert!(
             rule.contains("rgba(0, 0, 0, 0.35)"),
             "the app menu is not the previews' fill: {rule}"
+        );
+        // And nothing painted over the top of it. The theme's window background image
+        // is the difference between "the same 35% black" and "a more solid panel than
+        // the previews", and it is invisible in a stylesheet.
+        assert!(
+            rule.contains("background-image: none"),
+            "the theme's window background is back over the app menu's fill: {rule}"
         );
         assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         // The mini-CSD is the same fill as the cell it is drawn in, so a preview is
