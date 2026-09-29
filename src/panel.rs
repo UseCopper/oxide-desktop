@@ -2433,13 +2433,13 @@ thread_local! {
     /// The panel's own state: pinning an app keeps its square in the bar when it has
     /// no windows, and the order is where the squares sit, which a snapshot says
     /// nothing about.
-    static LAYOUT: RefCell<Layout> = RefCell::new(Layout {
-        pinned: HashSet::new(),
-        order: Vec::new(),
-    });
+    ///
+    /// Read from disk on the way to the first bar, and written back whenever it
+    /// changes, so a pin lasts past a restart instead of lasting until one.
+    static LAYOUT: RefCell<Layout> = RefCell::new(read_layout());
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Layout {
     /// Apps whose square stays in the bar whether or not they have windows.
     pinned: HashSet<String>,
@@ -2448,20 +2448,47 @@ struct Layout {
     order: Vec<String>,
 }
 
+impl From<crate::panel_conf::PanelLayout> for Layout {
+    fn from(saved: crate::panel_conf::PanelLayout) -> Self {
+        Self {
+            pinned: saved.pinned,
+            order: saved.order,
+        }
+    }
+}
+
+fn read_layout() -> Layout {
+    crate::panel_conf::load().into()
+}
+
+/// Write the layout back out. Best effort: a preference that could not be saved is
+/// better than a bar that will not build.
+fn save_layout() {
+    let layout = LAYOUT.with(|layout| layout.borrow().clone());
+    crate::panel_conf::save(&crate::panel_conf::PanelLayout {
+        order: layout.order,
+        pinned: layout.pinned,
+    });
+}
+
 fn is_pinned(id: &str) -> bool {
     LAYOUT.with(|layout| layout.borrow().pinned.contains(id))
 }
 
 /// Pin or unpin an app, and say which it ended up as.
 fn toggle_pin(id: &str) -> bool {
-    LAYOUT.with(|layout| {
+    let pinned = LAYOUT.with(|layout| {
         let mut layout = layout.borrow_mut();
         if !layout.pinned.insert(id.to_string()) {
             layout.pinned.remove(id);
             return false;
         }
         true
-    })
+    });
+    // Both ways, not just pinning: an unpin that did not outlive the next restart
+    // would pin the app again for no reason.
+    save_layout();
+    pinned
 }
 
 /// The apps pinned to the bar that have nothing open, and so need a square built for
@@ -4450,12 +4477,7 @@ mod tests {
 
     /// The ordering state is process-wide, so each of these starts from empty.
     fn with_empty_layout(body: impl FnOnce()) {
-        LAYOUT.with(|layout| {
-            *layout.borrow_mut() = Layout {
-                pinned: HashSet::new(),
-                order: Vec::new(),
-            };
-        });
+        LAYOUT.with(|layout| *layout.borrow_mut() = Layout::default());
         body();
     }
 

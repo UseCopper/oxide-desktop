@@ -15,6 +15,7 @@ pub mod input_handler;
 #[cfg(feature = "libei")]
 pub mod libei;
 pub mod panel;
+pub mod panel_conf;
 pub mod panel_ipc;
 pub mod render;
 pub mod shell;
