@@ -181,6 +181,9 @@ const MENU_EDGE_GAP: i32 = 8;
 /// How long the pointer must be outside both the bar and the menu before the
 /// menu closes. Long enough to cover the gap while crossing between them.
 const HOVER_GRACE: Duration = Duration::from_millis(400);
+/// How long the pointer must rest on a square before its menu opens. Long enough
+/// that travelling along the bar does not open a menu for every square crossed.
+const HOVER_OPEN: Duration = Duration::from_millis(250);
 /// How long to wait for every preview before showing the menu anyway.
 ///
 /// Short: a window with nothing committed, or a buffer the renderer will not
@@ -2732,15 +2735,28 @@ fn app_button(
     column.append(&dots);
     button.set_child(Some(&column));
 
-    // Hovering a square moves the menu to that app, so the pointer can travel along
-    // the bar and the menu follows it. Only while a menu is up, and only onto a
-    // different app: otherwise this would open one on the way past.
+    // Hovering a square opens that app's menu, and moves an open one to the app
+    // under the pointer, so travelling along the bar moves the menu with it.
+    //
+    // After a moment, not immediately. A square that opened its menu on the pointer
+    // arriving would open one for every square the pointer crossed on the way to
+    // somewhere, and the last of those would be the only one left standing.
+    //
+    // Any number of windows, including one. A lone window used to open nothing here
+    // and had to be clicked to be seen at all, which made an app that keeps a single
+    // window — a chat client in a tray, a browser with one tab — the one app in the
+    // bar with nothing to show for it.
     {
         let hover_menu = menu.clone();
         let hover_key = key.to_string();
         let hover_group: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
         let hover_stream = stream.clone();
+        // Shared with the timeout, so leaving the square or moving to another one
+        // cancels the open that was about to happen.
+        let token = Rc::new(Cell::new(0u64));
         let hover = gtk4::EventControllerMotion::new();
+
+        let on_enter = token.clone();
         hover.connect_enter({
             let menu = hover_menu.clone();
             let key = hover_key.clone();
@@ -2748,16 +2764,35 @@ fn app_button(
             let stream = hover_stream.clone();
             let button = button.clone();
             move |_, _, _| {
-                if !menu.shown.get() || group.len() < 2 {
+                if group.is_empty() {
                     return;
                 }
-                if menu.app.borrow().as_deref() == Some(key.as_str()) {
-                    return;
-                }
-                // Only the windows on screen, as everywhere else the menu is filled.
-                let group: Vec<&WindowInfo> = group.iter().collect();
-                menu_open(&menu, &key, &group, &button, &stream);
+                let ticket = on_enter.get().wrapping_add(1);
+                on_enter.set(ticket);
+                let menu = menu.clone();
+                let key = key.clone();
+                let group = group.clone();
+                let stream = stream.clone();
+                let button = button.clone();
+                let token = on_enter.clone();
+                glib::timeout_add_local(HOVER_OPEN, move || {
+                    if token.get() != ticket {
+                        // Left, or moved to another square, before it was due.
+                        return glib::ControlFlow::Break;
+                    }
+                    if menu.app.borrow().as_deref() == Some(key.as_str()) {
+                        return glib::ControlFlow::Break;
+                    }
+                    let group: Vec<&WindowInfo> = group.iter().collect();
+                    menu_open(&menu, &key, &group, &button, &stream);
+                    glib::ControlFlow::Break
+                });
             }
+        });
+
+        let on_leave = token.clone();
+        hover.connect_leave(move |_| {
+            on_leave.set(on_leave.get().wrapping_add(1));
         });
         button.add_controller(hover);
     }
