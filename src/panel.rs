@@ -126,7 +126,14 @@ const MENU_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.16);
 const CELL_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.35);
 const CELL_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
 const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
-const TITLEBAR_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.07);
+/// The mini-CSD's strip, in the same fill as the cell it sits in.
+///
+/// It was a 7% white wash, which made one preview two greys and put the app menu —
+/// now 35% black like the cell — on a footing the previews themselves were not. The
+/// strip is now the same transparency as everything else, so a cell reads as one
+/// surface; the title and the close square are told apart by the border and the text
+/// rather than by a second background under them.
+const TITLEBAR_FILL: (f64, f64, f64, f64) = CELL_FILL;
 const CLOSE_IDLE: (f64, f64, f64) = (0.55, 0.55, 0.55);
 const CLOSE_HOVER: (f64, f64, f64) = (1.0, 1.0, 1.0);
 const CLOSE_HOVER_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
@@ -2103,7 +2110,9 @@ fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
         menu.window.present();
     }
     let animation = Rc::new(Cell::new(menu.animation.get()));
-    animate_surface(&menu.window, animation, showing, left);
+    let landed = animate_surface(&menu.window, animation, showing, left);
+    // Kept in step, so a later call through `animate_menu` still supersedes this one.
+    menu.animation.set(landed);
 }
 
 /// Slide a surface out of the bar, or back into it, while fading.
@@ -2120,7 +2129,7 @@ fn animate_surface(
     token_cell: Rc<Cell<u64>>,
     showing: bool,
     left: i32,
-) {
+) -> u64 {
     let (from_opacity, to_opacity) = if showing { (0.0f64, 1.0f64) } else { (1.0, 0.0) };
     let resting = PANEL_HEIGHT;
     // Starts tucked up under the bar and slides down into place, so it reads as
@@ -2136,6 +2145,11 @@ fn animate_surface(
     // would otherwise finish and hide the surface that has just been reopened.
     token_cell.set(token_cell.get().wrapping_add(1));
     let token = token_cell.get();
+    // Handed back so a caller can tell when *this* animation lands. Reading the
+    // counter itself before calling this is a trap: the counter is bumped here, so
+    // the value a caller read a line earlier is already stale, and anything that
+    // waits for `counter == what_i_read` waits for ever.
+    let landed = token;
     let window = window.clone();
     let start = glib::monotonic_time();
     glib::timeout_add_local(Duration::from_millis(16), move || {
@@ -2159,6 +2173,7 @@ fn animate_surface(
         }
         glib::ControlFlow::Break
     });
+    landed
 }
 
 // ---------------------------------------------------------------- context menu
@@ -2399,9 +2414,9 @@ fn context_close(context: &Rc<ContextMenu>) {
         context.bar_width.get(),
         context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
     );
-    let token = context.animation.get();
     let fading = context.clone();
-    animate_surface(&context.window, context.animation.clone(), false, left);
+    // The token this animation is tagged with, from the call that started it.
+    let token = animate_surface(&context.window, context.animation.clone(), false, left);
     // `shown` is not cleared here. It is cleared when the fade lands, below, so that
     // a hover arriving in the next 180ms cannot open the previews behind a menu that
     // is still on screen — which is two surfaces in the same place, each closing the
@@ -4845,6 +4860,52 @@ mod tests {
             assert!(!toggle_pin("editor"), "and again, unpinned");
             assert!(!is_pinned("editor"));
         });
+    }
+
+    #[test]
+    fn an_animation_hands_back_the_token_it_is_tagged_with() {
+        // The counter is bumped inside the animation, so anything that reads it
+        // beforehand and waits for that value is waiting for a number that has
+        // already gone past. That is not hypothetical: the app menu read it before
+        // starting its fade, so the flag that says it is up was never cleared, and
+        // the previews could never be opened again for the rest of the session.
+        let cell = Rc::new(Cell::new(0u64));
+        let landed = animate_surface_stub(&cell);
+        assert_eq!(cell.get(), landed, "the counter is where the caller left it");
+        assert!(
+            landed > 0,
+            "and it moved, so a value read before the call is not the tag"
+        );
+    }
+
+    /// Just the bookkeeping half of `animate_surface`: take the next token and hand
+    /// it back, which is the part with the trap in it. The window is not needed for
+    /// the arithmetic, and a test that builds a layer surface needs a display.
+    fn animate_surface_stub(token_cell: &Rc<Cell<u64>>) -> u64 {
+        token_cell.set(token_cell.get().wrapping_add(1));
+        token_cell.get()
+    }
+
+    #[test]
+    fn the_previews_and_the_app_menu_are_the_same_fill() {
+        // Two menus belonging to one panel should not be two different greys, and
+        // the previews are cairo-drawn, so they are the fixed point: the stylesheet
+        // is the thing that has to match them. Both are 35% black over whatever is
+        // behind them.
+        let sheet = style_sheet((1, 2, 3));
+        let rule = sheet
+            .split("window.context {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("a rule for the app menu");
+        assert!(
+            rule.contains("rgba(0, 0, 0, 0.35)"),
+            "the app menu is not the previews' fill: {rule}"
+        );
+        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
+        // The mini-CSD is the same fill as the cell it is drawn in, so a preview is
+        // one surface rather than a cell with a second background under its title.
+        assert_eq!(TITLEBAR_FILL, CELL_FILL);
     }
 
     #[test]
