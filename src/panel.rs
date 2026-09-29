@@ -2460,12 +2460,54 @@ fn toggle_pin(id: &str) -> bool {
             layout.pinned.remove(id);
             return false;
         }
-        // Newly pinned: it goes at the end of the order until it is dragged
-        // somewhere, so a pin never silently moves a square that was already there.
-        if !layout.order.iter().any(|entry| entry == id) {
-            layout.order.push(id.to_string());
-        }
         true
+    })
+}
+
+/// The apps pinned to the bar that have nothing open, and so need a square built for
+/// them out of nothing but the pin.
+///
+/// A pinned app is meant to be somewhere to start it from. An app with no windows has
+/// no group of its own in a snapshot, so without this there would be nothing in the
+/// bar to unpin it from either.
+fn pinned_without_windows(groups: &[(String, Vec<&WindowInfo>)]) -> Vec<String> {
+    LAYOUT.with(|layout| {
+        let layout = layout.borrow();
+        layout
+            .pinned
+            .iter()
+            .filter(|id| !groups.iter().any(|(key, _)| key == *id))
+            .filter(|id| crate::desktop::is_app_id(id))
+            .cloned()
+            .collect()
+    })
+}
+
+/// Where each of `keys` goes in the bar, as an index into `keys`.
+///
+/// Every app is remembered the first time it is seen, and from then on the bar is in
+/// that remembered order. A snapshot says which apps are open and nothing about where
+/// their squares belong, so taking its order as the bar's would shuffle the bar
+/// whenever a window opened or closed — most visibly when an app started up, put
+/// itself last, and pushed everything else along.
+fn arrange(keys: &[String]) -> Vec<usize> {
+    LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        for key in keys {
+            if !layout.order.iter().any(|entry| entry == key) {
+                layout.order.push(key.clone());
+            }
+        }
+        let position = |key: &String| {
+            layout
+                .order
+                .iter()
+                .position(|entry| entry == key)
+                .unwrap_or(usize::MAX)
+        };
+        let mut out: Vec<usize> = (0..keys.len()).collect();
+        out.sort_by_key(|index| position(&keys[*index]));
+        out
     })
 }
 
@@ -3001,8 +3043,8 @@ fn rebuild_tasks(
         tasks.remove(&child);
     }
 
-    // Group the windows by app, keeping first-seen order. Windows with no app
-    // id get a key of their own so they don't all collapse together.
+    // Group the windows by app. Windows with no app id get a key of their own so
+    // they don't all collapse together.
     let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
     for info in windows {
         let key = if info.app_id.is_empty() {
@@ -3015,6 +3057,22 @@ fn rebuild_tasks(
             None => groups.push((key, vec![info])),
         }
     }
+
+    // A pinned app with nothing open gets a square of its own, so there is somewhere
+    // in the bar to start it from — and somewhere to unpin it from.
+    for id in pinned_without_windows(&groups) {
+        groups.push((id, Vec::new()));
+    }
+
+    // And the bar goes in the order the panel remembers, not the order the snapshot
+    // happened to list the apps in.
+    let keys: Vec<String> = groups.iter().map(|(key, _)| key.clone()).collect();
+    let positions = arrange(&keys);
+    let mut ordered: Vec<(String, Vec<&WindowInfo>)> = Vec::with_capacity(groups.len());
+    for index in positions {
+        ordered.push(groups[index].clone());
+    }
+    let groups = ordered;
 
     // An open menu is kept in step with every snapshot, *including* one where its
     // app has no windows left. Skipping that case — or closing the menu outright on
@@ -3106,12 +3164,15 @@ fn app_button(
     let focused = windows.iter().any(|window| window.focused);
     // Only when every one of the app's windows is minimized, so the square says the
     // app is there but not on screen rather than implying anything about the others.
-    let minimized = windows.iter().all(|window| window.minimized);
+    let minimized = !windows.is_empty() && windows.iter().all(|window| window.minimized);
     let count = windows.len();
+    // A pinned app with nothing open. Its square is here to be started from, so it
+    // is not "minimized" — there is no window of its own to have been minimized.
+    let idle = count == 0;
 
     let button = Button::new();
     button.add_css_class("task");
-    if minimized {
+    if minimized || idle {
         button.add_css_class("minimized");
     }
     if focused {
@@ -3122,7 +3183,12 @@ fn app_button(
     button.set_halign(gtk4::Align::Center);
     button.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
 
+    // A square with nothing behind it names the app rather than counting windows it
+    // does not have.
     let tooltip = match count {
+        0 => crate::desktop::cached(key)
+            .map(|app| app.label().to_string())
+            .unwrap_or_else(|| "Not running".to_string()),
         1 => window_title(windows[0]),
         _ => format!("{count} windows"),
     };
@@ -3242,7 +3308,14 @@ fn app_button(
         return,
         move |_, _, _, _| {
             if !multiple {
-                send(&stream, &format!("focus\t{}\n", owned[0].id));
+                match owned.first() {
+                    // Nothing open: the square is a pinned app's, and it starts it.
+                    // There is no window to bring forward, so focusing is not an
+                    // option — `owned[0]` here used to be a panic waiting for the
+                    // first pinned app with nothing running.
+                    None => send(&stream, &format!("launch\t{key}\n")),
+                    Some(window) => send(&stream, &format!("focus\t{}\n", window.id)),
+                }
                 return;
             }
             // A second click on the same square closes it, rather than rebuilding
@@ -4373,6 +4446,81 @@ mod tests {
             );
             assert!(color.alpha() > 0.0);
         }
+    }
+
+    /// The ordering state is process-wide, so each of these starts from empty.
+    fn with_empty_layout(body: impl FnOnce()) {
+        LAYOUT.with(|layout| {
+            *layout.borrow_mut() = Layout {
+                pinned: HashSet::new(),
+                order: Vec::new(),
+            };
+        });
+        body();
+    }
+
+    #[test]
+    fn a_snapshot_does_not_shuffle_the_bar() {
+        with_empty_layout(|| {
+            // Three apps, in the order the first snapshot listed them.
+            let keys: Vec<String> = ["alpha", "beta", "gamma"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            assert_eq!(arrange(&keys), [0, 1, 2]);
+
+            // A new snapshot, with an app started and listed first. The bar must not
+            // move: the newcomer goes at the end, and nothing else shifts.
+            let keys: Vec<String> = ["gamma", "delta", "alpha", "beta"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            assert_eq!(arrange(&keys), [2, 3, 0, 1]);
+        });
+    }
+
+    #[test]
+    fn an_app_that_leaves_comes_back_to_the_same_place() {
+        with_empty_layout(|| {
+            let keys: Vec<String> = ["a", "b", "c"].iter().map(|k| k.to_string()).collect();
+            arrange(&keys);
+            // `b` closes, so it is not in the snapshot, and the others close up.
+            let keys: Vec<String> = ["a", "c"].iter().map(|k| k.to_string()).collect();
+            assert_eq!(arrange(&keys), [0, 1]);
+            // It comes back, and goes where it was rather than at the end.
+            let keys: Vec<String> = ["a", "b", "c"].iter().map(|k| k.to_string()).collect();
+            assert_eq!(arrange(&keys), [0, 1, 2]);
+        });
+    }
+
+    #[test]
+    fn a_pinned_app_with_nothing_open_still_gets_a_square() {
+        with_empty_layout(|| {
+            LAYOUT.with(|layout| {
+                layout.borrow_mut().pinned.insert("editor".to_string());
+                layout.borrow_mut().pinned.insert("#17".to_string());
+            });
+            // The only app with windows is the browser, and one window has no app id.
+            let groups: Vec<(String, Vec<&WindowInfo>)> =
+                vec![("browser".to_string(), Vec::new()), ("#17".to_string(), Vec::new())];
+            let mut missing = pinned_without_windows(&groups);
+            missing.sort();
+            // The editor is missing a square and needs one. The `#17` key is not an
+            // app — it is one window with no app id — so there is nothing to pin and
+            // nothing to start.
+            assert_eq!(missing, ["editor"]);
+        });
+    }
+
+    #[test]
+    fn pinning_is_a_toggle() {
+        with_empty_layout(|| {
+            assert!(!is_pinned("editor"));
+            assert!(toggle_pin("editor"), "pinning says it ended up pinned");
+            assert!(is_pinned("editor"));
+            assert!(!toggle_pin("editor"), "and again, unpinned");
+            assert!(!is_pinned("editor"));
+        });
     }
 
     #[test]
