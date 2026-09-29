@@ -2135,6 +2135,340 @@ fn animate_surface(
     });
 }
 
+// ---------------------------------------------------------------- context menu
+
+/// What a right click on a square offers: the app itself, and what to do with it.
+///
+/// Not a second preview menu. Choosing between an app's windows is a left click, or
+/// a hover; this is for the things a picker cannot do — start the app again, close
+/// everything it has open, and keep it in the bar when it has nothing open.
+struct ContextMenu {
+    window: gtk4::Window,
+    rows: GtkBox,
+    /// The app it is open for, or none while it is closed.
+    app: RefCell<Option<String>>,
+    shown: Cell<bool>,
+    animation: Rc<Cell<u64>>,
+    /// Where the square that opened it is, so the menu can sit under it.
+    icon_center: Cell<i32>,
+    bar_width: Cell<i32>,
+    stream: RefCell<Option<Rc<UnixStream>>>,
+    hover: Rc<Hover>,
+}
+
+/// The icon each row is drawn with.
+///
+/// Symbolic names from the icon theme, so they follow the desktop's theme rather
+/// than being drawn here. A name the installed theme does not have simply shows
+/// nothing, which is why each row's label is never an icon alone.
+const ICON_CLOSE_ONE: &str = "window-close-symbolic";
+const ICON_CLOSE_ALL: &str = "edit-clear-all-symbolic";
+const ICON_PIN: &str = "starred-symbolic";
+const ICON_UNPIN: &str = "list-remove-symbolic";
+
+fn build_context_menu(app: &Application, monitor: &gdk::Monitor) -> Rc<ContextMenu> {
+    let window = gtk4::Window::builder().application(app).build();
+    window.set_decorated(false);
+    window.add_css_class("panel-window");
+    window.add_css_class("context");
+    window.init_layer_shell();
+    // The same namespace as the preview menu, so a compositor that hides panels by
+    // namespace treats the two alike.
+    window.set_namespace(Some("oxide-panel-menu"));
+    window.set_layer(Layer::Top);
+    window.set_monitor(Some(monitor));
+    window.set_anchor(Edge::Top, true);
+    window.set_anchor(Edge::Left, true);
+    window.set_margin(Edge::Top, PANEL_HEIGHT);
+    window.set_exclusive_zone(-1);
+    window.set_opacity(0.0);
+
+    // Real widgets rather than the cairo the preview menu is drawn with. These rows
+    // are text and icons, which is what widgets are for, and they get the icon
+    // theme, hover states and ellipsising for nothing.
+    let rows = GtkBox::new(Orientation::Vertical, 2);
+    rows.add_css_class("context-rows");
+    window.set_child(Some(&rows));
+
+    let context = Rc::new(ContextMenu {
+        window,
+        rows,
+        app: RefCell::new(None),
+        shown: Cell::new(false),
+        animation: Rc::new(Cell::new(0)),
+        icon_center: Cell::new(0),
+        bar_width: Cell::new(0),
+        stream: RefCell::new(None),
+        hover: Rc::new(Hover::default()),
+    });
+    watch_context_hover(&context);
+    context
+}
+
+/// One row of the context menu: an icon and a label, in a button.
+fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
+    let row = gtk4::Button::new();
+    row.add_css_class("context-row");
+    if emphasis {
+        row.add_css_class("app");
+    }
+    row.set_has_frame(false);
+
+    let icon = gtk4::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(ICON_SIZE);
+    let text = gtk4::Label::new(Some(label));
+    text.set_xalign(0.0);
+    // The row is as wide as its widest label, and a name can be long; this is where
+    // it gets shortened rather than pushing the menu off the edge of the output.
+    text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    text.set_max_width_chars(28);
+
+    let content = GtkBox::new(Orientation::Horizontal, 10);
+    content.append(&icon);
+    content.append(&text);
+    row.set_child(Some(&content));
+    row
+}
+
+/// Empty the context menu and build it for one app.
+///
+/// Refilled from scratch on every snapshot rather than patched, because what it
+/// offers depends on things that change under it: the window count decides whether
+/// there is anything to close and whether that is one window or all of them, and
+/// pinning is the panel's own state.
+fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
+    while let Some(child) = context.rows.first_child() {
+        context.rows.remove(&child);
+    }
+    let Some(stream) = context.stream.borrow().clone() else {
+        return;
+    };
+
+    // The app itself, which starts a new instance even when it has windows open —
+    // unlike the square in the bar, which brings the app forward. Two rows that do
+    // opposite things have to be told apart, and this is the one that is not obvious.
+    if let Some(app) = crate::desktop::cached(key) {
+        let row = context_row(&resolve_icon(key), app.label(), true);
+        let id = key.to_string();
+        let stream = stream.clone();
+        let owned = context.clone();
+        row.connect_clicked(move |_| {
+            send(&stream, &format!("launch\t{id}\n"));
+            context_close(&owned);
+        });
+        context.rows.append(&row);
+    }
+
+    match windows.len() {
+        // One window is closed by name, so a right click on an app with a single
+        // window cannot close some other window of the same app that has since
+        // opened behind it.
+        1 => {
+            let id = windows[0].id;
+            let row = context_row(ICON_CLOSE_ONE, "Close window", false);
+            let owned = context.clone();
+            let stream = stream.clone();
+            row.connect_clicked(move |_| {
+                send(&stream, &format!("close\t{id}\n"));
+                context_close(&owned);
+            });
+            context.rows.append(&row);
+        }
+        count if count > 1 => {
+            // Every window it has, closed. Sent one at a time because the protocol
+            // closes one window per message and has no "close this app" in it.
+            let ids: Vec<u64> = windows.iter().map(|info| info.id).collect();
+            let label = format!("Close all {} windows", count);
+            let row = context_row(ICON_CLOSE_ALL, &label, false);
+            let owned = context.clone();
+            let stream = stream.clone();
+            row.connect_clicked(move |_| {
+                for id in &ids {
+                    send(&stream, &format!("close\t{id}\n"));
+                }
+                context_close(&owned);
+            });
+            context.rows.append(&row);
+        }
+        // Nothing open: there is nothing to close, so the row is not there at all.
+        // A disabled one would be a dead square to aim at.
+        _ => {}
+    }
+
+    if crate::desktop::is_app_id(key) {
+        let (label, icon_name) = if is_pinned(key) {
+            ("Unpin from panel", ICON_UNPIN)
+        } else {
+            ("Pin to panel", ICON_PIN)
+        };
+        let row = context_row(icon_name, label, false);
+        let id = key.to_string();
+        // The windows are kept so the menu can refill itself: the row's own label
+        // and icon are what just changed, and rebuilding it needs to know how many
+        // windows this app has to offer closing.
+        let held: Vec<WindowInfo> = windows.to_vec();
+        let owned = context.clone();
+        row.connect_clicked(move |_| {
+            toggle_pin(&id);
+            context_fill(&owned, &id, &held);
+            // And the bar, which has just gained or lost a square.
+            rebuild_bar();
+        });
+        context.rows.append(&row);
+    }
+}
+
+/// Open the context menu for an app, or move an open one onto it.
+fn context_open(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    button: &Button,
+    stream: &Rc<UnixStream>,
+) {
+    let (icon_center, bar_width) = icon_metrics(button);
+    context.icon_center.set(icon_center);
+    context.bar_width.set(bar_width);
+    *context.stream.borrow_mut() = Some(stream.clone());
+    context.app.replace(Some(key.to_string()));
+    context_fill(context, key, windows);
+    context.shown.set(true);
+    context.window.present();
+    // Under the square, measured from the rows that were just built. Measured rather
+    // than waited for: a surface that has not been mapped has no width yet, and by
+    // the time it does the menu has been in the wrong place.
+    let (_, natural, _, _) = context
+        .rows
+        .measure(gtk4::Orientation::Horizontal, -1);
+    let left = menu_left(icon_center, bar_width, natural);
+    animate_surface(&context.window, context.animation.clone(), true, left);
+}
+
+/// Take the context menu off screen, then let it go.
+fn context_close(context: &Rc<ContextMenu>) {
+    if !context.shown.replace(false) {
+        return;
+    }
+    context.app.replace(None);
+    // Whatever the pointer was last over, it is not over a menu that is no longer
+    // there, so a close cannot be left scheduled against it.
+    context.hover.inside.set(false);
+    context.hover.token.set(context.hover.token.get().wrapping_add(1));
+    let left = menu_left(
+        context.icon_center.get(),
+        context.bar_width.get(),
+        context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
+    );
+    animate_surface(&context.window, context.animation.clone(), false, left);
+}
+
+/// Close the context menu once the pointer has been off it for a moment.
+///
+/// The same treatment the preview menu gets, and for the same reason: the pointer
+/// has to cross the bar to reach the menu, so a leave on one surface is not the
+/// pointer leaving both.
+fn watch_context_hover(context: &Rc<ContextMenu>) {
+    let context = context.clone();
+    let rows = context.rows.clone().upcast::<gtk4::Widget>();
+    let motion = gtk4::EventControllerMotion::new();
+
+    let on_move = context.hover.clone();
+    motion.connect_motion(move |_, _, _| {
+        on_move.inside.set(true);
+        on_move.token.set(on_move.token.get().wrapping_add(1));
+    });
+    let on_enter = context.hover.clone();
+    motion.connect_enter(move |_, _, _| {
+        on_enter.inside.set(true);
+        on_enter.token.set(on_enter.token.get().wrapping_add(1));
+    });
+
+    let on_leave = context.hover.clone();
+    motion.connect_leave(move |_| {
+        on_leave.inside.set(false);
+        let token = on_leave.token.get().wrapping_add(1);
+        on_leave.token.set(token);
+        let context = context.clone();
+        glib::timeout_add_local(HOVER_GRACE, move || {
+            if context.hover.token.get() != token {
+                return glib::ControlFlow::Break;
+            }
+            // A surface being resized under a stationary pointer is handed a leave,
+            // and the next resize hands it another. So while it is still moving, the
+            // close waits: the pointer has not gone anywhere, the surface has.
+            if context.shown.get() && !context.hover.inside.get() {
+                context_close(&context);
+            }
+            glib::ControlFlow::Break
+        });
+    });
+
+    rows.add_controller(motion);
+}
+
+thread_local! {
+    /// The last thing the bar was built from, so it can be built again without
+    /// waiting for a snapshot.
+    ///
+    /// Pinning is the panel's own state, not the compositor's: nothing in the window
+    /// list changes when an app is pinned, so there is no snapshot coming to rebuild
+    /// the bar with. Without this the square a pin adds would not appear until
+    /// something else happened to move a window.
+    static LAST_BAR: RefCell<Option<(GtkBox, Rc<Menu>, Vec<WindowInfo>, Rc<UnixStream>, Rc<ContextMenu>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Build the bar again from the last snapshot.
+fn rebuild_bar() {
+    let state = LAST_BAR.with(|cell| cell.borrow().clone());
+    let Some((tasks, menu, windows, stream, context)) = state else {
+        return;
+    };
+    rebuild_tasks(&tasks, &menu, &windows, &stream, &context);
+}
+
+thread_local! {
+    /// The apps pinned to the bar, and the order the bar is in.
+    ///
+    /// The panel's own state: pinning an app keeps its square in the bar when it has
+    /// no windows, and the order is where the squares sit, which a snapshot says
+    /// nothing about.
+    static LAYOUT: RefCell<Layout> = RefCell::new(Layout {
+        pinned: HashSet::new(),
+        order: Vec::new(),
+    });
+}
+
+#[derive(Clone)]
+struct Layout {
+    /// Apps whose square stays in the bar whether or not they have windows.
+    pinned: HashSet<String>,
+    /// The bar's order, as app ids. An app not named here goes after the ones that
+    /// are, in the order the snapshot gave.
+    order: Vec<String>,
+}
+
+fn is_pinned(id: &str) -> bool {
+    LAYOUT.with(|layout| layout.borrow().pinned.contains(id))
+}
+
+/// Pin or unpin an app, and say which it ended up as.
+fn toggle_pin(id: &str) -> bool {
+    LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        if !layout.pinned.insert(id.to_string()) {
+            layout.pinned.remove(id);
+            return false;
+        }
+        // Newly pinned: it goes at the end of the order until it is dragged
+        // somewhere, so a pin never silently moves a square that was already there.
+        if !layout.order.iter().any(|entry| entry == id) {
+            layout.order.push(id.to_string());
+        }
+        true
+    })
+}
+
 // ---------------------------------------------------------------- hover to close
 
 /// Whether the pointer is over the bar or the menu, and a token so a deferred
@@ -2263,6 +2597,34 @@ button.task.minimized {{
 }}
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
+}}
+/* The app menu, opened by a right click. Widgets rather than cairo, so it is
+   styled here like the rest of the panel. */
+window.context {{
+    background-color: rgba(32, 32, 32, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+}}
+.context-rows {{
+    padding: 4px;
+}}
+button.context-row {{
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 7px 10px;
+    border-radius: 7px;
+}}
+button.context-row label {{
+    color: #e8e8e8;
+    font-weight: 500;
+}}
+button.context-row:hover {{
+    background-color: rgba(255, 255, 255, 0.10);
+}}
+/* The app itself, which is the one row that is not a command. */
+button.context-row.app label {{
+    font-weight: 700;
 }}
 "
     )
@@ -2438,6 +2800,9 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
     let (bar, bar_row, tasks) = build_bar_window(app, &monitor);
     let menu = build_menu(app, &monitor, stream.clone());
     *menu.stream.borrow_mut() = stream.clone();
+    // The app menu, opened by a right click. A third surface for the same reason
+    // the menu is a second: an unpainted region of a surface still takes clicks.
+    let context = build_context_menu(app, &monitor);
     let hover = Rc::new(Hover::default());
 
     // Hover-out closes the menu. The pointer has to cross the bar to reach the
@@ -2447,7 +2812,7 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
 
     if let Some(stream) = stream {
         send_accent(&stream);
-        start_polling(&tasks, &menu, stream, hover);
+        start_polling(&tasks, &menu, stream, hover, &context);
     }
 
     bar.present();
@@ -2518,8 +2883,15 @@ fn send_accent(stream: &Rc<UnixStream>) {
 
 /// Drain the compositor socket, rebuilding the task list on every snapshot and
 /// keeping the newest preview for each window.
-fn start_polling(tasks: &GtkBox, menu: &Rc<Menu>, stream: Rc<UnixStream>, _hover: Rc<Hover>) {
+fn start_polling(
+    tasks: &GtkBox,
+    menu: &Rc<Menu>,
+    stream: Rc<UnixStream>,
+    _hover: Rc<Hover>,
+    context: &Rc<ContextMenu>,
+) {
     let tasks = tasks.clone();
+    let context = context.clone();
     let reader = RefCell::new(PanelReader::default());
     let windows = Rc::new(RefCell::new(Vec::<WindowInfo>::new()));
     // Both timers below need this state, so hand each its own handle.
@@ -2544,7 +2916,7 @@ fn start_polling(tasks: &GtkBox, menu: &Rc<Menu>, stream: Rc<UnixStream>, _hover
             match event {
                 PanelEvent::Snapshot(list) => {
                     windows.replace(list.clone());
-                    rebuild_tasks(&tasks, &menu, &list, &stream);
+                    rebuild_tasks(&tasks, &menu, &list, &stream, &context);
                 }
                 PanelEvent::Image {
                     id,
@@ -2607,7 +2979,24 @@ fn icon_metrics(button: &Button) -> (i32, i32) {
 }
 
 /// Rebuild the icon row, and keep any open menu in step with it.
-fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Rc<UnixStream>) {
+fn rebuild_tasks(
+    tasks: &GtkBox,
+    menu: &Rc<Menu>,
+    windows: &[WindowInfo],
+    stream: &Rc<UnixStream>,
+    context: &Rc<ContextMenu>,
+) {
+    // Remembered before anything else, so a rebuild asked for by the panel's own
+    // state — a pin, an unpin — can be served without waiting for a snapshot.
+    LAST_BAR.with(|cell| {
+        *cell.borrow_mut() = Some((
+            tasks.clone(),
+            menu.clone(),
+            windows.to_vec(),
+            stream.clone(),
+            context.clone(),
+        ));
+    });
     while let Some(child) = tasks.first_child() {
         tasks.remove(&child);
     }
@@ -2668,6 +3057,19 @@ fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream
         }
     }
 
+    // An open app menu is kept in step with the new snapshot too. What it offers
+    // depends on the window count — one window is closed by name, several are closed
+    // together, none means no row at all — so a window opened or closed underneath
+    // it has to change what is on screen.
+    if let Some(key) = context.app.borrow().clone() {
+        let group: Vec<WindowInfo> = groups
+            .iter()
+            .find(|(group_key, _)| *group_key == key)
+            .map(|(_, group)| group.iter().map(|info| (*info).clone()).collect())
+            .unwrap_or_default();
+        context_fill(context, &key, &group);
+    }
+
     for (key, group) in &groups {
         let app_id = if key.starts_with('#') { "" } else { key.as_str() };
         let multiple = group.len() > 1;
@@ -2678,6 +3080,7 @@ fn rebuild_tasks(tasks: &GtkBox, menu: &Rc<Menu>, windows: &[WindowInfo], stream
             multiple,
             key,
             menu,
+            context,
         );
         tasks.append(&button);
     }
@@ -2698,6 +3101,7 @@ fn app_button(
     multiple: bool,
     key: &str,
     menu: &Rc<Menu>,
+    context: &Rc<ContextMenu>,
 ) -> Button {
     let focused = windows.iter().any(|window| window.focused);
     // Only when every one of the app's windows is minimized, so the square says the
@@ -2818,12 +3222,15 @@ fn app_button(
     // layer surface never becomes the active GTK window, so a `clicked` on an
     // inactive window can be swallowed as an activation attempt, and a release
     // never arrives at all.
+    // Scoped, because the handles it shadows are the ones the right click below
+    // takes its own copies from.
+    let owned: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
+    let primary = {
     let stream = stream.clone();
     let key = key.to_string();
     // Owned handles, so the callback can outlive this function: a `&GtkBox`
     // parameter could not be captured by a `'static` closure.
     let menu = menu.clone();
-    let owned: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     // The handler needs the very square it is attached to, to line the menu up
@@ -2848,7 +3255,41 @@ fn app_button(
             menu_open(&menu, &key, &group, &button, &stream);
         }
     ));
-    button.add_controller(gesture);
+    gesture
+    };
+    button.add_controller(primary);
+
+    // A right click is the app's own menu, never its previews: what to do with the
+    // app is a different question from which of its windows to show, and the
+    // previews are already a hover away.
+    let right_stream = stream.clone();
+    let right_key = key.to_string();
+    let right_menu = menu.clone();
+    let context = context.clone();
+    let right_windows: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
+    let secondary = gtk4::GestureClick::new();
+    secondary.set_button(gdk::BUTTON_SECONDARY);
+    secondary.connect_pressed(glib::clone!(
+        #[weak]
+        button,
+        #[upgrade_or]
+        return,
+        move |_, _, _, _| {
+            // The previews are not wanted here, and leaving one up behind the app
+            // menu would put two surfaces in the same place.
+            menu_close(&right_menu);
+            // A second right click on the same square closes it, as a second left
+            // click on the previews does.
+            if context.shown.get()
+                && context.app.borrow().as_deref() == Some(right_key.as_str())
+            {
+                context_close(&context);
+                return;
+            }
+            context_open(&context, &right_key, &right_windows, &button, &right_stream);
+        }
+    ));
+    button.add_controller(secondary);
 
     button
 }
