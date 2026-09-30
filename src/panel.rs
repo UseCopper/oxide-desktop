@@ -2512,21 +2512,22 @@ fn measure_rows(context: &Rc<ContextMenu>, rows: &[gtk4::Widget]) -> i32 {
     width
 }
 
-/// Move the app menu: its rows fade while the panel they sit in does not.
+/// Move the app menu: the whole thing fades, and it slides to the new square.
 ///
-/// The one thing [`animate_surface`] does not do, which a move needs: that eases the
-/// *window's* opacity and the top margin, and sets the left one outright, because an
-/// open and a close have nowhere to slide to. A move has two squares between them.
+/// The whole surface fades — fill, outline and rows together. Fading only the rows
+/// and holding the panel was a misreading of "fade everything except the menu": it
+/// leaves an empty frame hanging over the desktop with the contents gone, which does
+/// not read as a menu going anywhere.
 ///
-/// The rows are what fade, and the window's opacity is not touched at all. Fading the
-/// window took the panel with it, so the menu dissolved as a whole and the surface
-/// was plainly there and gone; this keeps the menu and fades everything in it, which
-/// is what a panel whose contents change should look like.
+/// What this does that [`animate_surface`] does not, is ease the *left* margin. That
+/// one eases the window's opacity and the top margin, and sets the left outright,
+/// because an open and a close have nowhere to slide to. A move has two squares
+/// between them.
 #[allow(clippy::too_many_arguments)]
 fn context_ease(
     context: &Rc<ContextMenu>,
-    from_rows: f64,
-    to_rows: f64,
+    from_opacity: f64,
+    to_opacity: f64,
     from_left: i32,
     to_left: i32,
     from_top: i32,
@@ -2545,9 +2546,15 @@ fn context_ease(
         // The same ease the reveal uses, so a move feels like this menu arriving
         // rather than some other one.
         let eased = 1.0 - (1.0 - t).powi(3);
+        // The whole surface, so the fill and the outline fade with the rows.
+        //
+        // Fading only the rows and holding the panel was a misreading of "fade
+        // everything except the menu". It leaves an empty frame hanging over the
+        // desktop with the contents gone, which does not read as a menu going
+        // anywhere.
         context
-            .rows
-            .set_opacity(from_rows + (to_rows - from_rows) * eased);
+            .window
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
         context
             .window
             .set_margin(Edge::Left, ease_margin(from_left, to_left, eased));
@@ -2557,7 +2564,7 @@ fn context_ease(
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
-        context.rows.set_opacity(to_rows);
+        context.window.set_opacity(to_opacity);
         context.window.set_margin(Edge::Left, to_left);
         context.window.set_margin(Edge::Top, to_top);
         glib::ControlFlow::Break
@@ -2599,11 +2606,6 @@ fn context_open(
     }
     context.shown.set(true);
     context.window.present();
-    // The panel is up before anything fades and never fades; only the rows do. Fading
-    // the window took the menu with it, so the surface was plainly there and gone
-    // rather than a panel whose contents arrived in it.
-    context.window.set_opacity(1.0);
-    context.rows.set_opacity(0.0);
     // Under the square, measured from the rows that were just built. Measured rather
     // than waited for: a surface that has not been mapped has no width yet, and by
     // the time it does the menu has been in the wrong place.
@@ -2642,8 +2644,7 @@ fn context_close(context: &Rc<ContextMenu>) {
         context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
     );
     let fading = context.clone();
-    // The rows fade and the panel slides back up into the bar; the window's own
-    // opacity is not touched, because the panel is not what is leaving.
+    // The whole menu fades as it slides back up into the bar.
     let resting = PANEL_HEIGHT;
     let token = context_ease(
         context,
@@ -2952,7 +2953,18 @@ fn accent_rgb() -> (f64, f64, f64) {
     ACCENT.with(Cell::get)
 }
 
+/// The bar's panel colour, at [`BAR_PANEL_ALPHA`].
+///
+/// Named once because three rules in the stylesheet have to agree on it — the bar, the
+/// app menu, and a test that would otherwise be a fourth copy of a colour literal.
+const BAR_PANEL: (u8, u8, u8) = (32, 32, 32);
+const BAR_PANEL_ALPHA: f64 = 0.82;
+
 fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
+    // Fed in rather than written out, so the bar and the app menu cannot drift apart
+    // into two different greys.
+    let (panel_r, panel_g, panel_b) = BAR_PANEL;
+    let panel_a = BAR_PANEL_ALPHA;
     format!(
         "
 window.panel-window {{
@@ -2964,7 +2976,7 @@ window.panel-window {{
     box-shadow: none;
 }}
 .panel {{
-    background-color: rgba(32, 32, 32, 0.82);
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
     padding: 0 10px;
 }}
 .panel label {{
@@ -2996,22 +3008,16 @@ button.task.minimized {{
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
-/* The app menu, opened by a right click. Widgets, so it is styled here; the colours
-   are the preview menu's own, because two menus belonging to the same panel should
-   not be two different greys. The previews are cairo-drawn over whatever is behind
-   them at 35% black, so this is the same fill and the same edge — the same
-   transparency, not a different one that happens to look similar. */
+/* The app menu, opened by a right click. Widgets, so it is styled here.
+   Its fill is the bar's own panel colour, not the previews' 0.35 black: a preview
+   cell is 0.35 black *around an opaque window capture*, so only its padding shows,
+   while every part of this is background. A square has no background of its own, so
+   what a square is made of is the bar — and that is what this is. */
 window.context {{
-    background-color: rgba(0, 0, 0, 0.82);
-    /* Not 0.35, which is what the preview cells are filled with, and deliberately so.
-       A cell is 35% black *with an opaque window capture in the middle of it*, so a
-       row of them reads as a solid panel; its 35% only shows in the gaps and the
-       padding. This menu is text on an empty panel, so every part of it is
-       background, and at 0.35 the desktop came through it — the previews looked solid
-       and this looked like glass over them. 82% is the bar's own panel, which is the
-       other solid surface this panel has, so the two now read as the same thing.
-       The theme's window background image is off, or it would paint a fill of its own
-       over the top of this and make it a third value again. */
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
+    /* The theme paints a window background image on top of a window's background
+       colour, which would put a fill of its own over this and make it a third value
+       again. */
     background-image: none;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
@@ -5200,9 +5206,15 @@ mod tests {
         // while every part of the app menu is background. Matching the number would
         // have matched the transparency and not the appearance, which is what
         // "more transparent than the thumbnail menu" was.
+        // The bar's own panel colour, at the bar's own alpha, from the one place it is
+        // defined. A square has no background of its own, so this is what a square is
+        // made of, and it is a dark *grey* rather than the near-black it was.
         assert!(
-            rule.contains("rgba(0, 0, 0, 0.82)"),
-            "the app menu is not as solid as the previews read: {rule}"
+            rule.contains(&format!(
+                "rgba({}, {}, {}, {})",
+                BAR_PANEL.0, BAR_PANEL.1, BAR_PANEL.2, BAR_PANEL_ALPHA
+            )),
+            "the app menu is not the colour a square is: {rule}"
         );
         // And nothing painted over the top of it. The theme's window background image
         // is the difference between "the same 35% black" and "a more solid panel than
