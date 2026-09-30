@@ -603,6 +603,16 @@ struct Menu {
     width_from: Cell<i32>,
     width_to: Cell<i32>,
     width_elapsed: Cell<f64>,
+    /// Whether the surface is being held at [`Self::hold_width`], and at what.
+    ///
+    /// For the last cell leaving. The surface is sized by the row, and the row shrinks
+    /// with the cell — so the last cell collapsing took the whole menu to nothing
+    /// *before* the close could fade it, and a one-window app closing simply vanished
+    /// rather than playing the same close as any other. Held for the length of the
+    /// departure, the cell still fades and collapses inside a menu that keeps its
+    /// size, and the close has something to fade.
+    hold: Cell<bool>,
+    hold_width: Cell<i32>,
 }
 
 impl Menu {
@@ -749,6 +759,8 @@ fn build_menu(
         width_from: Cell::new(0),
         width_to: Cell::new(0),
         width_elapsed: Cell::new(0.0),
+        hold: Cell::new(false),
+        hold_width: Cell::new(0),
     });
 
     // Painting.
@@ -1289,6 +1301,12 @@ fn relayout(menu: &Rc<Menu>) {
     {
         layout.surface.width = width;
     }
+    // The departure, as opposed to a switch: the row is emptying and its width says
+    // so, but the menu is on its way out by the same animation as any other close and
+    // deserves the same surface to fade.
+    if menu.hold.get() {
+        layout.surface.width = menu.hold_width.get().max(MENU_PAD * 2);
+    }
     let size = (layout.surface.width, layout.surface.height);
     *menu.layout.borrow_mut() = layout.clone();
     {
@@ -1749,6 +1767,8 @@ fn menu_open(
     menu.icon_center.set(icon_center);
     menu.bar_width.set(bar_width);
     menu.app.replace(Some(key.to_string()));
+    // Not held at the width of whatever was leaving: this is a new app's menu.
+    menu.hold.set(false);
     // The whole snapshot, not just this app's windows. With an empty list every
     // entry left over from the app that was on show before looked like a window that
     // had gone, and was animated out *inside* the menu that had just opened — so
@@ -1929,6 +1949,16 @@ fn menu_replace(
             request_preview_if_missing(menu, info, stream);
         }
     }
+    // The last of an app's windows has gone: hold the surface where it is for the
+    // length of the departure, so the menu plays the same close as it would if the
+    // pointer had closed it. Without this the row shrinks with the last cell and the
+    // surface is down to its padding before the close has anything to fade, so a
+    // one-window app simply disappeared.
+    if group.is_empty() && menu.shown.get() && !menu.hold.get() {
+        menu.hold_width.set(menu.layout.borrow().surface.width);
+        menu.hold.set(true);
+    }
+
     // Anything on its way out needs the tick, not just something this snapshot
     // started. `arrived` alone meant a window that closed while a motion was already
     // running — or one caught mid-departure by a snapshot that had nothing new to
@@ -2088,6 +2118,8 @@ fn menu_close(menu: &Rc<Menu>) {
     menu.switch.set(Switch::Idle);
     menu.pending.borrow_mut().take();
     menu.width_override.set(None);
+    // The hold was for the departure; there is nothing left to hold open for.
+    menu.hold.set(false);
     // Whatever the pointer was last over, it is not over a menu that is no longer
     // there.
     menu.pointer.set(None);
@@ -2100,35 +2132,11 @@ fn menu_close(menu: &Rc<Menu>) {
     animate_menu(menu, false, left);
 }
 
-/// Take the preview menu off screen at once, with no animation.
-///
-/// For when something else is taking its place in the same spot. A fade here is 180ms
-/// of this surface and the next one overlapping, and two translucent menus on top of
-/// each other is worse than either on its own.
-fn menu_hide(menu: &Rc<Menu>) {
-    if menu.app.borrow().is_none() {
-        return;
-    }
-    menu.app.replace(None);
-    // A switch in flight is abandoned, as `menu_close` abandons it: its next tick
-    // would swap a set of entries in for an app that is no longer on show.
-    menu.switch.set(Switch::Idle);
-    menu.pending.borrow_mut().take();
-    menu.width_override.set(None);
-    menu.pointer.set(None);
-    menu.shown.set(false);
-    // Supersede anything already animating this surface, so a fade already in flight
-    // cannot run on and put it back.
-    menu.animation.set(menu.animation.get().wrapping_add(1));
-    menu.window.set_opacity(0.0);
-    menu.window.set_visible(false);
+/// Whether the preview menu is up and showing.
+fn menu_open_now(menu: &Rc<Menu>) -> bool {
+    menu.shown.get() && menu.app.borrow().is_some()
 }
 
-/// Slide the menu out of the bar, or back into it, while fading.
-///
-/// Only the compositor-facing properties move. The surface is not resized and
-/// nothing inside it is re-laid-out, so the pointer stays where it was and the
-/// menu does not flicker.
 fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
     if showing {
         menu.window.present();
@@ -2994,11 +3002,16 @@ button.task.focused {{
    them at 35% black, so this is the same fill and the same edge — the same
    transparency, not a different one that happens to look similar. */
 window.context {{
-    background-color: rgba(0, 0, 0, 0.35);
-    /* The theme paints a window background *image* — a shadow, and on some themes a
-       fill of its own — on top of the background colour, which is what made this
-       menu read as a more solid panel than the previews even though the two are the
-       same 35% black. Told to stop, and the colour is the whole of it. */
+    background-color: rgba(0, 0, 0, 0.82);
+    /* Not 0.35, which is what the preview cells are filled with, and deliberately so.
+       A cell is 35% black *with an opaque window capture in the middle of it*, so a
+       row of them reads as a solid panel; its 35% only shows in the gaps and the
+       padding. This menu is text on an empty panel, so every part of it is
+       background, and at 0.35 the desktop came through it — the previews looked solid
+       and this looked like glass over them. 82% is the bar's own panel, which is the
+       other solid surface this panel has, so the two now read as the same thing.
+       The theme's window background image is off, or it would paint a fill of its own
+       over the top of this and make it a third value again. */
     background-image: none;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
@@ -3918,13 +3931,34 @@ fn app_button(
             // up in the same place a frame later, and a preview menu still fading out
             // beneath it is two surfaces in the same place — which is what "the menu
             // just opens over it" was. Cut, and let the app menu do the fading.
-            menu_hide(&right_menu);
             // A second right click on the same square closes it, as a second left
             // click on the previews does.
             if context.shown.get()
                 && context.app.borrow().as_deref() == Some(right_key.as_str())
             {
                 context_close(&context);
+                return;
+            }
+            // The previews play their own close, and the app menu opens when that has
+            // finished. Not overlapped and not cut: overlapping was two surfaces in one
+            // place, and cutting threw away an animation the pointer had just earned.
+            // One after the other, each doing its own thing.
+            let opening = context.clone();
+            let key = right_key.clone();
+            let windows = right_windows.clone();
+            let stream = right_stream.clone();
+            let button = button.clone();
+            if menu_open_now(&right_menu) {
+                menu_close(&right_menu);
+                glib::timeout_add_local(MENU_FADE, move || {
+                    if opening.shown.get() {
+                        // Something else opened the app menu while the previews were
+                        // closing. Two of them at once is what this is avoiding.
+                        return glib::ControlFlow::Break;
+                    }
+                    context_open(&opening, &key, &windows, &button, &stream);
+                    glib::ControlFlow::Break
+                });
                 return;
             }
             context_open(&context, &right_key, &right_windows, &button, &right_stream);
@@ -5161,9 +5195,14 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu");
+        // Not the previews' 0.35, and the reason is in the rule itself: a cell is
+        // 0.35 black *around an opaque capture*, so only its padding is see-through,
+        // while every part of the app menu is background. Matching the number would
+        // have matched the transparency and not the appearance, which is what
+        // "more transparent than the thumbnail menu" was.
         assert!(
-            rule.contains("rgba(0, 0, 0, 0.35)"),
-            "the app menu is not the previews' fill: {rule}"
+            rule.contains("rgba(0, 0, 0, 0.82)"),
+            "the app menu is not as solid as the previews read: {rule}"
         );
         // And nothing painted over the top of it. The theme's window background image
         // is the difference between "the same 35% black" and "a more solid panel than
