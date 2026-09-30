@@ -126,14 +126,18 @@ const MENU_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.16);
 const CELL_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.35);
 const CELL_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
 const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
-/// The mini-CSD's strip, in the same fill as the cell it sits in.
+/// The mini-CSD's strip. Nothing: the cell's own fill is already under it.
 ///
-/// It was a 7% white wash, which made one preview two greys and put the app menu —
-/// now 35% black like the cell — on a footing the previews themselves were not. The
-/// strip is now the same transparency as everything else, so a cell reads as one
-/// surface; the title and the close square are told apart by the border and the text
-/// rather than by a second background under them.
-const TITLEBAR_FILL: (f64, f64, f64, f64) = CELL_FILL;
+/// It was a 7% white wash, which made one preview two greys, and then it was set to
+/// [`CELL_FILL`] on the reasoning that the same value would look the same — which is
+/// wrong, because the strip is drawn *on top of* the cell fill rather than instead of
+/// it. Two 35% blacks are 58% black, so the strip came out a third value, darker than
+/// the cell it is part of, and that is what changed.
+///
+/// Transparent is what "the same background transparency" actually means when the
+/// thing under it is already the colour you want. The title and the close square are
+/// told apart by the border and the text rather than by a second background.
+const TITLEBAR_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.0);
 const CLOSE_IDLE: (f64, f64, f64) = (0.55, 0.55, 0.55);
 const CLOSE_HOVER: (f64, f64, f64) = (1.0, 1.0, 1.0);
 const CLOSE_HOVER_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
@@ -5224,9 +5228,14 @@ mod tests {
             "the theme's window background is back over the app menu's fill: {rule}"
         );
         assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
-        // The mini-CSD is the same fill as the cell it is drawn in, so a preview is
-        // one surface rather than a cell with a second background under its title.
-        assert_eq!(TITLEBAR_FILL, CELL_FILL);
+        // The mini-CSD adds no fill of its own. The cell's fill is already under it,
+        // and setting the strip to the same value does not make it the same colour —
+        // it stacks, and two 35% blacks are 58%, so the strip came out darker than
+        // the cell it belongs to.
+        assert_eq!(TITLEBAR_FILL.3, 0.0, "the strip must not paint over the cell");
+        // Which is the one case where a fill *would* have been right: if the cell were
+        // not already filled, the strip would need the colour itself.
+        assert!(CELL_FILL.3 > 0.0, "the cell underneath is what shows through");
     }
 
     #[test]
