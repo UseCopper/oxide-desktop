@@ -1469,7 +1469,7 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
         Switch::Idle => {
             let mut entries = menu.entries.borrow_mut();
             // An entry is dropped once it has closed up to nothing.
-            entries.retain(|_, entry| {
+            entries.retain(|id, entry| {
                 let phase = entry.motion.get();
                 let step = if matches!(phase, Motion::FadingIn | Motion::FadingOut) {
                     fade_step
@@ -1531,6 +1531,9 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
                         // after it is already invisible — and read as a stall.
                         entry.width.set(width_at(entry, out));
                         if out_done {
+                            if menu_debug() {
+                                eprintln!("oxide-panel: cell {id} dropped");
+                            }
                             return false;
                         }
                     }
@@ -1894,6 +1897,12 @@ fn menu_replace(
             // A window that has gone starts fading out, and only closes up its width
             // once it is invisible. Already on its way out? left alone.
             if !alive.contains(id) && !matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking) {
+                if menu_debug() {
+                    eprintln!(
+                        "oxide-panel: cell {id} {:?} is going",
+                        entry.title.borrow()
+                    );
+                }
                 entry.motion.set(Motion::FadingOut);
                 // From zero, which is the whole point: a settled entry's clock has
                 // been sitting at one since it arrived, so without this the fade's
@@ -1945,6 +1954,23 @@ fn menu_replace(
             })
             .collect();
         *menu.order.borrow_mut() = draw_order(&previous, &live, &leaving);
+        if menu_debug() && menu.order.borrow().as_slice() != previous.as_slice() {
+            let rows: Vec<String> = menu
+                .order
+                .borrow()
+                .iter()
+                .map(|id| {
+                    let title = menu
+                        .entries
+                        .borrow()
+                        .get(id)
+                        .map(|entry| entry.title.borrow().clone())
+                        .unwrap_or_default();
+                    format!("{id}:{title:?}")
+                })
+                .collect();
+            eprintln!("oxide-panel: row is now {}", rows.join(" "));
+        }
     }
     // Outside the borrow: asking for a preview reads the entries, and doing that
     // while they are borrowed for writing panics.
