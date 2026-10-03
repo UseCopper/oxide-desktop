@@ -935,7 +935,19 @@ fn build_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<
             // step is capped, so the whole 100ms landed in that one frame. Every
             // motion then began most of the way through: a fade-out opening at 0.64
             // instead of 1.0, a grow opening at 84% of its width.
-            if menu.morphing.get() && now > previous {
+            // Whether to animate is decided here, and not only by whoever last asked.
+            //
+            // `morphing` is set by `kick_morph`, and every caller of that is gated on the
+            // menu being on screen. So anything that changed while it was closed — a
+            // window closing, a cell marked as leaving — was never ticked, and stayed in
+            // the row at full width and full opacity for the rest of the session. The
+            // debug log showed exactly that: `4:Settled/1.00w159` in the row while being
+            // reported as going.
+            //
+            // Asking the menu what state it is in, rather than trusting a flag, means a
+            // half-finished animation always finishes. There is no state the panel can
+            // be left in that the next frame does not notice.
+            if (menu.morphing.get() || menu_unsettled(&menu)) && now > previous {
                 tick_morph(&menu, now - previous);
             }
             glib::ControlFlow::Continue
@@ -1933,6 +1945,23 @@ fn phase_name(motion: Motion) -> &'static str {
 /// steps land mid-frame and wait for the next one to be presented — visible as
 /// uneven motion, and pinned to one rate whatever the display is actually running
 /// at. A frame callback is called once per frame, in step with presentation.
+/// Whether anything in the menu is still moving.
+///
+/// The one question the frame callback needs answered, and answered by looking rather
+/// than by remembering.
+fn menu_unsettled(menu: &Menu) -> bool {
+    if menu.switch.get() != Switch::Idle
+        || menu.width_override.get().is_some()
+        || menu.hold.get()
+    {
+        return true;
+    }
+    menu.entries
+        .borrow()
+        .values()
+        .any(|entry| entry.motion.get() != Motion::Settled)
+}
+
 fn kick_morph(menu: &Rc<Menu>) {
     if menu.morphing.get() {
         return;
