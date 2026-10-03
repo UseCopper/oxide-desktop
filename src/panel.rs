@@ -2370,7 +2370,15 @@ fn menu_set_image(menu: &Rc<Menu>, id: u64, width: i32, height: i32, pixels: Vec
     // speeding up: an ease out has monotonically shrinking steps, and the log had
     // them growing (1, 8, 3, 7, 21, 10). A refresh of the same size is not a change
     // of target and must not touch the motion at all.
-    if entry.target.get() != width {
+    // Only a real change of width. A window whose aspect wobbles by a pixel between
+    // refreshes — which most of them do, as their content changes — otherwise restated
+    // the cell as `Growing` on every single preview, so it never reached `Settled`, so the
+    // menu redrew every frame for as long as it was open. That is the lag, and it gets
+    // worse with every window on show because every one of them does it.
+    //
+    // One pixel is below anything visible, and a cell that is a pixel out is a cell whose
+    // image is a pixel out.
+    if (entry.target.get() - width).abs() > 1 {
         entry.target.set(width);
         entry.reaim();
     }
@@ -2865,8 +2873,16 @@ fn context_move(
     let landing = context.clone();
     // Behind an Option because the timer may be called again before it breaks, and
     // the rows cannot be given away twice.
+    //
+    // The swap happens at the midpoint, not after a pause.
+    //
+    // It used to fade the rows all the way out, wait a whole `MENU_FADE`, and only then
+    // bring the new ones up — so there was a full `MENU_FADE` of nothing at all, with the
+    // panel still there, and the menu read as three events rather than one movement. The
+    // preview menu swaps in the frame the old row reaches zero and comes straight back
+    // up, and that is what this does now: one motion, half each way, no gap.
     let mut incoming: Option<Vec<gtk4::Widget>> = Some(rows);
-    glib::timeout_add_local(MENU_FADE, move || {
+    glib::timeout_add_local(MENU_FADE / 2, move || {
         let Some(rows) = incoming.take() else {
             return glib::ControlFlow::Break;
         };
@@ -2875,7 +2891,7 @@ fn context_move(
             return glib::ControlFlow::Break;
         }
         context_install(&landing, rows);
-        // Straight back up, from wherever the slide had got to.
+        // Straight back up, from wherever the fade had got to.
         let _ = context_ease(
             &landing,
             0.0,
@@ -2958,7 +2974,14 @@ fn context_ease(
             return glib::ControlFlow::Break;
         }
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
-        let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        // Half the usual length for a move: the rows go out and come back up as one
+        // movement, so each half has to fit in half the time.
+        let full = if fade_surface {
+            MENU_FADE
+        } else {
+            MENU_FADE / 2
+        };
+        let t: f64 = (elapsed / full.as_secs_f64()).clamp(0.0, 1.0);
         // The same ease the preview menu uses for its width and the reveal uses, so a
         // move feels like this menu arriving rather than some other one.
         let eased = phase_value(ease_out, t).0;
@@ -4267,10 +4290,10 @@ fn activate(
         }
         return;
     }
-    // A second click on the same square closes it, rather than rebuilding the menu
-    // under the pointer.
+    // Clicking the square whose previews are already up leaves them up. It used to close
+    // them, which meant clicking the icon you had just hovered — the most natural way to
+    // interact with a square — dismissed the menu instead of choosing a window from it.
     if menu.shown.get() && menu.app.borrow().as_deref() == Some(key) {
-        menu_close(menu);
         return;
     }
     let group: Vec<&WindowInfo> = windows.iter().collect();
