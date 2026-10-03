@@ -2111,12 +2111,20 @@ fn menu_reveal(menu: &Rc<Menu>, force: bool) {
 
 /// Put every entry straight to its settled size and opacity.
 fn settle_all(menu: &Rc<Menu>) {
-    for entry in menu.entries.borrow().values() {
+    // Only what is on show. The map also holds entries for windows that are open but not
+    // being shown, and anything that was once on show and has since left the row; putting
+    // *those* to full width and full opacity is how a menu for three windows ends up
+    // showing six previews.
+    let order = menu.order.borrow().clone();
+    let entries = menu.entries.borrow();
+    for id in &order {
+        let Some(entry) = entries.get(id) else { continue };
         entry.snap_to_full();
         entry.alpha.set(1.0);
         entry.motion.set(Motion::Settled);
         entry.elapsed.set(0.0);
     }
+    drop(entries);
     relayout(menu);
 }
 
@@ -2238,6 +2246,33 @@ fn menu_replace(
         // moment it leaves the snapshot made the cell vanish in a single frame, and
         // the fade and the collapse that followed played out with nothing on screen —
         // which is a close that does not animate.
+        // Windows that are gone and already invisible are dropped outright.
+        //
+        // The animation was supposed to be what removed them, and while it runs that is
+        // what it does. But the tick only runs while the menu is up and moving: an entry
+        // marked as leaving while the menu is closed is never ticked, so it stays in the
+        // map and in the order for good. The next open then revives the lot — `settle_all`
+        // puts every entry, including the ones for windows closed long ago, back to full
+        // width and fully opaque — which is how a menu for three windows ends up showing
+        // six previews of an app that only has three.
+        //
+        // So: keep animating one that is still visible, and drop one that is not. Nothing
+        // is lost by dropping it early, because there is nothing left on screen of it.
+        let mut purge: Vec<u64> = entries
+            .iter()
+            .filter(|(id, entry)| {
+                !alive.contains(*id)
+                    && matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking)
+                    && entry.alpha.get() <= 0.0
+                    && entry.width.get() <= 0.0
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        purge.sort_unstable();
+        for id in purge {
+            entries.remove(&id);
+        }
+
         let leaving: HashMap<u64, bool> = entries
             .iter()
             .map(|(id, entry)| {
@@ -2247,7 +2282,14 @@ fn menu_replace(
                 )
             })
             .collect();
-        *menu.order.borrow_mut() = draw_order(&previous, &live, &leaving);
+        *menu.order.borrow_mut() = {
+            let row = draw_order(&previous, &live, &leaving);
+            // Only what is live, or an entry that still exists to be animated out. An id
+            // with no entry behind it has nothing to draw and nothing to fade.
+            row.into_iter()
+                .filter(|id| live.contains(id) || entries.contains_key(id))
+                .collect()
+        };
     }
     // The row, named. Read outside the borrow above, because `entries` is held for
     // writing across it: reading the same cell here is a second borrow while the first is
