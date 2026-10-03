@@ -274,6 +274,20 @@ impl PanelIpc {
     /// delivered must only do so when this says yes: a preview dropped here is one the
     /// panel never sees, and the panel has no way to ask again except by reporting that
     /// it has nothing.
+    /// Whether the backlog is too full to be worth adding to.
+    ///
+    /// Asked *before* a window is rendered, not after. Rendering a preview costs a GPU
+    /// readback of the window's whole content plus an area average over it, and if the
+    /// result then has nowhere to go the window is not marked as previewed, so it is
+    /// rendered again on the next tick — which fills the backlog further. With enough
+    /// windows open that loop runs every tick: the compositor spends its whole frame
+    /// re-rendering previews nobody receives, and the session drags. Skipping the render
+    /// while the backlog is full breaks it, because the window is simply still owed a
+    /// preview and is asked again when there is room.
+    pub fn backlog_full(&self) -> bool {
+        self.out.queued() > MAX_OUT_BACKLOG / 2
+    }
+
     pub fn send_image(&mut self, image: &PanelImage) -> bool {
         if self.conn.is_none() {
             return false;
@@ -572,6 +586,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if self.panel_window(id).is_none() {
                 forget(self, id);
                 self.panel_cached_previews.remove(&id);
+                continue;
+            }
+            // Nowhere to put it yet. Asked for again later, deliberately: this is the
+            // check that stops a full backlog from turning into a re-render every tick.
+            if self.panel_ipc.as_ref().is_some_and(|ipc| ipc.backlog_full()) {
+                forget(self, id);
                 continue;
             }
             if self.panel_preview_is_current(id) && !panel_wants.contains(&id) {

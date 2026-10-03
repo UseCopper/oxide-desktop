@@ -1022,45 +1022,7 @@ fn draw_menu(menu: &Rc<Menu>, context: &gtk4::cairo::Context, width: i32, height
     // a compositor that has enlarged the surface must not be able to paint the menu
     // larger than the row it is drawn from — an unpainted region is still a hit-test
     // region, so the surplus would swallow clicks.
-    let layout = menu.layout.borrow().clone();
-    let cell_count = layout.cells.len();
-    let surface = layout.surface;
-    // What the panel believes it is showing, every frame, under OXIDE_PANEL_DEBUG.
-    //
-    // A menu that is on screen with nothing in it has a cause that is not visible in the
-    // picture: an entry can be at zero opacity, or absent, or present with no preview.
-    // Those look identical on screen and are fixed in completely different places, and
-    // reading the code is not enough to tell them apart — this line is.
-    if menu_debug() {
-        let entries = menu.entries.borrow();
-        let cells: Vec<String> = menu
-            .order
-            .borrow()
-            .iter()
-            .map(|id| {
-                match entries.get(id) {
-                    None => format!("{id}:gone"),
-                    Some(entry) => format!(
-                        "{id}:{:?}/{:.2}w{}p{}",
-                        entry.motion.get(),
-                        entry.alpha.get(),
-                        entry.width.get(),
-                        if entry.preview.borrow().is_some() { '+' } else { '-' }
-                    ),
-                }
-            })
-            .collect();
-        eprintln!(
-            "oxide-panel: draw {}x{} surface {}x{} cells {} entries {} order[{}]",
-            width,
-            height,
-            surface.width,
-            surface.height,
-            cell_count,
-            entries.len(),
-            cells.join(" ")
-        );
-    }
+    let surface = menu.layout.borrow().surface;
     let width = surface.width.min(width);
     let height = surface.height.min(height);
     set_source(context, MENU_FILL);
@@ -2258,13 +2220,23 @@ fn menu_replace(
         //
         // So: keep animating one that is still visible, and drop one that is not. Nothing
         // is lost by dropping it early, because there is nothing left on screen of it.
+        //
+        // The condition is deliberately not "has finished animating": a leaving entry that
+        // the tick never reaches sits at full width and full opacity for ever, and asking
+        // only about the ones that already faded away cleans up exactly the entries that
+        // did not need it. The log showed `4:Settled/1.00w159` in the row while being
+        // reported as going.
+        //
+        // So while the menu is not on screen there is nothing to animate and a window
+        // that is gone is simply dropped. When it *is* on screen the departure is worth
+        // showing, and the tick will finish it.
+        let animating = menu.shown.get();
         let mut purge: Vec<u64> = entries
             .iter()
             .filter(|(id, entry)| {
                 !alive.contains(*id)
                     && matches!(entry.motion.get(), Motion::FadingOut | Motion::Shrinking)
-                    && entry.alpha.get() <= 0.0
-                    && entry.width.get() <= 0.0
+                    && (!animating || (entry.alpha.get() <= 0.0 && entry.width.get() <= 0.0))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -2588,6 +2560,15 @@ struct ContextMenu {
     /// finished, so nothing else can put another menu in the same place mid-fade.
     shown: Cell<bool>,
     animation: Rc<Cell<u64>>,
+    /// The width the surface is being eased between, when a transition is running.
+    ///
+    /// The same idea as the preview menu's `width_from`/`width_to`, and for the same
+    /// reason: a move used to fade the whole surface out, swap the rows, and fade it back
+    /// in at whatever width the new app's rows happened to be, so the menu changed size in
+    /// one step in the middle of a transition meant to be moving. Nothing is held here at
+    /// rest.
+    width_from: Cell<i32>,
+    width_to: Cell<i32>,
     /// Where the square that opened it is, so the menu can sit under it.
     icon_center: Cell<i32>,
     bar_width: Cell<i32>,
@@ -2642,6 +2623,8 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
         app: RefCell::new(None),
         shown: Cell::new(false),
         animation: Rc::new(Cell::new(0)),
+        width_from: Cell::new(0),
+        width_to: Cell::new(0),
         icon_center: Cell::new(0),
         bar_width: Cell::new(0),
         stream,
@@ -2833,7 +2816,23 @@ fn context_move(
 
     // The top does not move during a move — it is already out of the bar.
     let top = PANEL_HEIGHT;
-    let token = context_ease(context, 1.0, 0.0, from_left, to_left, top, top);
+    // The widths at each end of the transition, so the size eases with everything else
+    // instead of stepping once the rows are swapped.
+    let from_width = context.window.width().max(1);
+    let to_width = measure_rows(context, &rows).max(1);
+    let token = context_ease(
+        context,
+        1.0,
+        0.0,
+        from_left,
+        to_left,
+        top,
+        top,
+        from_width,
+        to_width,
+        // The rows fade; the panel behind them does not.
+        false,
+    );
     let landing = context.clone();
     // Behind an Option because the timer may be called again before it breaks, and
     // the rows cannot be given away twice.
@@ -2848,7 +2847,18 @@ fn context_move(
         }
         context_install(&landing, rows);
         // Straight back up, from wherever the slide had got to.
-        let _ = context_ease(&landing, 0.0, 1.0, to_left, to_left, top, top);
+        let _ = context_ease(
+            &landing,
+            0.0,
+            1.0,
+            to_left,
+            to_left,
+            top,
+            top,
+            to_width,
+            to_width,
+            false,
+        );
         glib::ControlFlow::Break
     });
 }
@@ -2898,29 +2908,52 @@ fn context_ease(
     to_left: i32,
     from_top: i32,
     to_top: i32,
+    from_width: i32,
+    to_width: i32,
+    // Whether the surface itself fades, or only what is inside it.
+    //
+    // True when the menu is opening or closing, where the whole thing going is the point.
+    // False when moving between apps, where the panel is a fixed object that happens to
+    // change its contents: fading it out leaves an empty frame hanging over the desktop
+    // with nothing in it, which does not read as a menu moving anywhere.
+    fade_surface: bool,
 ) -> u64 {
     let context = context.clone();
     context.animation.set(context.animation.get().wrapping_add(1));
     let token = context.animation.get();
     let start = glib::monotonic_time();
+    context.width_from.set(from_width);
+    context.width_to.set(to_width);
     glib::timeout_add_local(Duration::from_millis(16), move || {
         if context.animation.get() != token {
             return glib::ControlFlow::Break;
         }
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        // The same ease the reveal uses, so a move feels like this menu arriving
-        // rather than some other one.
-        let eased = 1.0 - (1.0 - t).powi(3);
-        // The whole surface, so the fill and the outline fade with the rows.
-        //
-        // Fading only the rows and holding the panel was a misreading of "fade
-        // everything except the menu". It leaves an empty frame hanging over the
-        // desktop with the contents gone, which does not read as a menu going
-        // anywhere.
-        context
-            .window
-            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+        // The same ease the preview menu uses for its width and the reveal uses, so a
+        // move feels like this menu arriving rather than some other one.
+        let eased = phase_value(ease_out, t).0;
+        let opacity = from_opacity + (to_opacity - from_opacity) * eased;
+
+        if fade_surface {
+            context.window.set_opacity(opacity);
+        } else {
+            // Only the rows. Each is faded on its own, so the panel behind them stays put
+            // and the menu reads as one object changing its contents rather than
+            // something appearing and being replaced.
+            let mut child = context.rows.first_child();
+            while let Some(widget) = child {
+                widget.set_opacity(opacity.clamp(0.0, 1.0));
+                child = widget.next_sibling();
+            }
+        }
+
+        // The width, eased. Nothing here moves the menu's size except this, so the row
+        // that shrinks the menu does it as part of the motion rather than in one jump
+        // halfway through.
+        let width = ease_margin(from_width, to_width, eased);
+        context.window.set_size_request(width.max(1), -1);
+        context.window.set_default_size(width.max(1), -1);
         context
             .window
             .set_margin(Edge::Left, ease_margin(from_left, to_left, eased));
@@ -2930,7 +2963,13 @@ fn context_ease(
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
-        context.window.set_opacity(to_opacity);
+        if fade_surface {
+            context.window.set_opacity(to_opacity);
+        }
+        // Row opacity is left at whatever it ended on: the rows are replaced wholesale
+        // mid-move, so restoring it here would only matter for a row that survived.
+        context.window.set_size_request(to_width.max(1), -1);
+        context.window.set_default_size(to_width.max(1), -1);
         context.window.set_margin(Edge::Left, to_left);
         context.window.set_margin(Edge::Top, to_top);
         glib::ControlFlow::Break
@@ -2977,6 +3016,15 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
     // And the slide out of the bar, which `animate_surface` would have done along
     // with the window's opacity.
     let resting = PANEL_HEIGHT;
+    // Opening and closing fade the whole surface: the menu appearing from nothing is the
+    // point. Only a move between apps holds the surface and fades the rows.
+    //
+    // From the width the surface is actually at, not the width its rows measure to. A
+    // menu left wide by a move measures narrower than it is, and easing from the
+    // measurement made the close jump to that width before it began — the close animation
+    // playing at a width the menu was not.
+    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
+    let from_width = context.window.width().max(1);
     let _ = context_ease(
         context,
         0.0,
@@ -2985,6 +3033,9 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
         left,
         resting - MENU_SLIDE,
         resting,
+        from_width,
+        width,
+        true,
     );
 }
 
@@ -3007,6 +3058,8 @@ fn context_close(context: &Rc<ContextMenu>) {
     let fading = context.clone();
     // The whole menu fades as it slides back up into the bar.
     let resting = PANEL_HEIGHT;
+    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
+    let from_width = context.window.width().max(1);
     let token = context_ease(
         context,
         1.0,
@@ -3015,6 +3068,10 @@ fn context_close(context: &Rc<ContextMenu>) {
         left,
         resting,
         resting - MENU_SLIDE,
+        from_width,
+        width,
+        // The whole surface: a menu closing is a menu closing.
+        true,
     );
     // `shown` is not cleared here. It is cleared when the fade lands, so that a hover
     // arriving in the next 180ms cannot put the previews into a menu that is still on
