@@ -3,12 +3,15 @@
 //!
 //! The compositor starts this as a child of itself (`oxide-desktop --panel`),
 //! pointed at its own Wayland socket. The list of open windows and focus
-//! requests travel over a Unix socket (see [`crate::panel_ipc`]).
+//! requests travel over a Unix socket, framed by [`crate::panel_proto`] — the
+//! module both halves of that connection share, so the two can never disagree about how
+//! a message is delimited.
 
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write},
+
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     rc::Rc,
@@ -20,6 +23,8 @@ use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, Image, Label, Orientation,
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+
+use crate::panel_proto;
 
 const PANEL_HEIGHT: i32 = 40;
 /// Each app is a 1:1 square.
@@ -95,6 +100,36 @@ const PREVIEW_MIN_WIDTH: i32 = 96;
 const PREVIEW_MAX_CELL: i32 = 360;
 /// The titlebar above each preview, echoing the compositor's own.
 const TITLEBAR_HEIGHT: i32 = 24;
+/// How long a square must be held before the press becomes a drag.
+///
+/// Or any movement past [`DRAG_SLOP`], whichever comes first. Without the hold, a drag
+/// needed movement, and a press that was meant to pick an app up and put it down
+/// somewhere else — which is most drags — started by activating the app instead.
+const DRAG_HOLD: Duration = Duration::from_millis(250);
+
+/// How long a press may last before it is acted on without waiting for the release.
+///
+/// Short enough to feel immediate, and long enough that a hand which is still on its way
+/// to the pointer does not activate an app it passed over. The reason it exists at all is
+/// in `app_button`: the release is delivered to the square that was pressed, and the bar
+/// is rebuilt from scratch on every snapshot, so a square rebuilt mid-press never delivers
+/// it and the click is lost.
+const CLICK_ARM: Duration = Duration::from_millis(120);
+
+/// How often to look for a compositor that is not there yet.
+///
+/// Short enough that a compositor restart is invisible, long enough not to spin: a
+/// `connect` against a socket that is not there fails immediately, so this would
+/// otherwise be a busy loop for as long as the compositor is down.
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How many times a hover-out close may be put off while the menu is still moving.
+///
+/// After this the close happens anyway. See `watch_hover`: the deferral exists for a
+/// menu being resized under a stationary pointer, and it is bounded because a `morphing`
+/// that is never cleared would otherwise defer the close forever and leave the menu
+/// impossible to dismiss with the pointer.
+const HOVER_DEFER_LIMIT: u8 = 3;
 /// Inset before the title.
 const TITLE_INSET: i32 = 7;
 /// Size the close glyph is drawn at: its own native resolution, one bitmap pixel
@@ -189,9 +224,14 @@ const MENU_FADE: Duration = Duration::from_millis(180);
 const MENU_SLIDE: i32 = 10;
 /// Minimum gap kept between the menu and the right edge of the output.
 const MENU_EDGE_GAP: i32 = 8;
-/// How long the pointer must be outside both the bar and the menu before the
-/// menu closes. Long enough to cover the gap while crossing between them.
-const HOVER_GRACE: Duration = Duration::from_millis(400);
+/// How long the pointer must be somewhere the previews do not follow before the menu
+/// closes.
+///
+/// A close scheduled by leaving a square is cancelled by the token if the pointer turns
+/// out to be heading for the menu, so this is a floor on how fast a close may happen
+/// rather than a penalty added to one — which is why it can be this short.
+const HOVER_GRACE: Duration = Duration::from_millis(60);
+
 /// How long the pointer must rest on a square before its menu opens. Long enough
 /// that travelling along the bar does not open a menu for every square crossed.
 const HOVER_OPEN: Duration = Duration::from_millis(250);
@@ -200,7 +240,14 @@ const HOVER_OPEN: Duration = Duration::from_millis(250);
 /// Long enough that a press which becomes a drag is not also a click — a square
 /// cannot be brought forward and picked up at once — and short enough that a click is
 /// not left feeling slow. A release beats it, so a plain click acts immediately.
-const CLICK_ARM: Duration = Duration::from_millis(180);
+/// How long a press may last before the hold is read as a drag rather than a click.
+///
+/// The gesture a square answers to: press and let go quickly and it opens its windows,
+/// press and hold — or move while pressed — and it is picked up. There is deliberately no
+/// hold-to-activate underneath this any more. There used to be one, firing at 180ms, and
+/// the two could not both be true: holding a square for a quarter of a second activated
+/// the app *and then* picked the square up.
+
 /// How long to wait for every preview before showing the menu anyway.
 ///
 /// Short: a window with nothing committed, or a buffer the renderer will not
@@ -235,10 +282,16 @@ impl Rect {
 /// Defined once and used by both the hit test and the painting, because a
 /// highlight that is not where the click area is makes the button feel broken.
 fn close_rect(cell: &Rect) -> Rect {
+    // Clamped to the cell's own width, because a cell mid-morph can be narrower than the
+    // titlebar. The square used to extend to `cell.x - N` in that case, which put its
+    // left half over the previous cell: the highlight was drawn on the shrinking one
+    // while a hit test in the overhang resolved to the previous cell's, so the pointer
+    // and the paint disagreed about what was under it.
+    let width = TITLEBAR_HEIGHT.min(cell.width);
     Rect {
-        x: cell.x + cell.width - TITLEBAR_HEIGHT,
+        x: cell.x + cell.width - width,
         y: cell.y,
-        width: TITLEBAR_HEIGHT,
+        width,
         height: TITLEBAR_HEIGHT,
     }
 }
@@ -251,12 +304,32 @@ struct MenuLayout {
 }
 
 impl MenuLayout {
-    /// What is under the pointer: the preview, or the close button in its
-    /// titlebar.
+    /// What is under the pointer, if every cell is live. Geometry alone — for tests, and
+    /// for the cases where nothing is animating.
+    #[cfg(test)]
     fn hit(&self, x: f64, y: f64) -> Hit {
+        self.hit_where(x, y, |_| true)
+    }
+
+    /// [`Self::hit`], skipping cells that `live` says are not there to be pressed.
+    ///
+    /// Geometry alone is not enough, and this was the difference between a cell that
+    /// had faded out and a cell that was gone. A cell keeps its full width for
+    /// `CELL_MORPH` after its fade finishes, and keeps its full footprint while it is
+    /// *growing*, at zero opacity throughout. Both were still hit, so clicking a preview
+    /// as it dissolved re-focused — or, with the close button, closed — a window that was
+    /// already on its way out, and clicking the space a preview was about to occupy
+    /// pressed it early.
+    fn hit_where(&self, x: f64, y: f64, mut live: impl FnMut(usize) -> bool) -> Hit {
         for (index, cell) in self.cells.iter().enumerate() {
             if !cell.contains(x, y) {
                 continue;
+            }
+            // A cell that is not there to be pressed still swallows the point: falling
+            // through to the cell behind it would mean pressing one window while aiming
+            // at another.
+            if !live(index) {
+                return Hit::None;
             }
             if close_rect(cell).contains(x, y) {
                 return Hit::Close(index);
@@ -355,6 +428,41 @@ fn preview_width(width: i32, height: i32) -> i32 {
 fn menu_left(icon_center: i32, bar_width: i32, menu_width: i32) -> i32 {
     let furthest = (bar_width - MENU_EDGE_GAP - menu_width).max(MENU_EDGE_GAP);
     (icon_center - menu_width / 2).clamp(MENU_EDGE_GAP, furthest.max(MENU_EDGE_GAP))
+}
+
+/// Squeeze a menu onto the output if it does not fit.
+///
+/// A row of previews has a natural width, and it is not bounded by the output's: six
+/// ordinary 16:9 windows come to more than a 1280px screen between them. Left alone, the
+/// menu simply ran off the right edge — the tail of it was off-screen but still part of
+/// the surface, so its cells were drawn over nothing and still took clicks.
+///
+/// Squeezed, not truncated. Narrowing the surface alone would have been worse than doing
+/// nothing: the cells past the new edge would be clipped away and become unclickable,
+/// which is the same loss of reachability this is here to fix. So every cell is narrowed
+/// in proportion and the row stays whole — every window remains visible and pressable,
+/// just smaller.
+///
+/// Below one readable cell's width there is no sensible squeeze left, and the menu is
+/// left at its natural size: a bar that narrow is not a real case, and collapsing the
+/// menu would help nobody.
+fn fit_menu_to_output(layout: &mut MenuLayout, bar_width: i32) {
+    let room = bar_width.saturating_sub(MENU_EDGE_GAP * 2);
+    if layout.surface.width <= room {
+        return;
+    }
+    let scale = f64::from(room) / f64::from(layout.surface.width);
+    // The guard is on what a cell would end up as, not on the scale: squeezing six
+    // previews into 24px makes each of them four pixels wide, which is not a preview.
+    let widest = layout.cells.iter().map(|cell| cell.width).max().unwrap_or(0);
+    if f64::from(widest) * scale < f64::from(PREVIEW_MIN_WIDTH) {
+        return;
+    }
+    for cell in &mut layout.cells {
+        cell.x = (f64::from(cell.x) * scale).round() as i32;
+        cell.width = ((f64::from(cell.width) * scale).round() as i32).max(1);
+    }
+    layout.surface.width = room;
 }
 
 // ---------------------------------------------------------------- menu state
@@ -581,9 +689,26 @@ struct Menu {
     width_override: Cell<Option<i32>>,
     /// The compositor socket, so the switch can ask for the incoming app's previews
     /// from the tick rather than only from an open.
-    stream: RefCell<Option<Rc<UnixStream>>>,
+    stream: Channel,
     /// Ticks the switch has spent waiting for the incoming previews.
     waited: Cell<u32>,
+    /// A snapshot arrived while a switch was running, so the row was not brought into
+    /// step with it. Set by the switch path of [`menu_replace`], cleared by the resync
+    /// that runs when the switch ends.
+    ///
+    /// Without this, closing a window during a switch lost that update permanently. The
+    /// switch owns the row while it runs and skips the prune, and the snapshot that
+    /// reported the window has already been consumed — so if nothing else changed
+    /// afterwards there was no further snapshot to prune it, and the menu kept showing a
+    /// window that had been closed for good. That is why it took hovering along the bar
+    /// first: travelling between squares is what starts a switch.
+    resync_pending: Cell<bool>,
+    /// Bumped whenever the pointer is somewhere the menu should stay open, so a close
+    /// scheduled by leaving one square can tell it was superseded.
+    ///
+    /// Shared by the squares and by the menu's own canvas, because the two are the same
+    /// question: is the pointer still on the app whose previews are up?
+    hover_token: Cell<u64>,
     /// Where the window's left edge is, and where a switch is easing it to. The
     /// position moves with the size: a row that resizes under an icon has to travel
     /// to stay under it, and the two are one motion rather than two snaps.
@@ -695,20 +820,36 @@ impl Menu {
     /// it kept up with neither a cell that had shifted nor a pointer that had left.
     fn hit(&self) -> Hit {
         match self.pointer.get() {
-            Some((x, y)) => self.layout.borrow().hit(x, y),
+            Some((x, y)) => {
+                let layout = self.layout.borrow();
+                layout.hit_where(x, y, |index| self.cell_is_live(index))
+            }
             None => Hit::None,
         }
+    }
+
+    /// Whether the cell at this index can be pressed right now.
+    ///
+    /// Anything not fully opaque is on its way in or out, and neither is a thing to
+    /// click. Deliberately checked for both, rather than only for the shrink: a cell
+    /// part way *up* is at full opacity but not yet at its final width, and a cell part
+    /// way down is not yet gone.
+    fn cell_is_live(&self, index: usize) -> bool {
+        let Some(id) = self.order.borrow().get(index).copied() else {
+            return false;
+        };
+        let entries = self.entries.borrow();
+        let Some(entry) = entries.get(&id) else {
+            return false;
+        };
+        entry.alpha.get() >= 1.0 && entry.motion.get() == Motion::Settled
     }
 }
 
 // ---------------------------------------------------------------- the surface
 
 /// Build the menu: one layer surface with a canvas on it, sized and drawn by us.
-fn build_menu(
-    app: &Application,
-    monitor: &gdk::Monitor,
-    stream: Option<Rc<UnixStream>>,
-) -> Rc<Menu> {
+fn build_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<Menu> {
     let window = gtk4::Window::builder().application(app).build();
     window.set_decorated(false);
     window.add_css_class("panel-window");
@@ -753,8 +894,10 @@ fn build_menu(
         switch: Cell::new(Switch::Idle),
         pending: RefCell::new(None),
         width_override: Cell::new(None),
-        stream: RefCell::new(None),
+        stream: Channel::default(),
         waited: Cell::new(0),
+        resync_pending: Cell::new(false),
+        hover_token: Cell::new(0),
         left_from: Cell::new(0),
         left_to: Cell::new(0),
         last_frame: Cell::new(0),
@@ -827,7 +970,11 @@ fn build_menu(
         let click = gtk4::GestureClick::new();
         click.set_button(gdk::BUTTON_PRIMARY);
         click.connect_pressed(move |_, _, x, y| {
-            let target = match clicked.layout.borrow().hit(x, y) {
+            let target = match clicked
+                .layout
+                .borrow()
+                .hit_where(x, y, |index| clicked.cell_is_live(index))
+            {
                 Hit::Close(index) => clicked.order.borrow().get(index).copied().map(|id| (id, true)),
                 Hit::Preview(index) => {
                     clicked.order.borrow().get(index).copied().map(|id| (id, false))
@@ -837,15 +984,12 @@ fn build_menu(
             let Some((id, close)) = target else {
                 return;
             };
-            let Some(stream) = stream.as_ref() else {
-                return;
-            };
             if close {
                 // Only that window, and the menu stays: you are picking the next one.
-                send(stream, &format!("close\t{id}\n"));
+                stream.send(&format!("close\t{id}"));
             } else {
                 // Focusing a window is choosing it, so the menu goes away.
-                send(stream, &format!("focus\t{id}\n"));
+                stream.send(&format!("focus\t{id}"));
                 menu_close(&clicked);
             }
         });
@@ -878,7 +1022,45 @@ fn draw_menu(menu: &Rc<Menu>, context: &gtk4::cairo::Context, width: i32, height
     // a compositor that has enlarged the surface must not be able to paint the menu
     // larger than the row it is drawn from — an unpainted region is still a hit-test
     // region, so the surplus would swallow clicks.
-    let surface = menu.layout.borrow().surface;
+    let layout = menu.layout.borrow().clone();
+    let cell_count = layout.cells.len();
+    let surface = layout.surface;
+    // What the panel believes it is showing, every frame, under OXIDE_PANEL_DEBUG.
+    //
+    // A menu that is on screen with nothing in it has a cause that is not visible in the
+    // picture: an entry can be at zero opacity, or absent, or present with no preview.
+    // Those look identical on screen and are fixed in completely different places, and
+    // reading the code is not enough to tell them apart — this line is.
+    if menu_debug() {
+        let entries = menu.entries.borrow();
+        let cells: Vec<String> = menu
+            .order
+            .borrow()
+            .iter()
+            .map(|id| {
+                match entries.get(id) {
+                    None => format!("{id}:gone"),
+                    Some(entry) => format!(
+                        "{id}:{:?}/{:.2}w{}p{}",
+                        entry.motion.get(),
+                        entry.alpha.get(),
+                        entry.width.get(),
+                        if entry.preview.borrow().is_some() { '+' } else { '-' }
+                    ),
+                }
+            })
+            .collect();
+        eprintln!(
+            "oxide-panel: draw {}x{} surface {}x{} cells {} entries {} order[{}]",
+            width,
+            height,
+            surface.width,
+            surface.height,
+            cell_count,
+            entries.len(),
+            cells.join(" ")
+        );
+    }
     let width = surface.width.min(width);
     let height = surface.height.min(height);
     set_source(context, MENU_FILL);
@@ -1271,16 +1453,33 @@ fn truncate_to_width(text: &str, budget: f64, measure: &impl Fn(&str) -> f64) ->
     if measure(text) <= budget {
         return text.to_owned();
     }
-    let mut cut = text.chars().count();
-    while cut > 0 {
-        let mut candidate: String = text.chars().take(cut).collect();
+    // Halve, measure, then bisect. The obvious version — shave one character off and
+    // remeasure — is quadratic in the title's length and `measure` is a Pango layout, so
+    // it is not a cheap operation. A title is whatever a client passed to `set_title`,
+    // and this runs on every repaint of every preview cell, so a client that set a long
+    // one could take the panel's main loop down with it.
+    let chars: Vec<char> = text.chars().collect();
+    let fits = |count: usize| {
+        let mut candidate: String = chars[..count].iter().collect();
         candidate.push(TITLE_ELLIPSIS);
-        if measure(&candidate) <= budget {
-            return candidate;
+        measure(&candidate) <= budget
+    };
+    let (mut low, mut high) = (0usize, chars.len());
+    while low < high {
+        // The midpoint, rounded up, so the search always makes progress.
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
         }
-        cut -= 1;
     }
-    TITLE_ELLIPSIS.to_string()
+    if low == 0 {
+        return TITLE_ELLIPSIS.to_string();
+    }
+    let mut out: String = chars[..low].iter().collect();
+    out.push(TITLE_ELLIPSIS);
+    out
 }
 
 // ---------------------------------------------------------------- driving it
@@ -1311,6 +1510,11 @@ fn relayout(menu: &Rc<Menu>) {
     if menu.hold.get() {
         layout.surface.width = menu.hold_width.get().max(MENU_PAD * 2);
     }
+    // Nothing on screen may be wider than the output. The layout's own width is the sum
+    // of the row and has no idea how wide the display is, so a menu showing enough
+    // windows to overflow it used to run off the right edge: the surplus was off-screen,
+    // drawn over nothing, and still part of the input surface.
+    fit_menu_to_output(&mut layout, menu.bar_width.get());
     let size = (layout.surface.width, layout.surface.height);
     *menu.layout.borrow_mut() = layout.clone();
     {
@@ -1462,6 +1666,7 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
             if up {
                 // Nothing left to drive, so the per-entry motions take over again.
                 menu.switch.set(Switch::Idle);
+                schedule_resync(menu);
             } else {
                 moving += 1;
             }
@@ -1612,17 +1817,74 @@ fn tick_morph(menu: &Rc<Menu>, frame_time: i64) {
 fn swap_in_pending(menu: &Rc<Menu>) {
     let Some(pending) = menu.pending.borrow_mut().take() else {
         menu.switch.set(Switch::Idle);
+        schedule_resync(menu);
         return;
     };
     menu.app.replace(Some(pending.key));
     menu.icon_center.set(pending.icon_center);
     menu.bar_width.set(pending.bar_width);
-    let stream = menu.stream.borrow().clone();
-    build_entries(menu, &pending.group, stream.as_ref());
+    build_entries(menu, &pending.group, &menu.stream);
     // The width to ease to, from the incoming previews' own aspects. Taken now
     // because a previews-as-it-arrives correction would restart the motion in
     // flight; the surface keeps up through the ordinary layout path afterwards.
     menu.width_to.set(menu.widths_from_layout());
+}
+
+/// Apply the snapshots that arrived while a switch was running, now that it is over.
+///
+/// On an idle rather than inline: this is reached from the draw function, which is
+/// holding borrows of the very entries and order a rebuild would want for writing.
+fn schedule_resync(menu: &Rc<Menu>) {
+    if !menu.resync_pending.replace(false) {
+        return;
+    }
+    let menu = menu.clone();
+    glib::idle_add_local_once(move || {
+        // Only if it is still the same menu and still open. A rebuild asked for by a pin
+        // has already been through `menu_replace` by then, and doing it twice would
+        // restart the departure of anything it had just started.
+        if menu.app.borrow().is_some() {
+            menu_replace_current(&menu);
+        }
+    });
+}
+
+/// Bring the open menu into step with the most recent snapshot.
+///
+/// The same thing [`rebuild_tasks`] does for an open menu, reachable without a rebuild —
+/// a rebuild is driven by a snapshot arriving, and a snapshot that arrived while the row
+/// was switched out has nothing left to drive one.
+fn menu_replace_current(menu: &Rc<Menu>) {
+    let Some(key) = menu.app.borrow().clone() else {
+        return;
+    };
+    let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
+    let every: Vec<&WindowInfo> = snapshot.iter().collect();
+    let group = group_for(&key, &snapshot);
+    menu_replace(menu, &every, &group, &menu.stream);
+}
+
+/// The windows belonging to one app, as the bar groups them.
+///
+/// Shared with [`rebuild_tasks`] so the two cannot disagree about what "this app's
+/// windows" means — a window with no app id is a group of its own, named after its panel
+/// id, and a resync that forgot that would prune a perfectly good cell.
+fn group_for<'a>(key: &str, windows: &'a [WindowInfo]) -> Vec<&'a WindowInfo> {
+    windows
+        .iter()
+        .filter(|info| group_key(info) == key)
+        .collect()
+}
+
+/// The group an app's windows are collected under.
+fn group_key(info: &WindowInfo) -> String {
+    if info.app_id.is_empty() {
+        // A window that never said what it was gets a key of its own so it does not
+        // collapse into every other such window.
+        format!("#{}", info.id)
+    } else {
+        info.app_id.clone()
+    }
 }
 
 /// Put a group of windows in the row, full width and invisible, and ask for any
@@ -1631,7 +1893,7 @@ fn swap_in_pending(menu: &Rc<Menu>) {
 /// The opposite of [`menu_replace`], which keeps what is already on show and marks
 /// the difference as leaving; this is the clean exchange a switch makes once the
 /// old previews have gone.
-fn build_entries(menu: &Rc<Menu>, group: &[WindowInfo], stream: Option<&Rc<UnixStream>>) {
+fn build_entries(menu: &Rc<Menu>, group: &[WindowInfo], stream: &Channel) {
     let mut wanted: Vec<u64> = Vec::new();
     {
         let mut entries = menu.entries.borrow_mut();
@@ -1738,7 +2000,7 @@ fn menu_open(
     key: &str,
     group: &[&WindowInfo],
     button: &Button,
-    stream: &Rc<UnixStream>,
+    stream: &Channel,
 ) {
     let (icon_center, bar_width) = icon_metrics(button);
     // Already up, and for a different app: move to the new one rather than
@@ -1755,6 +2017,37 @@ fn menu_open(
         });
         menu.icon_center.set(icon_center);
         menu.bar_width.set(bar_width);
+        // Not held at the width of whatever was leaving: this is a new app's menu, and a
+        // hold left over from a departure that is still in progress would pin the surface
+        // to the departing app's width for good. It used to be cleared only on the
+        // non-switching path below, so hovering off a square whose app had just closed,
+        // within the departure's fade, left the *new* app's row drawn in the old app's
+        // surface for the rest of the session.
+        menu.hold.set(false);
+        // Only the cells that are *at rest* need their clocks restarted, and only those.
+        //
+        // `Switch::FadingOut` derives each cell's opacity from its clock, so a cell whose
+        // clock has already run out — which is every settled cell, since `settle_all`
+        // leaves it there — is at zero opacity on the very first tick and the row
+        // hard-cuts to blank, then sits blank for the whole exchange. That is why the
+        // switch path reset nothing at all, and why the switch looked like a cut.
+        //
+        // But a cell that is *already* animating has a clock that is doing its job:
+        // `FadingOut` derives opacity from the clock and ignores the motion, so
+        // restarting one mid-fade would pop it back to opaque and fade it again, and
+        // restarting a `Shrinking` one — at zero width and zero alpha — would bring it
+        // back as a bright sliver. So: settled cells only.
+        {
+            let order = menu.order.borrow().clone();
+            let mut entries = menu.entries.borrow_mut();
+            for id in &order {
+                if let Some(entry) = entries.get_mut(id)
+                    && entry.motion.get() == Motion::Settled
+                {
+                    entry.elapsed.set(0.0);
+                }
+            }
+        }
         // Taken now, while the outgoing layout is still the one on show: by the time
         // the width motion wants it the entries have been exchanged. Any override
         // from an earlier switch is dropped first, or the width it eases *from*
@@ -1784,7 +2077,7 @@ fn menu_open(
     // rebuilt it.
     let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
     let all: Vec<&WindowInfo> = snapshot.iter().collect();
-    menu_replace(menu, &all, group, Some(stream));
+    menu_replace(menu, &all, group, stream);
     relayout(menu);
     menu_reveal(menu, false);
     arm_reveal_fallback(menu);
@@ -1808,6 +2101,7 @@ fn menu_reveal(menu: &Rc<Menu>, force: bool) {
     // highlight was still there with the pointer somewhere else entirely.
     menu.pointer.set(None);
     menu.shown.set(true);
+    sync_tooltips_from(&menu);
     animate_menu(menu, true, left);
     // Never a motion on the way in. Every window on show was open before the click,
     // so animating them would be showing off a transition that did not happen; the
@@ -1844,7 +2138,7 @@ fn menu_replace(
     menu: &Rc<Menu>,
     all: &[&WindowInfo],
     group: &[&WindowInfo],
-    stream: Option<&Rc<UnixStream>>,
+    stream: &Channel,
 ) {
     let alive = liveness(&all.iter().map(|info| info.id).collect::<Vec<_>>());
     let live: Vec<u64> = group.iter().map(|info| info.id).collect();
@@ -1954,23 +2248,29 @@ fn menu_replace(
             })
             .collect();
         *menu.order.borrow_mut() = draw_order(&previous, &live, &leaving);
-        if menu_debug() && menu.order.borrow().as_slice() != previous.as_slice() {
-            let rows: Vec<String> = menu
-                .order
-                .borrow()
+    }
+    // The row, named. Read outside the borrow above, because `entries` is held for
+    // writing across it: reading the same cell here is a second borrow while the first is
+    // still alive, and a `RefCell` refuses that by panicking. The panic is not caught —
+    // this runs inside a GLib trampoline that cannot unwind — so it aborts the panel, and
+    // a panel that has aborted does not respond to anything. It only ever happened with
+    // OXIDE_PANEL_DEBUG set, which is why it survived.
+    if menu_debug() && menu.order.borrow().as_slice() != previous.as_slice() {
+        let rows: Vec<String> = {
+            let order = menu.order.borrow();
+            let entries = menu.entries.borrow();
+            order
                 .iter()
                 .map(|id| {
-                    let title = menu
-                        .entries
-                        .borrow()
+                    let title = entries
                         .get(id)
                         .map(|entry| entry.title.borrow().clone())
                         .unwrap_or_default();
                     format!("{id}:{title:?}")
                 })
-                .collect();
-            eprintln!("oxide-panel: row is now {}", rows.join(" "));
-        }
+                .collect()
+        };
+        eprintln!("oxide-panel: row is now {}", rows.join(" "));
     }
     // Outside the borrow: asking for a preview reads the entries, and doing that
     // while they are borrowed for writing panics.
@@ -2040,10 +2340,7 @@ fn menu_set_image(menu: &Rc<Menu>, id: u64, width: i32, height: i32, pixels: Vec
 }
 
 /// Ask for a preview of a window on show that has not sent one.
-fn request_preview_if_missing(menu: &Rc<Menu>, info: &WindowInfo, stream: Option<&Rc<UnixStream>>) {
-    let Some(stream) = stream else {
-        return;
-    };
+fn request_preview_if_missing(menu: &Rc<Menu>, info: &WindowInfo, stream: &Channel) {
     let has = menu
         .entries
         .borrow()
@@ -2052,15 +2349,12 @@ fn request_preview_if_missing(menu: &Rc<Menu>, info: &WindowInfo, stream: Option
     if has {
         return;
     }
-    send(
-        stream,
-        &format!(
-            // Says the panel has nothing for this window, so the compositor must
-            // answer even if the pixels have not moved.
-            "preview\t{}\t{}\t{}\t{}\n",
-            info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, WANTED
-        ),
-    );
+    stream.send(&format!(
+        // Says the panel has nothing for this window, so the compositor must answer even
+        // if the pixels have not moved.
+        "preview\t{}\t{}\t{}\t{}",
+        info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, WANTED
+    ));
 }
 
 /// Which part of moving the menu from one app to another is in flight.
@@ -2119,20 +2413,17 @@ fn liveness(alive: &[u64]) -> HashSet<u64> {
 
 /// Ask for a fresh preview of every window the open menu is showing, so one that
 /// is animating or playing video is not shown frozen.
-fn menu_refresh(menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Rc<UnixStream>) {
+fn menu_refresh(menu: &Rc<Menu>, windows: &[WindowInfo], stream: &Channel) {
     if menu.app.borrow().is_none() {
         return;
     }
     let order = menu.order.borrow().clone();
     for info in windows.iter().filter(|info| order.contains(&info.id)) {
-        send(
-            stream,
-            &format!(
-                // A refresh: only answer if the window has actually changed.
-                "preview\t{}\t{}\t{}\t{}\n",
-                info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, REFRESH
-            ),
-        );
+        stream.send(&format!(
+            // A refresh: only answer if the window has actually changed.
+            "preview\t{}\t{}\t{}\t{}",
+            info.id, PREVIEW_TARGET.0, PREVIEW_TARGET.1, REFRESH
+        ));
     }
 }
 
@@ -2157,6 +2448,7 @@ fn menu_close(menu: &Rc<Menu>) {
     // can open it again. Leaving it set is what meant a menu could only ever be
     // opened once per panel run.
     menu.shown.set(false);
+    sync_tooltips_from(&menu);
     let width = menu.layout.borrow().surface.width;
     let left = menu_left(menu.icon_center.get(), menu.bar_width.get(), width);
     animate_menu(menu, false, left);
@@ -2257,7 +2549,7 @@ struct ContextMenu {
     /// Where the square that opened it is, so the menu can sit under it.
     icon_center: Cell<i32>,
     bar_width: Cell<i32>,
-    stream: RefCell<Option<Rc<UnixStream>>>,
+    stream: Channel,
     hover: Rc<Hover>,
 }
 
@@ -2278,7 +2570,7 @@ const ICON_CLOSE_ALL: &str = "edit-clear-all-symbolic";
 const ICON_PIN: &str = "starred-symbolic";
 const ICON_UNPIN: &str = "list-remove-symbolic";
 
-fn build_context_menu(app: &Application, monitor: &gdk::Monitor) -> Rc<ContextMenu> {
+fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<ContextMenu> {
     let window = gtk4::Window::builder().application(app).build();
     window.set_decorated(false);
     window.add_css_class("panel-window");
@@ -2310,7 +2602,7 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor) -> Rc<ContextMe
         animation: Rc::new(Cell::new(0)),
         icon_center: Cell::new(0),
         bar_width: Cell::new(0),
-        stream: RefCell::new(None),
+        stream,
         hover: Rc::new(Hover::default()),
     });
     context
@@ -2371,9 +2663,12 @@ fn context_rows_for(
     key: &str,
     windows: &[WindowInfo],
 ) -> Vec<gtk4::Widget> {
-    let Some(stream) = context.stream.borrow().clone() else {
+    // Not a reason to open an empty menu: with no compositor to talk to there is nothing
+    // these rows could do, and a box with nothing in it is a box that looks broken.
+    if !context.stream.is_connected() {
         return Vec::new();
-    };
+    }
+    let stream = context.stream.clone();
     let mut rows: Vec<gtk4::Widget> = Vec::new();
 
     // The app itself, which starts a new instance even when it has windows open —
@@ -2385,7 +2680,7 @@ fn context_rows_for(
         let stream = stream.clone();
         let owned = context.clone();
         row.connect_clicked(move |_| {
-            send(&stream, &format!("launch\t{id}\n"));
+            stream.send(&format!("launch\t{id}"));
             context_close(&owned);
         });
         rows.push(row.upcast());
@@ -2399,9 +2694,8 @@ fn context_rows_for(
             let id = windows[0].id;
             let row = context_row(ICON_CLOSE_ONE, "Close window", false);
             let owned = context.clone();
-            let stream = stream.clone();
             row.connect_clicked(move |_| {
-                send(&stream, &format!("close\t{id}\n"));
+                stream.send(&format!("close\t{id}"));
                 context_close(&owned);
             });
             rows.push(row.upcast());
@@ -2416,7 +2710,7 @@ fn context_rows_for(
             let stream = stream.clone();
             row.connect_clicked(move |_| {
                 for id in &ids {
-                    send(&stream, &format!("close\t{id}\n"));
+                    stream.send(&format!("close\t{id}"));
                 }
                 context_close(&owned);
             });
@@ -2608,17 +2902,10 @@ fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
 }
 
 /// Open the app menu for an app, or move an open one onto it.
-fn context_open(
-    context: &Rc<ContextMenu>,
-    key: &str,
-    windows: &[WindowInfo],
-    button: &Button,
-    stream: &Rc<UnixStream>,
-) {
+fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], button: &Button) {
     let (icon_center, bar_width) = icon_metrics(button);
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
-    *context.stream.borrow_mut() = Some(stream.clone());
     context.app.replace(Some(key.to_string()));
     context_fill(context, key, windows);
     if menu_debug() {
@@ -2635,6 +2922,7 @@ fn context_open(
         );
     }
     context.shown.set(true);
+    sync_tooltips_from_context(&context);
     context.window.present();
     // Under the square, measured from the rows that were just built. Measured rather
     // than waited for: a surface that has not been mapped has no width yet, and by
@@ -2668,6 +2956,7 @@ fn context_close(context: &Rc<ContextMenu>) {
     context.hover.inside.set(false);
     context.hover.token.set(context.hover.token.get().wrapping_add(1));
     context.app.replace(None);
+    sync_tooltips_from_context(context);
     let left = menu_left(
         context.icon_center.get(),
         context.bar_width.get(),
@@ -2766,8 +3055,11 @@ thread_local! {
     /// list changes when an app is pinned, so there is no snapshot coming to rebuild
     /// the bar with. Without this the square a pin adds would not appear until
     /// something else happened to move a window.
-    static LAST_BAR: RefCell<Option<(GtkBox, Rc<Menu>, Vec<WindowInfo>, Rc<UnixStream>, Rc<ContextMenu>)>> =
+    static LAST_BAR: RefCell<Option<(GtkBox, Rc<Menu>, Vec<WindowInfo>, Channel, Rc<ContextMenu>)>> =
         const { RefCell::new(None) };
+
+    /// The bar's overlay, which the carried layer is added to for the length of a drag.
+    static OVERLAY: RefCell<Option<gtk4::Overlay>> = const { RefCell::new(None) };
 }
 
 /// Build the bar again from the last snapshot.
@@ -2858,13 +3150,32 @@ fn toggle_pin(id: &str) -> bool {
 fn pinned_without_windows(groups: &[(String, Vec<&WindowInfo>)]) -> Vec<String> {
     LAYOUT.with(|layout| {
         let layout = layout.borrow();
-        layout
+        let missing = |id: &String| {
+            crate::desktop::is_app_id(id) && !groups.iter().any(|(key, _)| key == id)
+        };
+        // In the remembered order, so a pinned app that has not been started yet sits
+        // where the bar says it should. This used to iterate the pin set directly, which
+        // is a hash set: two or more pinned-but-idle apps came out in an order that
+        // differs every run, and the next save wrote that shuffle into panel.conf. So a
+        // bar quietly rearranged itself across restarts, and the file it wrote was noise.
+        let mut out: Vec<String> = layout
+            .order
+            .iter()
+            .filter(|id| layout.pinned.contains(*id) && missing(id))
+            .cloned()
+            .collect();
+        // Pins with no place in the order — a hand-edited file, or an app pinned before it
+        // was ever seen — go after those, sorted, so they too land in the same place
+        // every run rather than a new one.
+        let mut strays: Vec<String> = layout
             .pinned
             .iter()
-            .filter(|id| !groups.iter().any(|(key, _)| key == *id))
-            .filter(|id| crate::desktop::is_app_id(id))
+            .filter(|id| missing(id) && !layout.order.contains(*id))
             .cloned()
-            .collect()
+            .collect();
+        strays.sort();
+        out.extend(strays);
+        out
     })
 }
 
@@ -2876,11 +3187,21 @@ fn pinned_without_windows(groups: &[(String, Vec<&WindowInfo>)]) -> Vec<String> 
 /// whenever a window opened or closed — most visibly when an app started up, put
 /// itself last, and pushed everything else along.
 fn arrange(keys: &[String]) -> Vec<usize> {
-    LAYOUT.with(|layout| {
+    let (out, discovered) = LAYOUT.with(|layout| {
         let mut layout = layout.borrow_mut();
+        let mut discovered = false;
         for key in keys {
+            // A window that never said what it was gets a synthetic key so its windows
+            // do not all collapse into one square. It is a position for this session
+            // only: the key names a panel id, and panel ids start again at one in every
+            // compositor run, so remembering it would give an unrelated window in some
+            // later session the place this one had. It must not reach the file.
+            if key.starts_with('#') {
+                continue;
+            }
             if !layout.order.iter().any(|entry| entry == key) {
                 layout.order.push(key.clone());
+                discovered = true;
             }
         }
         let position = |key: &String| {
@@ -2892,8 +3213,18 @@ fn arrange(keys: &[String]) -> Vec<usize> {
         };
         let mut out: Vec<usize> = (0..keys.len()).collect();
         out.sort_by_key(|index| position(&keys[*index]));
-        out
-    })
+        (out, discovered)
+    });
+    // A newly discovered app changes where the squares sit, so the order is worth
+    // keeping. It used to be left in memory only, which meant an order the user never
+    // touched was forgotten on the next restart and rebuilt from whatever the first
+    // snapshot happened to say.
+    //
+    // Saved outside the borrow above: `save_layout` reads the same cell.
+    if discovered {
+        save_layout();
+    }
+    out
 }
 
 // ---------------------------------------------------------------- hover to close
@@ -2911,11 +3242,21 @@ fn watch_hover(bar_row: &GtkBox, menu: &Rc<Menu>, hover: &Rc<Hover>) {
     let menu = menu.clone();
     let bar = bar_row.clone().upcast::<gtk4::Widget>();
     let canvas = menu.canvas.clone().upcast::<gtk4::Widget>();
+    // The menu's own window as well as its canvas, so that moving onto the menu counts as
+    // moving onto the menu whatever part of it the pointer lands on.
+    let surface = menu.window.clone().upcast::<gtk4::Widget>();
     // The bar's row and the menu's canvas, both content widgets rather than
     // toplevels. A toplevel also reports enter and leave when it is resized or
     // reconfigured, which is not the pointer going anywhere, and this menu is
     // resized as previews arrive.
-    for widget in [bar, canvas] {
+    // Whether this surface is the menu rather than the bar, which decides whether being
+    // on it cancels a close that leaving a square scheduled.
+    //
+    // Only the menu does. The bar does not: leaving a square for the panel *background*
+    // is the pointer going somewhere the previews do not follow, and that has to close
+    // them. Cancelling it there left the previews on screen with the pointer resting on
+    // empty bar.
+    for (widget, is_menu) in [(bar, false), (canvas, true), (surface, true)] {
         let motion = gtk4::EventControllerMotion::new();
         // Per iteration: the handler is `Fn` and so borrows its captures.
         let closing_menu = menu.clone();
@@ -2925,16 +3266,26 @@ fn watch_hover(bar_row: &GtkBox, menu: &Rc<Menu>, hover: &Rc<Hover>) {
         // it is handed a leave, and treating that as the pointer having gone is what
         // closed the menu while the pointer never left it.
         let on_move = hover.clone();
+        let on_move_menu = menu.clone();
         motion.connect_motion(move |_, _, _| {
             on_move.inside.set(true);
             on_move.token.set(on_move.token.get() + 1);
+            if is_menu {
+                // Being on the menu counts as still being on the app whose previews it is
+                // showing, so it cancels a close that leaving the bar square scheduled.
+                on_move_menu.hover_token.set(on_move_menu.hover_token.get() + 1);
+            }
         });
 
         let on_enter = hover.clone();
+        let on_enter_menu = menu.clone();
         motion.connect_enter(move |_, _, _| {
             on_enter.inside.set(true);
             // Invalidate any close that is already scheduled.
             on_enter.token.set(on_enter.token.get() + 1);
+            if is_menu {
+                on_enter_menu.hover_token.set(on_enter_menu.hover_token.get() + 1);
+            }
         });
 
         let on_leave = hover.clone();
@@ -2950,12 +3301,21 @@ fn watch_hover(bar_row: &GtkBox, menu: &Rc<Menu>, hover: &Rc<Hover>) {
             // Cloned in here rather than outside: the handler is `Fn`, so it
             // cannot hand its own captures to a `'static` closure.
             let recheck = on_leave.clone();
+            // How many times a close may be put off because the menu is still moving.
+            //
+            // Bounded, because the alternative is a close that never happens: `morphing`
+            // is set when a motion is kicked and cleared when a tick finishes it, and a
+            // kick with no tick behind it leaves it true for good. The timer then
+            // rescheduled itself forever and the menu could not be dismissed by moving
+            // the pointer away from it at all — it could only be dismissed by clicking.
+            let mut deferred = 0u8;
             glib::timeout_add_local(HOVER_GRACE, move || {
-                // A surface being resized under a stationary pointer is handed a
-                // leave, and the next resize will hand it another. So while the menu
-                // is still moving, a close is put off rather than acted on: the
-                // pointer has not gone anywhere, the surface has.
-                if closing.morphing.get() {
+                // A surface being resized under a stationary pointer is handed a leave,
+                // and the next resize will hand it another. So while the menu is still
+                // moving, a close is put off rather than acted on: the pointer has not
+                // gone anywhere, the surface has. A few times only.
+                if closing.morphing.get() && deferred < HOVER_DEFER_LIMIT {
+                    deferred += 1;
                     return glib::ControlFlow::Continue;
                 }
                 if recheck.token.get() == token && !recheck.inside.get() {
@@ -3030,6 +3390,16 @@ button.task {{
 button.task:hover {{
     background-color: rgba(255, 255, 255, 0.10);
 }}
+/* A square being carried. It has left the row and is in a layer over it, so it needs no
+ * transition to stay under the pointer and nothing to lift it: the layer is above.
+ *
+ * No margin transitions and no z-index here. Both were how the row was rearranged
+ * before, and both are wrong: a negative margin asks a widget with a 36px minimum for a
+ * negative width, which GTK refuses, and GTK's CSS has no z-index at all — the property
+ * it warned about on startup. */
+button.task.carrying {{
+    background-color: rgba(255, 255, 255, 0.18);
+}}
 /* Deliberately not dimmed. Minimized and closed are different things, and dimming
    the square conflates them with a pinned app that has nothing open at all. */
 button.task.minimized {{
@@ -3102,90 +3472,149 @@ enum PanelEvent {
         height: i32,
         pixels: Vec<u8>,
     },
+    /// The connection is gone. The panel starts over and reconnects.
+    Disconnected,
 }
 
-/// An image whose payload has not fully arrived yet: the header is in, the
-/// pixels are still on their way.
-struct PendingImage {
-    id: u64,
-    width: i32,
-    height: i32,
-    /// How many payload bytes are owed.
-    len: usize,
-}
-
-/// Reads the compositor's byte stream, which mixes newline-delimited text with
-/// length-prefixed image payloads.
+/// Reads the compositor's byte stream into events.
 ///
-/// The payload cannot be newline-terminated: raw pixels contain `\n`, which
-/// would truncate the message, so an `img` header states its own byte count and
-/// exactly that many bytes are consumed before the next line is looked at.
-#[derive(Default)]
+/// All the framing lives in [`crate::panel_proto`], which the compositor's half shares;
+/// this is only the part that knows what the messages *mean*. The one thing worth saying
+/// here is that a dropped connection is an event rather than an error: the compositor
+/// restarts underneath a running panel, and a panel that treats that as fatal is a panel
+/// that has to be killed and restarted by hand to get its bar back.
 struct PanelReader {
-    buffer: Vec<u8>,
-    pending: Option<PendingImage>,
+    frames: panel_proto::FrameReader,
+    /// Set when the socket has gone, cleared by [`Self::drain`].
+    ///
+    /// An event rather than a return value: a disconnection and a stream we cannot parse
+    /// want the same response from the panel, and a panel that treats one as fatal is a
+    /// panel that needs killing by hand whenever the compositor restarts.
+    lost: bool,
+}
+
+impl Default for PanelReader {
+    fn default() -> Self {
+        Self {
+            frames: panel_proto::FrameReader::new(),
+            lost: false,
+        }
+    }
 }
 
 impl PanelReader {
-    /// Take everything parseable out of the buffer.
+    /// Take delivery of bytes read from the socket.
+    fn feed(&mut self, bytes: &[u8]) {
+        self.frames.feed(bytes);
+    }
+
+    /// Note that the compositor has gone, so [`Self::drain`] reports it once.
+    ///
+    /// Separate from the framer's own error path because the socket reading nothing —
+    /// `read` returning zero — is the ordinary way a peer closes, and the framer cannot
+    /// see it: it is a fact about the file descriptor, not about the bytes.
+    fn report_lost(&mut self) {
+        self.frames.reset();
+        self.lost = true;
+    }
+
+    /// Every event the buffer now holds.
+    ///
+    /// Reading stops at the first frame that cannot be understood, because a stream we
+    /// have lost our place in has no next message: the rest is reported as one
+    /// disconnection rather than guessed at.
     fn drain(&mut self) -> Vec<PanelEvent> {
         let mut events = Vec::new();
+        if self.lost {
+            self.lost = false;
+            events.push(PanelEvent::Disconnected);
+        }
         loop {
-            if let Some(pending) = self.pending.take() {
-                // The payload is owed in full before it means anything; a partial
-                // one stays pending, with the bytes left buffered for next time.
-                if self.buffer.len() < pending.len {
-                    self.pending = Some(pending);
-                    break;
-                }
-                let payload: Vec<u8> = self.buffer.drain(..pending.len).collect();
-                events.push(PanelEvent::Image {
-                    id: pending.id,
-                    width: pending.width,
-                    height: pending.height,
-                    pixels: payload,
-                });
-                continue;
-            }
-
-            let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') else {
-                break;
+            let Some(frame) = self.frames.next_frame() else {
+                return events;
             };
-            let line: Vec<u8> = self.buffer.drain(..=newline).collect();
-            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-            if let Some(header) = line.strip_prefix("img\t") {
-                if let Some(pending) = parse_image_header(header) {
-                    self.pending = Some(pending);
+            match frame {
+                Err(err) => {
+                    // Includes the peer hanging up, which is the ordinary case here: the
+                    // compositor exited, or is being restarted.
+                    tracing::debug!(%err, "panel: connection lost, will reconnect");
+                    self.frames.reset();
+                    events.push(PanelEvent::Disconnected);
+                    return events;
                 }
-            } else if let Some(windows) = parse_snapshot(&line) {
-                events.push(PanelEvent::Snapshot(windows));
+                Ok(frame) => match parse_frame(&frame) {
+                    Some(event) => events.push(event),
+                    // Framed correctly but not a message we know. The stream is still in
+                    // step, because the frame length is what put it there.
+                    None => {}
+                },
             }
         }
-        events
     }
 }
 
-/// Parse an `img\t<id>\t<width>\t<height>\t<len>` header into the image it
-/// introduces, with room reserved for its payload.
-fn parse_image_header(header: &str) -> Option<PendingImage> {
-    let mut fields = header.split('\t');
-    let id = fields.next()?.parse::<u64>().ok()?;
-    let width = fields.next()?.parse::<i32>().ok()?;
-    let height = fields.next()?.parse::<i32>().ok()?;
-    let len = fields.next()?.parse::<usize>().ok()?;
-    if width <= 0 || height <= 0 || len != (width as usize) * (height as usize) * 4 {
+/// Turn one framed message into an event, or `None` if it is not one we know.
+fn parse_frame(frame: &[u8]) -> Option<PanelEvent> {
+    if frame.starts_with(b"img\t") {
+        let image = panel_proto::decode_image(frame)?;
+        return Some(PanelEvent::Image {
+            id: image.id,
+            width: image.width,
+            height: image.height,
+            pixels: image.pixels,
+        });
+    }
+    let fields = panel_proto::parse_text(frame)?;
+    if fields.first().map(String::as_str) != Some("list") {
         return None;
     }
-    Some(PendingImage {
-        id,
-        width,
-        height,
-        len,
-    })
+    parse_snapshot(&fields).map(PanelEvent::Snapshot)
 }
 
+/// Write a message to the compositor.
+///
+/// A partial write is not treated as an error worth reporting: the socket is
+/// non-blocking, and these are short requests the compositor drains every frame. Silently
+/// dropping one costs a preview that is asked for again on the next tick.
 fn send(stream: &Rc<UnixStream>, message: &str) {
-    let _ = (&**stream).write_all(message.as_bytes());
+    let _ = (&**stream).write_all(&panel_proto::encode_text(message));
+}
+
+/// The panel's handle on the compositor.
+///
+/// A shared, replaceable pointer rather than an `Rc<UnixStream>` threaded through every
+/// call, because the compositor can go away and come back: the bar, the app menu and the
+/// context menu all send through the same socket, and on a reconnect all of them have to
+/// be talking to the new one. Holding the socket in each of them would mean reconnecting
+/// each of them, and any one of them that was missed would keep writing into a dead
+/// connection forever.
+#[derive(Clone, Default)]
+struct Channel(Rc<RefCell<Option<Rc<UnixStream>>>>);
+
+impl Channel {
+    fn new(stream: Option<Rc<UnixStream>>) -> Self {
+        Self(Rc::new(RefCell::new(stream)))
+    }
+
+    fn get(&self) -> Option<Rc<UnixStream>> {
+        self.0.borrow().clone()
+    }
+
+    /// Point every holder at a new socket, or at nothing.
+    fn set(&self, stream: Option<Rc<UnixStream>>) {
+        *self.0.borrow_mut() = stream;
+    }
+
+    fn is_connected(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    /// Send one message, if there is anywhere to send it.
+    fn send(&self, message: &str) {
+        if let Some(stream) = self.get() {
+            send(&stream, message);
+        }
+    }
 }
 
 pub fn run_panel() {
@@ -3220,7 +3649,7 @@ fn connect_panel() -> Option<Rc<UnixStream>> {
     Some(Rc::new(stream))
 }
 
-fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
+fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     if !gtk4_layer_shell::is_supported() {
         eprintln!("oxide-desktop panel: compositor does not support wlr-layer-shell");
         std::process::exit(1);
@@ -3248,30 +3677,37 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
     // closed if the window had not shrunk back. Two surfaces make that
     // impossible: the bar is always exactly `PANEL_HEIGHT`, and the menu is sized
     // to exactly what it draws.
+    // One handle, shared by the bar, both menus and the poll timer, so that a
+    // reconnect is a single assignment rather than something each holder has to be told
+    // about — and cannot be missed by.
+    let channel = Channel::new(socket.clone());
     let (bar, bar_row, tasks) = build_bar_window(app, &monitor);
-    let menu = build_menu(app, &monitor, stream.clone());
-    *menu.stream.borrow_mut() = stream.clone();
+    // The same handle, not a copy of the socket: a reconnect is then a single assignment
+    // and there is no second place where a menu can still be holding the connection that
+    // just died. The context menu used to be given its own, and nothing ever set it, so
+    // right-clicking a square opened a menu with nothing in it.
+    let menu = build_menu(app, &monitor, channel.clone());
     // The app menu, opened by a right click. A third surface for the same reason
     // the menu is a second: an unpainted region of a surface still takes clicks.
-    let context = build_context_menu(app, &monitor);
+    let context = build_context_menu(app, &monitor, channel.clone());
     // Watching needs the bar, so it is wired here rather than at the build.
     watch_context_hover(&context, &bar_row);
     let hover = Rc::new(Hover::default());
 
-    // Squares can be dragged along the bar to reorder them. The drag carries the app
-    // id and the row decides which gap it landed in, so the gesture itself needs to
-    // know nothing about the bar.
-    watch_reorder(&tasks);
 
     // Hover-out closes the menu. The pointer has to cross the bar to reach the
     // menu, so "inside" spans both surfaces, and the close is deferred briefly so
     // passing between them is not read as leaving.
     watch_hover(&bar_row, &menu, &hover);
 
-    if let Some(stream) = stream {
-        send_accent(&stream);
-        start_polling(&tasks, &menu, stream, hover, &context);
+    if let Some(stream) = socket {
+        channel.send(&format!("accent\t{:.6}\t{:.6}\t{:.6}", accent_rgb().0, accent_rgb().1, accent_rgb().2));
+        drop(stream);
     }
+    // Polled whether or not there was a socket to begin with: a panel started before its
+    // compositor is listening yet is the ordinary case on a login, and the reconnect in
+    // the poll timer is what picks it up.
+    start_polling(&tasks, &menu, &channel, hover, &context);
 
     bar.present();
 }
@@ -3328,15 +3764,38 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
         ),
     );
 
-    window.set_child(Some(&row));
+    // The row, with a layer over it for the square a drag is carrying.
+    //
+    // A carried square cannot stay in the box. GTK lays a box out from its children's
+    // size requests, and a square with a negative margin asks for a negative width, which
+    // a widget with a 36px minimum cannot have — GTK rejects it and asserts. Moving one
+    // square out of the flow and leaving a placeholder of the same size behind is the only
+    // way to carry a square *and* have the row close up around the hole, without asking
+    // the layout for something impossible.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&row));
+    // The layer a carried square goes into is built when a drag starts and destroyed when
+    // it ends, so that at rest there is nothing at all between the pointer and the
+    // squares.
+    //
+    // It used to live here for the whole session. It is a real widget, in an overlay, in
+    // front of every square — and a widget in front of a button takes the pointer before
+    // the button sees it. That is why nothing in the bar could be pressed: not a broken
+    // drag, a layer that was always there, doing nothing, eating every click.
+    OVERLAY.with(|cell| *cell.borrow_mut() = Some(overlay.clone()));
+
+    window.set_child(Some(&overlay));
     (window, row, tasks)
 }
 
 /// Tell the compositor the accent so it can tint the snap preview.
-fn send_accent(stream: &Rc<UnixStream>) {
+///
+/// Sent on every connect rather than once at startup, because the compositor forgets it
+/// when it exits: a panel that outlives its compositor has to say it again or the snap
+/// preview comes back in whatever colour the last session ended on.
+fn send_accent(channel: &Channel) {
     let (red, green, blue) = accent_rgb();
-    let message = format!("accent\t{red:.6}\t{green:.6}\t{blue:.6}\n");
-    let _ = (&**stream).write_all(message.as_bytes());
+    channel.send(&format!("accent\t{red:.6}\t{green:.6}\t{blue:.6}"));
 }
 
 /// Drain the compositor socket, rebuilding the task list on every snapshot and
@@ -3344,37 +3803,64 @@ fn send_accent(stream: &Rc<UnixStream>) {
 fn start_polling(
     tasks: &GtkBox,
     menu: &Rc<Menu>,
-    stream: Rc<UnixStream>,
+    channel: &Channel,
     _hover: Rc<Hover>,
     context: &Rc<ContextMenu>,
 ) {
+    let menu = menu.clone();
     let tasks = tasks.clone();
     let context = context.clone();
     let reader = RefCell::new(PanelReader::default());
     let windows = Rc::new(RefCell::new(Vec::<WindowInfo>::new()));
     // Both timers below need this state, so hand each its own handle.
-    let (stream_poll, stream_refresh) = (stream.clone(), stream.clone());
-    let (windows_poll, windows_refresh) = (windows.clone(), windows.clone());
-    let (menu_poll, menu_tick) = (menu.clone(), menu.clone());
-    let stream = stream_poll;
-    let windows = windows_poll;
-    let menu = menu_poll;
+    let channel_poll = channel.clone();
+    let channel_refresh = channel.clone();
+    let windows_refresh = windows.clone();
+    let menu_tick = menu.clone();
+
     glib::timeout_add_local(POLL_INTERVAL, move || {
         let mut buf = [0u8; 65536];
-        loop {
-            match (&*stream).read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => reader.borrow_mut().buffer.extend_from_slice(&buf[..n]),
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
+        let mut lost = false;
+        // Through the channel rather than a captured socket, because the socket is
+        // replaceable: a reconnect has to be visible here without this closure being
+        // rebuilt.
+        let stream = channel_poll.get();
+        match stream.as_ref() {
+            Some(stream) => loop {
+                match (&**stream).read(&mut buf) {
+                    // The compositor has gone. Not fatal — the panel outlives it, and
+                    // this used to be a plain `break`, which left the panel polling a
+                    // dead file descriptor every 8ms for the rest of the session with an
+                    // empty task list and no way back.
+                    Ok(0) => {
+                        lost = true;
+                        break;
+                    }
+                    Ok(n) => reader.borrow_mut().feed(&buf[..n]),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        lost = true;
+                        break;
+                    }
+                }
+            },
+            // Nothing connected: not an error, just nothing to read. This is also the
+            // state between a disconnect and the next attempt.
+            None => {}
+        }
+        // The reader is told about the loss rather than being thrown away, so everything
+        // downstream sees one code path for "the window list is no longer trustworthy"
+        // however it happened.
+        if lost {
+            reader.borrow_mut().report_lost();
         }
 
         for event in reader.borrow_mut().drain() {
             match event {
                 PanelEvent::Snapshot(list) => {
                     windows.replace(list.clone());
-                    rebuild_tasks(&tasks, &menu, &list, &stream, &context);
+                    rebuild_tasks(&tasks, &menu, &list, &channel_poll, &context);
                 }
                 PanelEvent::Image {
                     id,
@@ -3382,13 +3868,21 @@ fn start_polling(
                     height,
                     pixels,
                 } => {
-                    // Straight to the menu, which keeps the preview. There used to
-                    // be a cache here that the value was read back out of — but
-                    // `insert` returns the value it *replaced*, so the first preview
-                    // of a window never arrived and every later one was a frame
-                    // stale, which is exactly what a preview that never seems to
-                    // change looks like.
+                    // Straight to the menu, which keeps the preview. There used to be a
+                    // cache here that the value was read back out of — but `insert`
+                    // returns the value it *replaced*, so the first preview of a window
+                    // never arrived and every later one was a frame stale, which is
+                    // exactly what a preview that never seems to change looks like.
                     menu_set_image(&menu, id, width, height, pixels);
+                }
+                PanelEvent::Disconnected => {
+                    // Forget the compositor's window list rather than leaving a stale one
+                    // on screen: every square in it belongs to a compositor that is gone.
+                    // The compositor sends a fresh list on connect, so nothing has to be
+                    // asked for by hand.
+                    windows.replace(Vec::new());
+                    rebuild_tasks(&tasks, &menu, &[], &channel_poll, &context);
+                    reconnect(&channel_poll);
                 }
             }
         }
@@ -3396,13 +3890,53 @@ fn start_polling(
         glib::ControlFlow::Continue
     });
 
-    // Keep an open menu's previews current, so a window that is animating or
-    // playing video is not shown frozen.
+    // Keep an open menu's previews current, so a window that is animating or playing
+    // video is not shown frozen.
     glib::timeout_add_local(PREVIEW_REFRESH, move || {
         let snapshot = windows_refresh.borrow().clone();
-        menu_refresh(&menu_tick, &snapshot, &stream_refresh);
+        menu_refresh(&menu_tick, &snapshot, &channel_refresh);
         glib::ControlFlow::Continue
     });
+}
+
+/// Point the panel at a new compositor connection, if there is one to have.
+///
+/// Runs from the poll timer after a disconnect, so a compositor that has been restarted
+/// underneath a live panel is picked up without anybody having to kill the panel. The
+/// compositor sends its whole window list the moment it accepts a connection, so there is
+/// nothing to re-request here beyond the accent, which it does not remember between
+/// sessions.
+fn reconnect(channel: &Channel) {
+    match connect_panel() {
+        Some(stream) => {
+            channel.set(Some(stream));
+            // Both menus keep their own copy of the channel, and are pointed at the new
+            // connection too — otherwise a menu opened after the reconnect would send
+            // into the socket that just died.
+            send_accent(channel);
+            tracing::info!("Reconnected to the compositor");
+        }
+        None => {
+            // Not an error: the compositor may not be listening yet. Try again shortly —
+            // this has to be a timer rather than waiting for the next disconnection,
+            // because nothing further will happen to wake us. A panel started before its
+            // compositor came up, and a panel whose compositor is restarting, both land
+            // here, and neither produces another `Disconnected` to try again from.
+            channel.set(None);
+            let channel = channel.clone();
+            glib::timeout_add_local(RECONNECT_INTERVAL, move || {
+                if channel.is_connected() {
+                    return glib::ControlFlow::Break;
+                }
+                reconnect(&channel);
+                if channel.is_connected() {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        }
+    }
 }
 
 /// The title shown for a window, falling back to the app id.
@@ -3441,7 +3975,7 @@ fn rebuild_tasks(
     tasks: &GtkBox,
     menu: &Rc<Menu>,
     windows: &[WindowInfo],
-    stream: &Rc<UnixStream>,
+    stream: &Channel,
     context: &Rc<ContextMenu>,
 ) {
     // Remembered before anything else, so a rebuild asked for by the panel's own
@@ -3456,19 +3990,27 @@ fn rebuild_tasks(
             context.clone(),
         ));
     });
+    // Before anything is taken out of the row: a carried square is not in it, and would
+    // otherwise be left over the bar taking clicks that are not its own.
+    drag_cancel();
     while let Some(child) = tasks.first_child() {
         tasks.remove(&child);
+    }
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: rebuilt bar with {} window(s) for {:?}",
+            windows.len(),
+            menu.app.borrow().as_deref().unwrap_or("<none>")
+        );
     }
 
     // Group the windows by app. Windows with no app id get a key of their own so
     // they don't all collapse together.
     let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
     for info in windows {
-        let key = if info.app_id.is_empty() {
-            format!("#{}", info.id)
-        } else {
-            info.app_id.clone()
-        };
+        // The same rule [`group_for`] uses, so a rebuild and a resync cannot disagree
+        // about which windows belong to an app.
+        let key = group_key(info);
         match groups.iter_mut().find(|(group_key, _)| *group_key == key) {
             Some((_, group)) => group.push(info),
             None => groups.push((key, vec![info])),
@@ -3499,6 +4041,9 @@ fn rebuild_tasks(
     let open_key = menu.app.borrow().clone();
     let every: Vec<&WindowInfo> = windows.iter().collect();
     if let Some(key) = &open_key {
+        // A rebuild is itself the reconciliation, so anything the row missed while a
+        // switch was running has now been applied.
+        menu.resync_pending.set(false);
         let group: Vec<&WindowInfo> = groups
             .iter()
             .find(|(group_key, _)| group_key == key)
@@ -3508,7 +4053,7 @@ fn rebuild_tasks(
         // captured, so the compositor answers with the last frame it took for it and
         // the cell shows that: more use than a hole in the row, and it keeps the count
         // on the square and the number of previews in step.
-        menu_replace(menu, &every, &group, Some(stream));
+        menu_replace(menu, &every, &group, stream);
         if menu_debug() {
             // The bar and the menu disagreeing about which windows exist is the
             // awkward one to read off the screen: the count is right and the row is
@@ -3573,17 +4118,24 @@ fn rebuild_tasks(
 /// window to bring forward.
 #[allow(clippy::too_many_arguments)]
 fn activate(
-    stream: &Rc<UnixStream>,
+    stream: &Channel,
     key: &str,
     windows: &[WindowInfo],
     menu: &Rc<Menu>,
     button: &Button,
     multiple: bool,
 ) {
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: activate {key:?} multiple={multiple} windows={} connected={}",
+            windows.len(),
+            stream.is_connected()
+        );
+    }
     if !multiple {
         match windows.first() {
-            None => send(stream, &format!("launch\t{key}\n")),
-            Some(window) => send(stream, &format!("focus\t{}\n", window.id)),
+            None => stream.send(&format!("launch\t{key}")),
+            Some(window) => stream.send(&format!("focus\t{}", window.id)),
         }
         return;
     }
@@ -3597,58 +4149,466 @@ fn activate(
     menu_open(menu, key, &group, button, stream);
 }
 
-/// Let a square be dropped anywhere on the row of squares to give it a new place.
-fn watch_reorder(tasks: &GtkBox) {
-    let target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
-    let row = tasks.clone();
-    target.connect_drop(move |_, value, x, _| {
-        let Some(id) = value.get::<String>().ok() else {
-            return false;
-        };
-        if !crate::desktop::is_app_id(&id) {
-            // A window that never said what it was has no place in the order; there
-            // is nothing to remember about it between runs.
-            return false;
-        }
-        let index = drop_index(&row, x);
-        place_at(&id, index);
-        if menu_debug() {
-            eprintln!("oxide-panel: dropped {id:?} at {index}");
-        }
-        // The bar is rebuilt on an idle rather than here: this runs inside the drop,
-        // while the square being dragged is still on screen, and taking the widgets
-        // out from under it mid-gesture loses the drag.
-        glib::idle_add_local_once(|| rebuild_bar());
-        true
-    });
-    tasks.add_controller(target);
+/// The class on the square being carried.
+const DRAG_CARRYING: &str = "carrying";
+
+/// The widget name a placeholder carries, so it is never mistaken for a square.
+const GAP_NAME: &str = "gap:";
+
+/// The prefix a square's widget name carries, so a drag can tell which app a button is.
+///
+/// Widget names are the only per-widget field a plain `Button` keeps that survives a
+/// rebuild, and the row has to be able to map a position back to an app to move the
+/// right one.
+const APP_NAME_PREFIX: &str = "app:";
+
+/// The app a square belongs to, from its widget name. A placeholder has none.
+fn app_of(widget: &gtk4::Widget) -> Option<String> {
+    let name = widget.widget_name();
+    if name.starts_with(GAP_NAME) {
+        return None;
+    }
+    Some(name.strip_prefix(APP_NAME_PREFIX)?.to_string())
 }
 
-/// Which gap in the bar a drop at this x lands in, given where its squares are.
+/// Name a square, so a drag can find it again.
+fn set_app_of(button: &Button, app: &str) {
+    button.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+}
+
+/// Which gap in a row a pointer at this x is over.
 ///
-/// The bar is a row, so the gap is decided by which squares' middles the pointer is
-/// past: left of the first square's middle is before it, right of the last is after
-/// it, and in between it is whichever side of that square's middle the pointer is on.
+/// The bar is a row, so the gap is decided by which squares' middles the pointer is past:
+/// left of the first square's middle is before it, right of the last is after it, and in
+/// between it is whichever side of that square's middle the pointer is on.
 ///
-/// Separated from the widget walking so the arithmetic can be tested without a
-/// display, which is the part that can be off by one and put a square dropped
-/// between two of them one place out.
+/// Separated from the widget walking so the arithmetic can be tested without a display,
+/// which is the part that can be off by one and put a square down one place out.
 fn gap_at(middles: &[f64], x: f64) -> usize {
     middles.iter().filter(|middle| x > **middle).count()
 }
 
-/// [`gap_at`], for a drop on the real row.
-fn drop_index(tasks: &GtkBox, x: f64) -> usize {
+/// Where each square in the row is, in the row's own coordinates.
+struct RowGeometry {
+    /// The middles of the visible children, left to right. A placeholder is one of them,
+    /// because the hole it leaves is exactly as wide as the square that left it.
+    middles: Vec<f64>,
+}
+
+impl RowGeometry {
+    fn gap_at(&self, x: f64) -> usize {
+        gap_at(&self.middles, x)
+    }
+}
+
+/// Measure the row of squares.
+fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     let mut middles = Vec::new();
     let mut child = tasks.first_child();
     while let Some(widget) = child {
         let square = widget.upcast::<gtk4::Widget>();
+        // A square that has not been allocated yet has no position, and contributes
+        // nothing to the row either.
         if let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0) {
             middles.push(left + f64::from(square.width()) / 2.0);
         }
         child = square.next_sibling();
     }
-    gap_at(&middles, x)
+    RowGeometry { middles }
+}
+
+/// The square being carried, and the placeholder standing in for it.
+struct DragState {
+    /// The app being carried.
+    app: String,
+    /// The gap it would land in if let go now.
+    gap: usize,
+    /// Where it was picked up from, so putting it back where it started is not a change.
+    original: usize,
+    /// Where its top left corner is in the carried layer, which is what the pointer's
+    /// travel is added to.
+    carried_at: (f64, f64),
+}
+
+thread_local! {
+    // One square at a time, and every square's handlers must be able to see it: the
+    // gesture that starts the drag belongs to the pressed button, but the row has to be
+    // rearranged by squares that know nothing about it.
+    static DRAG: RefCell<Option<Rc<RefCell<DragState>>>> = const { RefCell::new(None) };
+}
+
+/// Whether a square is being carried.
+fn drag_active() -> bool {
+    DRAG.with(|drag| drag.borrow().is_some())
+}
+
+/// Pick a square up.
+///
+/// The square leaves the row and goes into the overlay, and a placeholder of the same
+/// size takes its place, so the row keeps its width and closes up around the hole exactly
+/// as it would if the square were still there and had moved. Nothing in the row is asked
+/// for a negative size.
+fn drag_begin(app: &str) {
+    if drag_active() {
+        // A second square cannot join the first. Ignoring it is better than ending the
+        // drag in progress, which would leave the carried square stranded in the overlay.
+        return;
+    }
+    if !crate::desktop::is_app_id(app) {
+        // A window that never said what it was has no place in the order; there is
+        // nothing to remember about it between runs.
+        return;
+    }
+    let Some(tasks) = tasks_box() else {
+        return;
+    };
+    let Some(square) = square_for(&tasks, app) else {
+        return;
+    };
+    let Some(overlay) = carried_layer() else {
+        return;
+    };
+    let index = child_index(&tasks, square.upcast_ref()).unwrap_or(0);
+
+    // Where the square is *before* anything moves, so the layer can put it back exactly
+    // there and the pointer can be measured against it. In the row's own coordinates,
+    // which is also the layer's, because the layer sits exactly over the row.
+    //
+    // Taken first deliberately: inserting the placeholder at `index` pushes the square
+    // one place along, so measuring afterwards lands a whole square out — every drag
+    // began from the wrong position.
+    let (left, top) = square
+        .translate_coordinates(&tasks, 0.0, 0.0)
+        .unwrap_or((0.0, 0.0));
+
+    // The placeholder. Invisible, the same size as a square, and holding the gap open.
+    let placeholder = GtkBox::new(Orientation::Horizontal, 0);
+    placeholder.set_widget_name(GAP_NAME);
+    placeholder.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+    put_child(&tasks, placeholder.upcast_ref(), index);
+
+    tasks.remove(&square);
+    square.add_css_class(DRAG_CARRYING);
+    overlay.put(&square, left, top);
+
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: carrying {app:?} at {index}, left {left:.0}, {} squares",
+            row_geometry(&tasks).middles.len()
+        );
+    }
+    DRAG.with(|drag| {
+        *drag.borrow_mut() = Some(Rc::new(RefCell::new(DragState {
+            app: app.to_string(),
+            gap: index,
+            original: index,
+            carried_at: (left, top),
+        })));
+    });
+    if menu_debug() {
+        eprintln!("oxide-panel: picked up {app:?}");
+    }
+}
+
+/// Carry the square under the pointer, and move the hole in the row to suit.
+///
+/// Returns whether the gap moved, which is the only time the row has to be laid out
+/// again.
+fn drag_update(pointer_x: f64, delta: (f64, f64)) -> bool {
+    let state = DRAG.with(|drag| drag.borrow().clone());
+    let Some(state) = state else {
+        return false;
+    };
+    let Some(tasks) = tasks_box() else {
+        return false;
+    };
+    let Some(overlay) = carried_layer() else {
+        return false;
+    };
+    let _ = &overlay;
+    let app = state.borrow().app.clone();
+    let Some(square) = carried_square(&app) else {
+        return false;
+    };
+
+    // From where the square was put down, not from where it is now: adding the total
+    // travel onto the current position compounds the rounding of every step, and the
+    // square drifts away from the cursor over a long drag.
+    let origin = state.borrow().carried_at;
+    let (dx, dy) = delta;
+    // From the square's position at the start of the drag, not from where it is now:
+    // accumulating a delta onto the current position compounds the rounding of every
+    // step, and the square drifts away from the cursor over a long drag.
+    let (x, y) = (
+        (origin.0 + dx - f64::from(SQUARE_SIZE) / 2.0).round(),
+        (origin.1 + dy - f64::from(SQUARE_SIZE) / 2.0).round(),
+    );
+    // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no parent, and this
+    // square has been in the fixed since the drag began: every reposition after the first
+    // failed the assertion and did nothing. The square froze where it was picked up while
+    // the hole in the row kept following the pointer — and, worse, the squares left
+    // stranded in the fixed stayed over the bar taking clicks that were not theirs, which
+    // is why nothing in the bar could be pressed at all.
+    overlay.move_(&square, x, y);
+    // The gap is measured against the row as it is *now*, with the placeholder in it, so
+    // the hole moves and the gap follows it.
+    let gap = row_geometry(&tasks).gap_at(pointer_x);
+    if gap == state.borrow().gap {
+        return false;
+    }
+    if let Some(placeholder) = placeholder_for(&tasks) {
+        put_child(&tasks, placeholder.upcast_ref(), gap);
+    }
+    state.borrow_mut().gap = gap;
+    if menu_debug() {
+        eprintln!("oxide-panel: gap {gap} for {app:?} (pointer {pointer_x:.0})");
+    }
+    true
+}
+
+/// Abandon a drag without moving anything.
+///
+/// Called before the row is rebuilt. A carried square lives outside the row, so a rebuild
+/// that empties the row would leave it stranded in the layer above it — still holding
+/// pointer input, over a bar position that no longer means anything. Every button in the
+/// row is about to be discarded anyway, so the square is simply let go of.
+fn drag_cancel() {
+    let running = DRAG.with(|drag| drag.borrow_mut().take());
+    if running.is_none() && carried_square_count() == 0 {
+        return;
+    }
+    // Take the whole layer away rather than emptying it. Emptying leaves the widget over
+    // the bar taking clicks aimed at the squares; this is what puts the bar back to
+    // having nothing between it and the pointer.
+    drop_carried_layer();
+    // And take the placeholder out of the row, or it is a hole in the bar that nothing
+    // will ever fill.
+    if let Some(tasks) = tasks_box()
+        && let Some(placeholder) = placeholder_for(&tasks)
+    {
+        tasks.remove(&placeholder);
+    }
+    if menu_debug() && running.is_some() {
+        eprintln!("oxide-panel: drag abandoned by a rebuild");
+    }
+}
+
+/// How many widgets the carried layer is holding, which should never be more than one.
+fn carried_square_count() -> usize {
+    let Some(layer) = existing_carried_layer() else {
+        return 0;
+    };
+    let mut count = 0usize;
+    let mut cursor = layer.first_child();
+    while let Some(widget) = cursor {
+        count += 1;
+        cursor = widget.next_sibling();
+    }
+    count
+}
+
+/// Put the square down where it was dropped, and remember it.
+///
+/// Returns whether it actually moved, which is what tells a press that picked a square up
+/// and put it straight back from one that rearranged the bar.
+fn drag_end() -> bool {
+    let state = DRAG.with(|drag| drag.borrow_mut().take());
+    let (Some(state), Some(tasks), Some(overlay)) = (state, tasks_box(), carried_layer()) else {
+        return false;
+    };
+    let app = state.borrow().app.clone();
+    let gap = state.borrow().gap;
+
+    // The square goes back in the row, in the placeholder's place, and the placeholder
+    // goes away. Whatever the row was showing before the drag began is restored by the
+    // rebuild below, so this only has to be *correct*, not pretty.
+    let square = carried_square(&app);
+    if square.is_none() {
+        // The square has gone missing from the layer, which means something went wrong
+        // mid-drag. Put everything back rather than leaving a half-finished one.
+        drag_cancel();
+        return false;
+    }
+    let landed = placeholder_for(&tasks);
+    let index = landed
+        .as_ref()
+        .and_then(|placeholder| child_index(&tasks, placeholder))
+        .unwrap_or(gap);
+    if let Some(placeholder) = landed {
+        tasks.remove(&placeholder);
+    }
+    let stayed = index == state.borrow().original;
+    if let Some(square) = square {
+        square.remove_css_class(DRAG_CARRYING);
+        overlay.remove(&square);
+        put_child(&tasks, square.upcast_ref(), index);
+    }
+    // The square is back in the row, so the layer has nothing left to be for.
+    drop_carried_layer();
+    if stayed {
+        if menu_debug() {
+            eprintln!("oxide-panel: {app:?} put down where it started");
+        }
+        return false;
+    }
+    if menu_debug() {
+        eprintln!("oxide-panel: {app:?} moved to {index}");
+    }
+    // The same path a drop took, so there is one way the bar is reordered and saved.
+    place_at(&app, index);
+    true
+}
+
+/// The box the squares are in, while there is a bar.
+fn tasks_box() -> Option<GtkBox> {
+    LAST_BAR.with(|cell| cell.borrow().as_ref().map(|state| state.0.clone()))
+}
+
+/// The layer a carried square is put in, built now if there is not one already.
+///
+/// Built on demand and torn down afterwards rather than kept: a widget left sitting over
+/// the row is a widget sitting between the pointer and the squares, and it takes the
+/// click whether or not anything is in it.
+fn carried_layer() -> Option<gtk4::Fixed> {
+    if let Some(existing) = existing_carried_layer() {
+        return Some(existing);
+    }
+    let overlay = OVERLAY.with(|cell| cell.borrow().clone())?;
+    let layer = gtk4::Fixed::new();
+    layer.set_halign(gtk4::Align::Start);
+    layer.set_valign(gtk4::Align::Start);
+    overlay.add_overlay(&layer);
+    Some(layer)
+}
+
+/// The carried layer, if one is already there.
+///
+/// Never builds one. A function that only wants to *look* at the layer must not be able to
+/// bring it into existence, because a layer over the bar is a layer over the squares and
+/// nothing about it should ever be created by a read.
+fn existing_carried_layer() -> Option<gtk4::Fixed> {
+    let overlay = OVERLAY.with(|cell| cell.borrow().clone())?;
+    let mut cursor = overlay.last_child();
+    while let Some(widget) = cursor {
+        if let Some(layer) = widget.downcast_ref::<gtk4::Fixed>() {
+            return Some(layer.clone());
+        }
+        cursor = widget.prev_sibling();
+    }
+    None
+}
+
+/// Take the carried layer out of the overlay, so nothing is over the bar.
+fn drop_carried_layer() {
+    let overlay = OVERLAY.with(|cell| cell.borrow().clone());
+    let Some(overlay) = overlay else { return };
+    let mut cursor = overlay.last_child();
+    while let Some(widget) = cursor {
+        let next = widget.prev_sibling();
+        if widget.downcast_ref::<gtk4::Fixed>().is_some() {
+            widget.unparent();
+        }
+        cursor = next;
+    }
+}
+
+/// One square, by app.
+fn square_for(tasks: &GtkBox, app: &str) -> Option<Button> {
+    let mut child = tasks.first_child();
+    while let Some(widget) = child {
+        let square = widget.upcast::<gtk4::Widget>();
+        if let Some(button) = square.downcast_ref::<Button>()
+            && app_of(&square).as_deref() == Some(app)
+        {
+            return Some(button.clone());
+        }
+        child = square.next_sibling();
+    }
+    None
+}
+
+/// The square currently in the carried layer, if a drag is running.
+fn carried_square(app: &str) -> Option<Button> {
+    let mut cursor = existing_carried_layer()?.first_child();
+    while let Some(widget) = cursor {
+        if let Some(button) = widget.downcast_ref::<Button>()
+            && app_of(&square_ref(button)).as_deref() == Some(app)
+        {
+            return Some(button.clone());
+        }
+        cursor = widget.next_sibling();
+    }
+    None
+}
+
+/// A button as the plain widget its name is read from.
+fn square_ref(button: &Button) -> gtk4::Widget {
+    button.clone().upcast()
+}
+
+/// The placeholder standing in for the carried square.
+fn placeholder_for(tasks: &GtkBox) -> Option<gtk4::Widget> {
+    let mut child = tasks.first_child();
+    while let Some(widget) = child {
+        let square = widget.upcast::<gtk4::Widget>();
+        if square.widget_name() == GAP_NAME {
+            return Some(square.clone());
+        }
+        child = square.next_sibling();
+    }
+    None
+}
+
+/// Whether two widgets are the same object, without borrowing one to compare it.
+///
+/// A box can only be walked one child at a time and the child being looked for is held
+/// elsewhere, so the pointers are compared rather than the values.
+fn same_widget(a: &gtk4::Widget, b: &gtk4::Widget) -> bool {
+    std::ptr::eq(a.as_ptr(), b.as_ptr())
+}
+
+/// Put a child at an index in a box, moving it if it is already in one.
+///
+/// `GtkBox` has no `insert`, only `insert_child_after` — so the siblings are read to find
+/// who should precede it, and a child going to the front is prepended. Taken at face
+/// value, `insert_child_after` with a child still in the box moves nothing at all, which
+/// is a quiet way to do nothing for a whole drag.
+fn put_child(parent: &GtkBox, child: &gtk4::Widget, index: usize) {
+    let child = child.clone();
+    // Unparented first, always. `insert_child_after` with a child that is still in a box
+    // moves nothing at all, which is a silent way to do nothing.
+    if child.parent().is_some() {
+        child.unparent();
+    }
+    if index == 0 {
+        parent.prepend(&child);
+        return;
+    }
+    let mut siblings: Vec<gtk4::Widget> = Vec::new();
+    let mut cursor = parent.first_child();
+    while let Some(widget) = cursor {
+        siblings.push(widget.clone());
+        cursor = widget.next_sibling();
+    }
+    match siblings.get(index - 1) {
+        Some(before) => parent.insert_child_after(&child, Some(before)),
+        // Past the end: the end is the only place left to put it.
+        None => parent.append(&child),
+    }
+}
+
+/// Where a child sits in a box.
+fn child_index(parent: &GtkBox, child: &gtk4::Widget) -> Option<usize> {
+    let mut index = 0usize;
+    let mut cursor = parent.first_child();
+    while let Some(widget) = cursor {
+        if same_widget(&widget, child) {
+            return Some(index);
+        }
+        index += 1;
+        cursor = widget.next_sibling();
+    }
+    None
 }
 
 /// Move an app's square to a place in the bar, and remember it.
@@ -3662,6 +4622,49 @@ fn place_at(id: &str, index: usize) {
     save_layout();
 }
 
+/// Show or hide one square's tooltip, to match whether a menu is up.
+///
+/// A tooltip says what a square is, and a menu under the pointer is about to say it
+/// better. Left on, it came up underneath the app menu and drew through it: the menus are
+/// 35% black over whatever is behind them, so anything behind shows.
+fn sync_tooltip(button: &Button, menu: &Rc<Menu>, context: &Rc<ContextMenu>) {
+    button.set_has_tooltip(!(menu.shown.get() || context.shown.get()));
+}
+
+/// Bring every square's tooltip into line with the menus, from whichever menu just moved.
+///
+/// Called whenever a menu opens or closes, so the answer does not depend on when the bar
+/// happened to be rebuilt — which is what used to leave every square tooltip-less after
+/// one menu had been opened, until some window's title changed.
+fn sync_tooltips_from(menu: &Rc<Menu>) {
+    let context = LAST_BAR.with(|cell| cell.borrow().as_ref().map(|state| state.4.clone()));
+    if let Some(context) = context {
+        sync_tooltips(menu, &context);
+    }
+}
+
+fn sync_tooltips_from_context(context: &Rc<ContextMenu>) {
+    let menu = LAST_BAR.with(|cell| cell.borrow().as_ref().map(|state| state.1.clone()));
+    if let Some(menu) = menu {
+        sync_tooltips(&menu, context);
+    }
+}
+
+/// Bring every square's tooltip into line with the menus.
+fn sync_tooltips(menu: &Rc<Menu>, context: &Rc<ContextMenu>) {
+    let tasks = LAST_BAR.with(|cell| cell.borrow().as_ref().map(|state| state.0.clone()));
+    let Some(tasks) = tasks else {
+        return;
+    };
+    let mut child = tasks.first_child();
+    while let Some(widget) = child {
+        if let Some(button) = widget.downcast_ref::<Button>() {
+            sync_tooltip(button, menu, context);
+        }
+        child = widget.next_sibling();
+    }
+}
+
 /// One square (1:1) per app, with indicator dots for its window count.
 ///
 /// With several windows open the square opens a menu of their previews
@@ -3669,7 +4672,7 @@ fn place_at(id: &str, index: usize) {
 fn app_button(
     app_id: &str,
     windows: &[&WindowInfo],
-    stream: &Rc<UnixStream>,
+    stream: &Channel,
     multiple: bool,
     key: &str,
     menu: &Rc<Menu>,
@@ -3685,6 +4688,9 @@ fn app_button(
     let idle = count == 0;
 
     let button = Button::new();
+    // Named for the app, which is how a drag finds this square again: the row moves
+    // squares by app, and a button carries nothing else that survives a rebuild.
+    set_app_of(&button, key);
     button.add_css_class("task");
     if minimized || idle {
         button.add_css_class("minimized");
@@ -3706,15 +4712,14 @@ fn app_button(
         1 => window_title(windows[0]),
         _ => format!("{count} windows"),
     };
-    // A tooltip says what a square is, and a menu under the pointer is about to say it
-    // better. Left on, it came up underneath the app menu and drew through it: the
-    // menus are 35% black over whatever is behind them, so anything behind shows.
-    if menu.shown.get() || context.shown.get() {
-        button.set_has_tooltip(false);
-    } else {
-        button.set_has_tooltip(true);
-        button.set_tooltip_text(Some(&tooltip));
-    }
+    // The text is always set; whether it is *shown* is not decided here. That used to be
+    // decided here, from whether a menu was open at the moment this square was built —
+    // and nothing ever turned it back on except another rebuild, which needs a window
+    // title to change. So closing a preview menu left every square in the bar without a
+    // tooltip until something unrelated happened, and the text computed above was thrown
+    // away. See `sync_tooltips`, which both menus call when they open and close.
+    button.set_tooltip_text(Some(&tooltip));
+    sync_tooltip(&button, menu, context);
 
     let icon = resolve_icon(app_id);
     let image = if icon.starts_with('/') {
@@ -3766,16 +4771,42 @@ fn app_button(
         let token = Rc::new(Cell::new(0u64));
         let hover = gtk4::EventControllerMotion::new();
 
+        // Owned handles for the handler, because a controller can outlive this
+        // function. The button is the exception: it is held weakly, because this
+        // controller is added *to* that button, and a strong capture would make a cycle
+        // that no `unparent` breaks. Every rebuild of the bar would leave one behind.
         let on_enter = token.clone();
-        hover.connect_enter({
-            let menu = hover_menu.clone();
-            let key = hover_key.clone();
-            let group = hover_group.clone();
-            let stream = hover_stream.clone();
-            let button = button.clone();
-            let context = hover_context.clone();
+        let (enter_menu, enter_key) = (hover_menu.clone(), hover_key.clone());
+        let (enter_group, enter_stream, enter_context) = (
+            hover_group.clone(),
+            hover_stream.clone(),
+            hover_context.clone(),
+        );
+        hover.connect_enter(glib::clone!(
+            #[weak]
+            button,
+            #[upgrade_or]
+            return,
             move |_, _, _| {
+                let (menu, key, group, stream, context) = (
+                    &enter_menu,
+                    &enter_key,
+                    &enter_group,
+                    &enter_stream,
+                    &enter_context,
+                );
+                // Entering anywhere on the row cancels a close scheduled by leaving the
+                // square before, whether this square has anything to show or not.
+                menu.hover_token.set(menu.hover_token.get() + 1);
                 if group.is_empty() {
+                    // An app with no windows has no previews to offer, so there is
+                    // nothing to switch to and nothing to show. It is not a reason to
+                    // leave the previous app's menu on screen: leaving the previews up
+                    // while the pointer rests somewhere they have nothing to do with is
+                    // how a menu ends up floating over an icon it does not belong to.
+                    if menu.shown.get() && menu.app.borrow().is_some() {
+                        menu_close(menu);
+                    }
                     return;
                 }
                 // One menu at a time: the app menu is up, so this must not open the
@@ -3803,14 +4834,32 @@ fn app_button(
                 }
                 let ticket = on_enter.get().wrapping_add(1);
                 on_enter.set(ticket);
+                // The timer below outlives this handler by up to a quarter of a second,
+                // and the bar can be rebuilt underneath it in the meantime: every window
+                // title change throws away every square and builds new ones. So the timer
+                // must not hold this square — a strong reference would keep the old one
+                // alive for the session — but it must equally not give up when it goes,
+                // or a rebuild in the middle of a hover cancels the hover and the previews
+                // never open. It looks the square up again when it fires instead.
+                let pending_key = key.clone();
                 let menu = menu.clone();
                 let key = key.clone();
                 let group = group.clone();
                 let stream = stream.clone();
-                let button = button.clone();
                 let token = on_enter.clone();
                 let context = context.clone();
                 glib::timeout_add_local(HOVER_OPEN, move || {
+                    // The square this hover started on may have been rebuilt away. That
+                    // is not a reason to abandon the hover: the pointer is still resting
+                    // on the same app, which is still in the bar. Found again by name,
+                    // because a rebuild replaces the widget and its position with it.
+                    let Some(button) = tasks_box()
+                        .as_ref()
+                        .and_then(|tasks| square_for(tasks, &pending_key))
+                    else {
+                        // The app really has gone. Nothing to open.
+                        return glib::ControlFlow::Break;
+                    };
                     if token.get() != ticket {
                         // Left, or moved to another square, before it was due.
                         return glib::ControlFlow::Break;
@@ -3834,11 +4883,35 @@ fn app_button(
                     glib::ControlFlow::Break
                 });
             }
-        });
+        ));
 
         let on_leave = token.clone();
+        let on_leave_menu = menu.clone();
+        let on_leave_key = key.to_string();
         hover.connect_leave(move |_| {
             on_leave.set(on_leave.get().wrapping_add(1));
+            // Only while this app's own previews are up. Leaving a square whose menu is
+            // not showing must not close somebody else's.
+            if !on_leave_menu.shown.get()
+                || on_leave_menu.app.borrow().as_deref() != Some(on_leave_key.as_str())
+            {
+                return;
+            }
+            let menu = on_leave_menu.clone();
+            let ticket = menu.hover_token.get().wrapping_add(1);
+            menu.hover_token.set(ticket);
+            // Deferred, because the pointer may be on its way to the menu or to another
+            // square, and either of those bumps the token and cancels this.
+            let held_key = on_leave_key.clone();
+            glib::timeout_add_local(HOVER_GRACE, move || {
+                if menu.hover_token.get() != ticket {
+                    return glib::ControlFlow::Break;
+                }
+                if menu.app.borrow().as_deref() == Some(held_key.as_str()) {
+                    menu_close(&menu);
+                }
+                glib::ControlFlow::Break
+            });
         });
         button.add_controller(hover);
     }
@@ -3868,49 +4941,105 @@ fn app_button(
     // The token is copied in first, because the release handler and the drag below
     // share it and a closure that moved it would leave them holding a moved value.
     let press_here = press.clone();
-    // Two copies, one per closure below.
-    let (press_context, release_context) = (context.clone(), context.clone());
+    let release_context = context.clone();
     // The release handler needs the same handles, and a closure that took them would
     // leave it holding moved values.
     let (rel_stream, rel_key, rel_menu) = (stream.clone(), key.clone(), menu.clone());
     let (rel_owned, rel_button) = (owned.clone(), button.clone());
-    gesture.connect_pressed(glib::clone!(
-        #[weak]
-        button,
-        #[upgrade_or]
-        return,
+    gesture.connect_pressed({
+        let press_here = press_here.clone();
+        let key = key.clone();
+        let stream = stream.clone();
+        let menu = menu.clone();
+        let button = button.clone();
+        let owned = owned.clone();
+        let context = context.clone();
         move |_, _, _, _| {
             let ticket = press_here.get().wrapping_add(1);
             press_here.set(ticket);
-            let stream = stream.clone();
-            let key = key.clone();
-            let menu = menu.clone();
-            let owned = owned.clone();
-            let button = button.clone();
-            let press_here = press_here.clone();
-            let context = press_context.clone();
+            if menu_debug() {
+                eprintln!("oxide-panel: pressed {key:?}");
+            }
+            // Activate shortly after the press, if it is still held.
+            //
+            // Not a convenience: this is the only thing that makes a click reliable. The
+            // alternative is to wait for the release, and the release is delivered to the
+            // square that was pressed — but `rebuild_tasks` throws away every square and
+            // builds new ones on every snapshot from the compositor, so a button rebuilt
+            // between the press and the release never delivers it. That is not a rare
+            // edge: the compositor sends a snapshot whenever a window opens, closes or
+            // takes focus, which is most of what happens while you are using a bar. The
+            // log showed eighteen presses and not one release.
+            //
+            // A release still acts at once, and bumps the token, so a plain click is not
+            // left waiting; and a drag bumps it too, so picking a square up never also
+            // activates it.
+            let armed_press = press_here.clone();
+            let armed_stream = stream.clone();
+            let armed_menu = menu.clone();
+            let armed_button = button.clone();
+            let armed_owned = owned.clone();
+            let armed_key = key.clone();
+            let armed_context = context.clone();
             glib::timeout_add_local(CLICK_ARM, move || {
-                if press_here.get() != ticket {
+                if armed_press.get() != ticket || drag_active() {
                     // Released already, or a drag took this press instead.
                     return glib::ControlFlow::Break;
                 }
-                press_here.set(press_here.get().wrapping_add(1));
-                // One menu at a time: the app menu is up, so this click dismisses it
-                // rather than opening the previews behind it.
-                if context.shown.get() {
-                    context_close(&context);
+                armed_press.set(armed_press.get().wrapping_add(1));
+                // The app menu dismisses itself rather than opening the previews behind
+                // it, and one menu at a time.
+                if armed_context.shown.get() {
+                    context_close(&armed_context);
                     return glib::ControlFlow::Break;
                 }
-                activate(&stream, &key, &owned, &menu, &button, multiple);
+                activate(
+                    &armed_stream,
+                    &armed_key,
+                    &armed_owned,
+                    &armed_menu,
+                    &armed_button,
+                    multiple,
+                );
                 glib::ControlFlow::Break
             });
+
+            // Holding without moving picks the square up, if the drag is on.
+            let held_press = press_here.clone();
+            let held_key = key.clone();
+            if std::env::var_os("OXIDE_PANEL_DRAG").is_some() {
+                glib::timeout_add_local(DRAG_HOLD, move || {
+                    if held_press.get() != ticket || drag_active() {
+                        // Released, already carrying a square, or the drag has begun.
+                        return glib::ControlFlow::Break;
+                    }
+                    held_press.set(held_press.get().wrapping_add(1));
+                    drag_begin(&held_key);
+                    glib::ControlFlow::Break
+                });
+            }
         }
-    ));
+    });
     {
         let press = press.clone();
         gesture.connect_released(move |_, _, _, _| {
             let ticket = press.get().wrapping_add(1);
             press.set(ticket);
+            if menu_debug() {
+                eprintln!(
+                    "oxide-panel: released {rel_key:?} drag_active={} context_shown={}",
+                    drag_active(),
+                    release_context.shown.get()
+                );
+            }
+            // A press that became a drag ends here too, and the release of it must not
+            // also count as a click. The square has been put back down by the drag's own
+            // end handler by now, so there is nothing left to cancel — only a click that
+            // would focus or start the app that was just moved across the bar.
+            if drag_active() {
+                drag_end();
+                return;
+            }
             if release_context.shown.get() {
                 context_close(&release_context);
                 return;
@@ -3932,25 +5061,82 @@ fn app_button(
     // A right click is the app's own menu, never its previews: what to do with the
     // app is a different question from which of its windows to show, and the
     // previews are already a hover away.
-    // Dragging this square somewhere else in the bar. The drag content is the app
-    // id, so a drop knows which square it is being given a place to, and the drop
-    // target is the row the squares are in.
-    let drag = gtk4::DragSource::new();
-    drag.connect_drag_begin({
-        let id = key.to_string();
-        let press = press.clone();
-        move |source, _| {
-            // This press is a drag, not a click. Bumping the token stops the armed
-            // click from running, so rearranging the bar does not also focus or
-            // start the app being moved.
-            press.set(press.get().wrapping_add(1));
-            let value = id.to_value();
-            source.set_content(Some(&gdk::ContentProvider::for_value(&value)));
-        }
-    });
+    // Picking this square up and putting it somewhere else in the bar.
+    //
+    // A `GestureDrag` of our own rather than GTK's drag-and-drop, because the gesture
+    // wanted here is not drop-on-release: the row rearranges *while* the pointer moves,
+    // which a drag source cannot express — it reports a beginning, an end and a drop, and
+    // nothing in between. It is also why a drag could never be started at all before: a
+    // `DragSource` and the click gesture above are both single-pointer gestures on the
+    // same button, and the click gesture was added first, so it claimed the sequence and
+    // the drag source was never offered one.
+    //
+    // Two ways in, meaning the same thing: move the pointer, or hold without moving. Both
+    // are wanted. A drag that needs movement begins by activating the app when the hand
+    // is not perfectly steady, and one that needs a hold cannot be started at all by
+    // someone who lifts and puts the square down in one motion.
+    // Off unless OXIDE_PANEL_DRAG is set, and *off by default*.
+    //
+    // The drag rearranges squares by taking one out of the row and putting it in a layer
+    // over it. That is the only thing in the panel that moves a widget between parents
+    // while the user is mid-gesture, and it is the prime suspect for the preview menu
+    // coming up as an empty black box: a square left in the layer, or a placeholder left
+    // in the row, is a hole where a cell should be.
+    //
+    // Rather than keep guessing at which of those it is, the feature is switchable, so
+    // one run with it off says whether the drag is involved at all.
+    let drag_enabled = std::env::var_os("OXIDE_PANEL_DRAG").is_some();
+    let drag = gtk4::GestureDrag::new();
+    drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    if drag_enabled {
+    {
+        let drag_press = press.clone();
+        let drag_key = key.to_string();
+        drag.connect_drag_begin(move |_, _, _| {
+            // This press is a drag, not a click: cancelling the armed one here is what
+            // stops rearranging the bar from also focusing or starting the app.
+            drag_press.set(drag_press.get().wrapping_add(1));
+            drag_begin(&drag_key);
+        });
+    }
+    {
+        let drag_press = press.clone();
+        drag.connect_drag_update(move |_, delta_x, _| {
+                if !drag_active() {
+                return;
+            }
+                // Where the pointer is in the row, from where it went down: the square's
+                // own left edge in the row, plus the centre of the square, plus the
+                // distance travelled. The square is centred on the pointer rather than
+                // hanging below it, which needs no record of where inside the square the
+                // press landed.
+                let start_left = DRAG.with(|drag| {
+                    drag
+                        .borrow()
+                        .as_ref()
+                        .map(|state| state.borrow().carried_at.0)
+                });
+                let Some(start_left) = start_left else { return };
+                let pointer_x = start_left + f64::from(SQUARE_SIZE) / 2.0 + delta_x;
+                if drag_update(pointer_x, (delta_x, 0.0)) {
+                    if let Some(tasks) = tasks_box() {
+                        tasks.queue_allocate();
+                    }
+                }
+        });
+        drag.connect_drag_end(move |_, _, _| {
+            drag_press.set(drag_press.get().wrapping_add(1));
+            let moved = drag_end();
+            // Put down and rebuilt on an idle rather than here: this runs inside the
+            // gesture, while the square is still being let go of.
+            if moved {
+                glib::idle_add_local_once(|| rebuild_bar());
+            }
+        });
+    }
     button.add_controller(drag);
+    }
 
-    let right_stream = stream.clone();
     let right_key = key.to_string();
     let right_menu = menu.clone();
     let context = context.clone();
@@ -3982,7 +5168,6 @@ fn app_button(
             let opening = context.clone();
             let key = right_key.clone();
             let windows = right_windows.clone();
-            let stream = right_stream.clone();
             let button = button.clone();
             if menu_open_now(&right_menu) {
                 menu_close(&right_menu);
@@ -3992,12 +5177,12 @@ fn app_button(
                         // closing. Two of them at once is what this is avoiding.
                         return glib::ControlFlow::Break;
                     }
-                    context_open(&opening, &key, &windows, &button, &stream);
+                    context_open(&opening, &key, &windows, &button);
                     glib::ControlFlow::Break
                 });
                 return;
             }
-            context_open(&context, &right_key, &right_windows, &button, &right_stream);
+            context_open(&context, &right_key, &right_windows, &button);
         }
     ));
     button.add_controller(secondary);
@@ -4072,25 +5257,41 @@ fn resolve_icon(app_id: &str) -> String {
     FALLBACK_ICON.to_string()
 }
 
-/// Parse a `list\t<count>\t<id>\t<focused>\t<app_id>\t<title>...` line.
-fn parse_snapshot(line: &str) -> Option<Vec<WindowInfo>> {
-    let mut fields = line.split('\t');
-    if fields.next()? != "list" {
+/// Split a message into fields the way the framer does.
+///
+/// For tests, which want to hand [`parse_snapshot`] a message as it arrives rather than
+/// building a frame around it first.
+#[cfg(test)]
+fn fields(message: &str) -> Vec<String> {
+    panel_proto::parse_text(message.as_bytes()).unwrap_or_default()
+}
+
+/// Read the windows out of an already-split `list\t<count>\t<id>\t<focused>\t<minimized>
+/// \t<app_id>\t<title>...` message.
+///
+/// Every field is propagated rather than defaulted, so a snapshot that has been truncated
+/// or reordered is dropped whole instead of becoming a list of half-populated windows. The
+/// declared count is checked against what arrived: the compositor is the only writer, so a
+/// mismatch means the two ends disagree about the format, and quietly using the fields that
+/// did arrive would hide that until something looked wrong on screen.
+fn parse_snapshot(fields: &[String]) -> Option<Vec<WindowInfo>> {
+    if fields.first().map(String::as_str) != Some("list") {
         return None;
     }
-    let _count: usize = fields.next()?.parse().ok()?;
-    let mut windows = Vec::new();
-    while let Some(id) = fields.next() {
-        let focused = fields.next()? == "1";
-        let minimized = fields.next()? == "1";
-        let app_id = fields.next()?.to_string();
-        let title = fields.next()?.to_string();
+    let count: usize = fields.get(1)?.parse().ok()?;
+    let rest = &fields[2..];
+    // Five fields per window.
+    if rest.len() != count * 5 {
+        return None;
+    }
+    let mut windows = Vec::with_capacity(count);
+    for window in rest.chunks_exact(5) {
         windows.push(WindowInfo {
-            id: id.parse().ok()?,
-            focused,
-            minimized,
-            app_id,
-            title,
+            id: window[0].parse().ok()?,
+            focused: window[1] == "1",
+            minimized: window[2] == "1",
+            app_id: window[3].clone(),
+            title: window[4].clone(),
         });
     }
     Some(windows)
@@ -4214,7 +5415,7 @@ mod tests {
     #[test]
     fn parses_a_snapshot() {
         let windows =
-            parse_snapshot("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerminal").unwrap();
+            parse_snapshot(&fields("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerminal")).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].id, 7);
         assert!(windows[0].focused);
@@ -4236,21 +5437,21 @@ mod tests {
         // misread as an empty app id: the walk runs off the end of the line and the
         // whole snapshot is rejected. That is the behaviour that turns a producer
         // mistake into an empty panel rather than a panel full of nonsense.
-        assert!(parse_snapshot("list\t1\t7\t1\t0\t\tfirefox\tMozilla").is_none());
+        assert!(parse_snapshot(&fields("list\t1\t7\t1\t0\t\tfirefox\tMozilla")).is_none());
         // One field short, likewise.
-        assert!(parse_snapshot("list\t1\t7\t1\t0\tfirefox").is_none());
+        assert!(parse_snapshot(&fields("list\t1\t7\t1\t0\tfirefox")).is_none());
         // A count that does not parse.
-        assert!(parse_snapshot("list\tx\t7\t1\t0\tfirefox\tMozilla").is_none());
+        assert!(parse_snapshot(&fields("list\tx\t7\t1\t0\tfirefox\tMozilla")).is_none());
         // And the well-formed line still works, including an empty app id, which is
         // how a window with no app id is sent.
-        let windows = parse_snapshot("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerm").unwrap();
+        let windows = parse_snapshot(&fields("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerm")).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[1].app_id, "");
     }
 
     #[test]
     fn ignores_other_messages() {
-        assert!(parse_snapshot("focus\t3").is_none());
+        assert!(parse_snapshot(&fields("focus\t3")).is_none());
     }
 
     #[test]
@@ -5012,17 +6213,18 @@ mod tests {
         assert_eq!(CLOSE_XBM.as_slice(), compositor);
     }
 
+    /// Feed bytes as though they had arrived in one read.
+    fn deliver(reader: &mut PanelReader, bytes: &[u8]) {
+        reader.feed(bytes);
+    }
+
     #[test]
     fn reads_an_image_payload_after_its_header() {
         let mut reader = PanelReader::default();
-        // Two pixels, and a 0x0A byte in the payload: the length prefix is what
-        // keeps that from truncating the message.
+        // Two pixels, and a 0x0A byte in the payload: the frame length is what keeps that
+        // from truncating the message.
         let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 0x0A];
-        let header = format!("img\t7\t2\t1\t{}\n", pixels.len());
-        reader
-            .buffer
-            .extend_from_slice(header.as_bytes());
-        reader.buffer.extend_from_slice(&pixels);
+        deliver(&mut reader, &panel_proto::encode_image(7, 2, 1, &pixels).unwrap());
 
         let events = reader.drain();
         assert_eq!(events.len(), 1);
@@ -5043,18 +6245,113 @@ mod tests {
     #[test]
     fn waits_for_the_whole_payload() {
         let mut reader = PanelReader::default();
-        reader.buffer.extend_from_slice(b"img\t1\t2\t1\t8\n");
-        reader.buffer.extend_from_slice(&[1, 2, 3]);
+        let frame = panel_proto::encode_image(1, 2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        deliver(&mut reader, &frame[..frame.len() - 5]);
         assert!(reader.drain().is_empty(), "partial payload is not an event");
-        reader.buffer.extend_from_slice(&[4, 5, 6, 7, 8]);
+        deliver(&mut reader, &frame[frame.len() - 5..]);
         assert_eq!(reader.drain().len(), 1);
     }
 
     #[test]
-    fn rejects_a_header_whose_length_lies() {
-        // 2x1 is 8 bytes, not the 9 claimed.
-        assert!(parse_image_header("9\t2\t1\t9").is_none());
-        assert!(parse_image_header("9\t0\t1\t0").is_none());
+    fn a_preview_whose_header_lies_about_its_size_is_dropped_not_misread() {
+        // 2x1 is 8 bytes, not the 9 claimed. The frame is framed correctly, so the reader
+        // stays in step and the *next* message still arrives.
+        let mut reader = PanelReader::default();
+        // Frame length 19: the header plus nine bytes of payload for a 2x1 image, which
+        // is eight. The frame itself is framed correctly, which is the point.
+        let mut wire = b"19\nimg\t9\t2\t1\nabcdefghi".to_vec();
+        wire.extend_from_slice(&panel_proto::encode_text("list\t0"));
+        deliver(&mut reader, &wire);
+        let events = reader.drain();
+        assert!(
+            !matches!(events.first(), Some(PanelEvent::Image { .. })),
+            "a header that lies about its size produced an image"
+        );
+        assert!(
+            matches!(events.last(), Some(PanelEvent::Snapshot(list)) if list.is_empty()),
+            "the stream lost its place after a rejected frame: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_list_arrives_as_a_window_list() {
+        let mut reader = PanelReader::default();
+        deliver(
+            &mut reader,
+            &panel_proto::encode_text("list\t2\t1\t1\t0\tfirefox\tA Tab\t2\t0\t1\tcode\tmain.rs"),
+        );
+        let events = reader.drain();
+        match events.first() {
+            Some(PanelEvent::Snapshot(list)) => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0].id, 1);
+                assert!(list[0].focused);
+                assert_eq!(list[0].app_id, "firefox");
+                assert_eq!(list[0].title, "A Tab");
+                assert!(!list[1].focused);
+                assert_eq!(list[1].app_id, "code");
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_message_is_skipped_and_the_next_one_still_arrives() {
+        let mut reader = PanelReader::default();
+        let mut wire = panel_proto::encode_text("something\tnew\tin\tthis\tversion");
+        wire.extend_from_slice(&panel_proto::encode_text("list\t1\t3\t0\t0\tapp\tTitle"));
+        deliver(&mut reader, &wire);
+        let events = reader.drain();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], PanelEvent::Snapshot(_)));
+    }
+
+    #[test]
+    fn a_stream_that_stops_being_readable_is_a_disconnection_too() {
+        // A compositor that has spoken nonsense rather than hung up. There is no
+        // position to resume from, so this is the same event and the same recovery.
+        let mut reader = PanelReader::default();
+        deliver(&mut reader, b"not a length\n");
+        assert!(matches!(
+            reader.drain().first(),
+            Some(PanelEvent::Disconnected)
+        ));
+        deliver(&mut reader, &panel_proto::encode_text("list\t0"));
+        assert!(matches!(
+            reader.drain().first(),
+            Some(PanelEvent::Snapshot(_))
+        ));
+    }
+
+    #[test]
+    fn a_lost_compositor_is_an_event_and_the_panel_starts_over() {
+        // The panel used to treat a closed socket as "no more data", spin on a dead file
+        // descriptor forever, and never recover: a compositor restart left a bar with an
+        // empty task list and no way back.
+        let mut reader = PanelReader::default();
+        deliver(&mut reader, &panel_proto::encode_text("list\t0"));
+        assert!(matches!(
+            reader.drain().first(),
+            Some(PanelEvent::Snapshot(_))
+        ));
+        // A stream that stops mid-frame is not a stream we can read to its end.
+        let frame = panel_proto::encode_image(1, 2, 1, &[0u8; 8]).unwrap();
+        deliver(&mut reader, &frame[..4]);
+        assert!(reader.drain().is_empty(), "a partial frame is not an event");
+        // The rest of that frame, then the socket going away.
+        deliver(&mut reader, &frame[4..]);
+        assert_eq!(reader.drain().len(), 1);
+        reader.report_lost();
+        assert!(matches!(
+            reader.drain().first(),
+            Some(PanelEvent::Disconnected)
+        ));
+        // And the reader is usable afterwards, for the panel that reconnects.
+        deliver(&mut reader, &panel_proto::encode_text("list\t0"));
+        assert!(matches!(
+            reader.drain().first(),
+            Some(PanelEvent::Snapshot(_))
+        ));
     }
 
     #[test]
@@ -5087,9 +6384,50 @@ mod tests {
     }
 
     /// The ordering state is process-wide, so each of these starts from empty.
+    /// Run `body` with an empty layout and the config file redirected to a temporary one.
+    ///
+    /// The redirect is the important half. Anything that changes the layout saves it, and
+    /// the save went to the user's real `panel.conf` — so the test suite used to overwrite
+    /// the running panel's pins and bar order with these tests' fixtures, on every run,
+    /// silently. Kept in one place so a new test cannot reintroduce it by forgetting.
     fn with_empty_layout(body: impl FnOnce()) {
+        let path = std::env::temp_dir().join(format!(
+            "oxide-panel-test-{}-{:?}.conf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _guard = crate::panel_conf::use_test_path(path.clone());
         LAYOUT.with(|layout| *layout.borrow_mut() = Layout::default());
         body();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_test_suite_cannot_write_the_real_config() {
+        // The bug this guards against: `cargo test` silently replacing the user's pins and
+        // bar order with test fixtures. It survived because every test passed and the panel
+        // merely came back with the wrong bar — nobody looks at a config file after a green
+        // test run and concludes it ate their settings.
+        with_empty_layout(|| {
+            toggle_pin("an-app-that-does-not-exist");
+            arrange(&["another-fake-app".to_string()]);
+        });
+        // Nothing was written to the temporary file either, because both of those record
+        // their result in memory and only save on a change that reached disk — but the
+        // point is which path was used, so check that directly.
+        let path = std::env::temp_dir().join(format!(
+            "oxide-panel-probe-{}.conf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _guard = crate::panel_conf::use_test_path(path.clone());
+        toggle_pin("probe");
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            written.contains("pin probe"),
+            "the override was not honoured: {written:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -5182,6 +6520,228 @@ mod tests {
             // nothing to start.
             assert_eq!(missing, ["editor"]);
         });
+    }
+
+    #[test]
+    fn pinned_idle_apps_keep_the_same_order_every_run() {
+        // This used to iterate the pin set, which is a hash set with a per-process
+        // random seed, so two or more pinned-but-not-running apps came out in a
+        // different order every time the panel started — and the next save wrote that
+        // shuffle into panel.conf, so the bar rearranged itself across restarts.
+        with_empty_layout(|| {
+            LAYOUT.with(|layout| {
+                let mut layout = layout.borrow_mut();
+                for id in ["alpha", "beta", "gamma", "delta"] {
+                    layout.pinned.insert(id.to_string());
+                    layout.order.push(id.to_string());
+                }
+            });
+            let groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
+            let first = pinned_without_windows(&groups);
+            assert_eq!(first, ["alpha", "beta", "gamma", "delta"]);
+            // Repeated calls, and a fresh layout with the same pins in the same order,
+            // agree: nothing here depends on hash iteration.
+            for _ in 0..16 {
+                assert_eq!(pinned_without_windows(&groups), first);
+            }
+        });
+    }
+
+    #[test]
+    fn a_pin_with_nowhere_to_go_still_has_a_stable_place() {
+        // A hand-edited file, or an app pinned before it was ever seen: it is in the pin
+        // set but not in the order. It gets a square, and that square does not move
+        // between runs either.
+        with_empty_layout(|| {
+            LAYOUT.with(|layout| {
+                let mut layout = layout.borrow_mut();
+                for id in ["zebra", "yak", "xerus"] {
+                    layout.pinned.insert(id.to_string());
+                }
+            });
+            let groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
+            assert_eq!(
+                pinned_without_windows(&groups),
+                ["xerus", "yak", "zebra"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_window_with_no_app_id_does_not_get_remembered() {
+        // The key for one of these names a panel id, and panel ids start again at one in
+        // every compositor run. Persisting it would hand an unrelated window in a later
+        // session the place this one had — and the file would grow one dead line per such
+        // window ever seen.
+        with_empty_layout(|| {
+            let keys = vec!["browser".to_string(), "#17".to_string()];
+            assert_eq!(arrange(&keys), [0, 1]);
+            let order = LAYOUT.with(|layout| layout.borrow().order.clone());
+            assert_eq!(order, ["browser"]);
+            assert!(!order.iter().any(|entry| entry.starts_with('#')));
+        });
+    }
+
+    /// A `measure` that is proportional to length, so bisection and shaving agree.
+    fn wide_measure(text: &str) -> f64 {
+        text.chars().count() as f64 * 10.0
+    }
+
+    #[test]
+    fn a_title_is_cut_to_fit_however_long_it_is() {
+        // Bisection has to land on the same answer shaving one character at a time did.
+        // Ten a character, so the ellipsis counts against the budget like anything else.
+        assert_eq!(truncate_to_width("firefox", 100.0, &wide_measure), "firefox");
+        // Below 70 the whole title no longer fits, and the ellipsis spends budget too.
+        assert_eq!(truncate_to_width("firefox", 65.0, &wide_measure), "firef\u{2026}");
+        assert_eq!(truncate_to_width("firefox", 55.0, &wide_measure), "fire\u{2026}");
+        assert_eq!(truncate_to_width("firefox", 45.0, &wide_measure), "fir\u{2026}");
+        // Not even the ellipsis fits.
+        assert_eq!(truncate_to_width("firefox", 5.0, &wide_measure), "\u{2026}");
+        assert_eq!(truncate_to_width("firefox", 0.0, &wide_measure), "\u{2026}");
+        // And the whole point: a very long title, measured logarithmically rather than
+        // once per character. Counting the measures is the assertion.
+        let long = "x".repeat(4096);
+        let measures = std::cell::Cell::new(0usize);
+        let counting = |text: &str| {
+            measures.set(measures.get() + 1);
+            wide_measure(text)
+        };
+        let cut = truncate_to_width(&long, 500.0, &counting);
+        assert_eq!(cut.chars().count(), 50);
+        // 12 bisection steps plus the initial check, rather than 4096 measures and a few
+        // hundred megabytes of temporary strings.
+        assert!(
+            measures.get() <= 16,
+            "{} measurements for a 4096 character title",
+            measures.get()
+        );
+    }
+
+    #[test]
+    fn a_close_button_stays_inside_its_own_cell() {
+        // Mid-morph a cell can be narrower than the titlebar. The square used to hang off
+        // its left edge, over the previous cell — so the paint and the hit test disagreed
+        // about what was under the pointer.
+        let cell = Rect {
+            x: 100,
+            y: 6,
+            width: 10,
+            height: 142,
+        };
+        let close = close_rect(&cell);
+        assert!(close.x >= cell.x, "the close square left its cell");
+        assert_eq!(close.x + close.width, cell.x + cell.width);
+        assert_eq!(close.width, 10);
+        // And at full width it is unchanged.
+        let wide = Rect { width: 362, ..cell };
+        assert_eq!(close_rect(&wide).width, TITLEBAR_HEIGHT);
+    }
+
+    #[test]
+    fn a_menu_wider_than_the_output_is_squeezed_onto_it_not_truncated() {
+        // Six ordinary 16:9 windows come to more than a 1280px screen between them. The
+        // layout is the sum of the row and has no idea how wide the display is.
+        let wide: Vec<i32> = (0..6).map(|_| preview_width(1920, 1080) + 2).collect();
+        let natural = layout_menu(&wide);
+        assert!(natural.surface.width > 1280, "this case is meant to overflow");
+        let mut squeezed = natural.clone();
+        fit_menu_to_output(&mut squeezed, 1280);
+        assert_eq!(squeezed.surface.width, 1280 - MENU_EDGE_GAP * 2);
+        // Every cell is still on the surface and still has width, so every window is
+        // still visible and still pressable. Clipping the surface instead would have
+        // quietly lost the tail of the row.
+        assert_eq!(squeezed.cells.len(), 6);
+        for cell in &squeezed.cells {
+            assert!(cell.width > 0, "a cell was squeezed out of existence");
+            assert!(
+                cell.x + cell.width <= squeezed.surface.width,
+                "a cell runs off the right edge"
+            );
+        }
+        // In order, and in proportion.
+        for pair in squeezed.cells.windows(2) {
+            assert!(pair[0].x < pair[1].x);
+        }
+        // A menu that already fits is left exactly as it was.
+        let narrow = layout_menu(&wide[..2]);
+        let mut untouched = narrow.clone();
+        fit_menu_to_output(&mut untouched, 1280);
+        assert_eq!(untouched, narrow);
+        // A bar too narrow to hold even one preview is left alone rather than collapsed:
+        // a menu with no width is not a menu.
+        let mut too_narrow = natural.clone();
+        fit_menu_to_output(&mut too_narrow, 40);
+        assert_eq!(too_narrow, natural);
+    }
+
+    #[test]
+    fn a_cell_that_has_gone_is_not_there_to_be_pressed() {
+        // Geometry alone said yes: a shrinking cell keeps its full width for the rest of
+        // the morph after its fade has finished, so a click on a preview that was already
+        // closing re-focused — or closed — a window on its way out.
+        let widths = [200, 200, 200];
+        let layout = layout_menu(&widths);
+        let middle = layout.cells[1];
+        let x = f64::from(middle.x + 10);
+        let y = f64::from(middle.y + 10);
+        // With every cell live, this is the middle preview.
+        assert_eq!(layout.hit_where(x, y, |_| true), Hit::Preview(1));
+        // With the middle one gone, the point is dead rather than falling through to its
+        // neighbours — pressing one window while aiming at another would be worse.
+        assert_eq!(layout.hit_where(x, y, |index| index != 1), Hit::None);
+        // And with only it live, it is still pressable.
+        assert_eq!(layout.hit_where(x, y, |index| index == 1), Hit::Preview(1));
+        // A cell that is still growing has its full footprint but is not yet there.
+        assert_eq!(layout.hit_where(x, y, |_| false), Hit::None);
+    }
+
+    fn window(id: u64, app: &str) -> WindowInfo {
+        WindowInfo {
+            id,
+            focused: false,
+            minimized: false,
+            app_id: app.to_string(),
+            title: format!("{app} window {id}"),
+        }
+    }
+
+    /// The row as four squares, 36px each with a 2px gap, so middles at 18, 56, 94, 132.
+    fn four_squares() -> RowGeometry {
+        RowGeometry {
+            middles: vec![18.0, 56.0, 94.0, 132.0],
+        }
+    }
+
+    #[test]
+    fn the_gap_under_the_pointer_is_measured_against_the_row_with_the_placeholder_in_it() {
+        // The placeholder is a child of the row like any other, so it contributes a
+        // middle of its own. That is deliberate: the hole the carried square leaves is
+        // exactly as wide as the square, and the pointer has to cross it to move the gap
+        // on by one place.
+        let row = four_squares();
+        // Before the first square, after the last, and either side of each middle.
+        assert_eq!(row.gap_at(4.0), 0);
+        assert_eq!(row.gap_at(17.0), 0);
+        assert_eq!(row.gap_at(19.0), 1);
+        assert_eq!(row.gap_at(56.0), 1);
+        assert_eq!(row.gap_at(58.0), 2);
+        assert_eq!(row.gap_at(200.0), 4);
+        // The row is re-measured as the placeholder moves, so the same x can name
+        // different gaps as the drag runs. That is the whole of "rearrange live".
+        let moved = RowGeometry {
+            middles: vec![18.0, 56.0, 94.0, 132.0],
+        };
+        assert_eq!(moved.gap_at(58.0), 2);
+    }
+
+    #[test]
+    fn a_row_of_one_square_is_never_a_reorder() {
+        let row = RowGeometry {
+            middles: vec![18.0],
+        };
+        assert_eq!(row.gap_at(-50.0), 0);
+        assert_eq!(row.gap_at(500.0), 1);
     }
 
     #[test]

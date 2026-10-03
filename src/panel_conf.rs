@@ -26,12 +26,52 @@ pub struct PanelLayout {
     pub pinned: HashSet<String>,
 }
 
+/// A path to use instead of the real one, for tests.
+///
+/// This exists because of a real, long-standing bug: the panel's tests exercise code that
+/// saves the layout, and that save went to the *user's* actual `panel.conf`. Every
+/// `cargo test` run therefore overwrote the running panel's pins and bar order with test
+/// fixtures — silently, because the tests passed and the panel merely came back with the
+/// wrong bar. Verified against the pre-existing code, not just the current one.
+///
+/// It is a thread-local rather than an environment variable so it cannot be set by
+/// accident at runtime, and it is `#[cfg(test)]` so it is not in a release build at all.
+#[cfg(test)]
+thread_local! {
+    static OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Point [`path`] at a temporary file for the duration of a test.
+///
+/// Returns a guard that puts the real path back, so a test that panics still leaves the
+/// next one looking at the real thing.
+#[cfg(test)]
+pub fn use_test_path(path: PathBuf) -> TestPathGuard {
+    OVERRIDE.with(|slot| *slot.borrow_mut() = Some(path));
+    TestPathGuard(())
+}
+
+/// Puts the real config path back when dropped.
+#[cfg(test)]
+pub struct TestPathGuard(());
+
+#[cfg(test)]
+impl Drop for TestPathGuard {
+    fn drop(&mut self) {
+        OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// Where the file lives.
 ///
-/// `XDG_CONFIG_HOME` is the configured place; `$HOME/.config` is the default for when
-/// it is unset. A panel with no home directory has nowhere to keep anything, which is
-/// not a reason to refuse to start.
+/// `XDG_CONFIG_HOME` is the configured place; `$HOME/.config` is the default for when it
+/// is unset. A panel with no home directory has nowhere to keep anything, which is not a
+/// reason to refuse to start.
 pub fn path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
