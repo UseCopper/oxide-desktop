@@ -12,7 +12,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gtk4::{gdk, gio, glib, prelude::*};
@@ -20,6 +20,9 @@ use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, Image, Label, Orientation,
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+
+use crate::panel_ipc::PanelImage;
+use crate::panel_proto;
 
 const PANEL_HEIGHT: i32 = 40;
 /// Each app is a 1:1 square.
@@ -36,6 +39,12 @@ const DEFAULT_ACCENT: &str = "#d8d8d8";
 const MUTED_COLOR: (f64, f64, f64) = (0.78, 0.78, 0.78);
 /// How often the panel drains the compositor socket.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to wait between attempts to (re)connect to the compositor socket.
+const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// The box a preview is requested inside, `(width, height)`. The compositor
+/// fits each window's own aspect inside it, never distorting; this bounds the
+/// readback cost rather than fixing the shape.
+const PREVIEW_MAX: (i32, i32) = (360, 220);
 const FALLBACK_ICON: &str = "application-x-executable";
 
 thread_local! {
@@ -92,6 +101,7 @@ button.task.minimized {{
 }
 
 /// One open window as reported by the compositor.
+#[derive(Clone)]
 struct WindowInfo {
     id: u64,
     focused: bool,
@@ -101,9 +111,21 @@ struct WindowInfo {
 }
 
 pub fn run_panel() {
-    let app = Application::builder()
-        .application_id("dev.oxide.Panel")
-        .build();
+    // One panel per compositor, which means one D-Bus application id per
+    // compositor. A shared id makes the session bus treat a second panel as a
+    // remote instance of the first: it forwards its activation to the panel
+    // that is already running and then exits, so the second compositor gets
+    // no panel and the first grows extra windows — on its own output, since
+    // that panel's Wayland connection is the one it was started with.
+    //
+    // The compositor hands its socket name to us in `WAYLAND_DISPLAY`, which
+    // is unique per instance (`bind_auto` never reuses a name), so keying the
+    // id off it keeps the panels independent without any extra plumbing.
+    let id = match std::env::var("WAYLAND_DISPLAY") {
+        Ok(socket) if !socket.is_empty() => format!("dev.oxide.Panel.{socket}"),
+        _ => "dev.oxide.Panel".to_string(),
+    };
+    let app = Application::builder().application_id(&id).build();
 
     let stream = connect_panel();
     app.connect_activate(move |app| build_ui(app, stream.clone()));
@@ -118,14 +140,11 @@ fn connect_panel() -> Option<Rc<UnixStream>> {
     let stream = UnixStream::connect(PathBuf::from(path)).ok()?;
     stream.set_nonblocking(true).ok()?;
     Some(Rc::new(stream))
-}
-
-fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
+}fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
     if !gtk4_layer_shell::is_supported() {
         eprintln!("oxide-desktop panel: compositor does not support wlr-layer-shell");
         std::process::exit(1);
     }
-
     install_css();
 
     let window = ApplicationWindow::builder().application(app).build();
@@ -182,10 +201,13 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
         ),
     );
 
-    if let Some(stream) = stream {
-        send_accent(&stream);
-        start_polling(&tasks, stream);
+    // The connection may not be up yet (or may have dropped and come back);
+    // `start_polling` owns reconnecting as well as draining it. The accent
+    // travels with every (re)connect, including this first one.
+    if let Some(stream) = stream.as_ref() {
+        send_accent(stream);
     }
+    start_polling(&tasks, Rc::new(RefCell::new(stream)), PreviewStore::default());
 
     window.set_child(Some(&row));
     window.present();
@@ -194,37 +216,147 @@ fn build_ui(app: &Application, stream: Option<Rc<UnixStream>>) {
 /// Tell the compositor the accent so it can tint the snap preview.
 fn send_accent(stream: &Rc<UnixStream>) {
     let (red, green, blue) = accent_rgb();
-    let message = format!("accent\t{red:.6}\t{green:.6}\t{blue:.6}\n");
-    let _ = (&**stream).write_all(message.as_bytes());
+    send(stream, &format!("accent\t{red:.6}\t{green:.6}\t{blue:.6}"));
+}
+
+/// Write one framed message to the compositor.
+///
+/// A partial write is not treated as an error worth reporting: the socket is
+/// non-blocking, and these are short requests the compositor drains every
+/// frame. Silently dropping one costs a preview that is asked for again on the
+/// next tick.
+fn send(stream: &Rc<UnixStream>, message: &str) {
+    let _ = (&**stream).write_all(&panel_proto::encode_text(message));
+}
+
+/// The newest preview received for each window, as RGBA rows.
+///
+/// The compositor pushes frames for the windows the panel has asked about, and
+/// this holds the most recent one: a live preview is drawn from the last frame
+/// the compositor ever produced, not from whatever happens to arrive next.
+#[derive(Clone, Default)]
+struct PreviewStore(Rc<RefCell<HashMap<u64, PanelImage>>>);
+
+impl PreviewStore {
+    fn insert(&self, id: u64, width: i32, height: i32, pixels: Vec<u8>) {
+        self.0.borrow_mut().insert(
+            id,
+            PanelImage {
+                id,
+                width,
+                height,
+                pixels,
+            },
+        );
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.0.borrow().contains_key(&id)
+    }
+
+    fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
 }
 
 /// Drain the compositor socket and rebuild the task list on every snapshot.
-fn start_polling(tasks: &GtkBox, stream: Rc<UnixStream>) {
+/// The connection is owned here: when it is missing or goes away, reconnect.
+/// Every known window gets a preview request each tick, so the preview store
+/// always holds the most recent frame the compositor has produced for it — for
+/// every app at once, with the compositor skipping windows whose pixels have
+/// not changed and budgeting the ones that have.
+fn start_polling(tasks: &GtkBox, slot: Rc<RefCell<Option<Rc<UnixStream>>>>, previews: PreviewStore) {
     let tasks = tasks.clone();
-    let pending = RefCell::new(Vec::<u8>::new());
+    let reader = RefCell::new(panel_proto::FrameReader::new());
+    let windows = RefCell::new(Vec::<WindowInfo>::new());
+    let last_attempt = Cell::new(None::<Instant>);
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match (&*stream).read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => pending.borrow_mut().extend_from_slice(&buf[..n]),
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        // Bound before matching: a scrutinee temporary would hold the borrow
+        // through the match body, and the arms below borrow_mut.
+        let live = slot.borrow().clone();
+        let mut dead = false;
+        if let Some(stream) = live.as_ref() {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match (&**stream).read(&mut buf) {
+                    Ok(0) => {
+                        dead = true;
+                        break;
+                    }
+                    Ok(n) => reader.borrow_mut().feed(&buf[..n]),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        dead = true;
+                        break;
+                    }
+                }
             }
         }
-
-        loop {
-            let Some(newline) = pending.borrow().iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let line = {
-                let mut pending = pending.borrow_mut();
-                let line = String::from_utf8_lossy(&pending[..newline]).to_string();
-                pending.drain(..=newline);
-                line
-            };
-            if let Some(windows) = parse_snapshot(&line) {
-                rebuild_tasks(&tasks, &windows, &stream);
+        if dead {
+            // The compositor dropped us. Drop our end, forget its window list
+            // and every preview that came over it — they belong to a compositor
+            // that is no longer listening, and a reconnect starts from nothing.
+            reader.borrow_mut().reset();
+            windows.borrow_mut().clear();
+            previews.clear();
+            slot.borrow_mut().take();
+            last_attempt.set(Some(Instant::now()));
+        } else if live.is_none() {
+            let ready = last_attempt
+                .get()
+                .is_none_or(|at| Instant::now().saturating_duration_since(at) >= RETRY_INTERVAL);
+            if ready {
+                last_attempt.set(Some(Instant::now()));
+                if let Some(stream) = connect_panel() {
+                    send_accent(&stream);
+                    slot.borrow_mut().replace(stream);
+                }
+            }
+        } else {
+            let stream = live.unwrap();
+            // Hand over whole frames. A frame that cannot be read past means
+            // the stream has no recoverable position: drop the connection and
+            // start over.
+            loop {
+                let next = reader.borrow_mut().next_frame();
+                let Some(frame) = next else {
+                    break;
+                };
+                let Ok(frame) = frame else {
+                    dead = true;
+                    break;
+                };
+                if frame.starts_with(b"img\t") {
+                    if let Some(image) = panel_proto::decode_image(&frame) {
+                        previews.insert(image.id, image.width, image.height, image.pixels);
+                    }
+                    continue;
+                }
+                if let Some(list) = panel_proto::parse_text(&frame)
+                    .filter(|fields| fields.first().map(String::as_str) == Some("list"))
+                    .and_then(|fields| parse_snapshot(&fields))
+                {
+                    *windows.borrow_mut() = list.clone();
+                    rebuild_tasks(&tasks, &list, &stream);
+                }
+            }
+            if !dead {
+                // A refresh request per known window. `wanted` says the panel
+                // has nothing for it, so the compositor answers even for a
+                // window it cannot render right now (a minimized one) from its
+                // own last captured frame. Unchanged windows cost nothing on
+                // the compositor side, so this can run every tick.
+                for window in windows.borrow().iter() {
+                    let wanted = u8::from(!previews.contains(window.id));
+                    send(
+                        &stream,
+                        &format!(
+                            "preview\t{}\t{}\t{}\t{}",
+                            window.id, PREVIEW_MAX.0, PREVIEW_MAX.1, wanted
+                        ),
+                    );
+                }
             }
         }
 
@@ -320,8 +452,7 @@ fn app_button(app_id: &str, windows: &[&WindowInfo], stream: &Rc<UnixStream>) ->
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     gesture.connect_pressed(move |_, _, _, _| {
-        let message = format!("focus\t{target}\n");
-        let _ = (&*stream).write_all(message.as_bytes());
+        send(&stream, &format!("focus\t{target}"));
     });
     button.add_controller(gesture);
 
@@ -513,9 +644,10 @@ fn desktop_file_icon(path: &Path) -> Option<String> {
     None
 }
 
-/// Parse a `list\t<count>\t<id>\t<focused>\t<app_id>\t<title>...` line.
-fn parse_snapshot(line: &str) -> Option<Vec<WindowInfo>> {
-    let mut fields = line.split('\t');
+/// Parse a `list` frame's fields: verb, count, then five per window —
+/// id, focused, minimized, app id, title.
+fn parse_snapshot(fields: &[String]) -> Option<Vec<WindowInfo>> {
+    let mut fields = fields.iter();
     if fields.next()? != "list" {
         return None;
     }
@@ -630,10 +762,18 @@ fn update_clock(label: &Label) {
 mod tests {
     use super::*;
 
+    /// Split a wire line into the fields `parse_snapshot` reads, the way
+    /// [`panel_proto::parse_text`] would.
+    fn fields(line: &str) -> Vec<String> {
+        line.split('\t').map(str::to_string).collect()
+    }
+
     #[test]
     fn parses_a_snapshot() {
-        let windows =
-            parse_snapshot("list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerminal").unwrap();
+        let windows = parse_snapshot(&fields(
+            "list\t2\t7\t1\t0\tfirefox\tMozilla\t8\t0\t1\t\tTerminal",
+        ))
+        .unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].id, 7);
         assert!(windows[0].focused);
@@ -649,7 +789,7 @@ mod tests {
 
     #[test]
     fn ignores_other_messages() {
-        assert!(parse_snapshot("focus\t3").is_none());
+        assert!(parse_snapshot(&fields("focus\t3")).is_none());
     }
 
     #[test]

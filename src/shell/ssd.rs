@@ -69,6 +69,17 @@ pub struct WindowState {
     /// Stable identifier used by the panel to refer to this window. Assigned
     /// lazily the first time the window list is published.
     pub panel_id: Option<u64>,
+    /// Bumped every time the client commits a new buffer.
+    ///
+    /// The panel asks for previews to show live window content, but rendering
+    /// one means reading the whole window back off the GPU, so it is only worth
+    /// doing for a window whose contents actually changed. This counter is what
+    /// makes that check cheap.
+    pub content_generation: u64,
+    /// The [`content_generation`](Self::content_generation) the panel's current
+    /// preview was rendered from, if any. A request matching it is answered with
+    /// nothing, leaving the panel to keep showing the image it has.
+    pub previewed_generation: Option<u64>,
     pub header_bar: HeaderBar,
 }
 
@@ -1058,6 +1069,8 @@ impl WindowElement {
                 visibility: VisibilityState::default(),
                 last_frame: None,
                 panel_id: None,
+                content_generation: 0,
+                previewed_generation: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
                     width: 0,

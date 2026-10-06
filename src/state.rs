@@ -210,6 +210,24 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
     /// Counter for assigning stable panel ids to windows.
     pub next_panel_id: u64,
+    /// Windows the panel has asked a preview of that have not been rendered yet.
+    ///
+    /// Coalesced by window, oldest first, and served a couple per frame, so the
+    /// whole set settles at frame_rate / n fps instead of one window getting all
+    /// the budget.
+    pub panel_preview_queue: std::collections::VecDeque<u64>,
+    /// Which of those are already queued, so a window asked for again while it
+    /// waits is not queued twice.
+    pub panel_preview_queued: std::collections::HashSet<u64>,
+    /// The last frame captured for each window, so a window that can no longer
+    /// be rendered — a minimized one, which is unmapped and has nothing to
+    /// capture — can still be answered. This is what keeps the panel showing
+    /// the most recent frame it ever got for such a window.
+    pub panel_cached_previews: std::collections::HashMap<u64, crate::panel_ipc::PanelImage>,
+    /// The size each queued window was asked for, carried with it rather than
+    /// remembered per tick: a window can be queued on one tick and come up for
+    /// service several ticks later.
+    pub panel_preview_sizes: std::collections::HashMap<u64, (i32, i32)>,
 }
 
 #[derive(Debug)]
@@ -854,6 +872,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             snap_candidate_since: Instant::now(),
             panel_ipc: None,
             next_panel_id: 1,
+            panel_preview_queue: std::collections::VecDeque::new(),
+            panel_preview_queued: std::collections::HashSet::new(),
+            panel_cached_previews: std::collections::HashMap::new(),
+            panel_preview_sizes: std::collections::HashMap::new(),
         };
 
         crate::panel_ipc::spawn_panel(&mut state);
@@ -1282,4 +1304,19 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
+
+    /// Render a scaled-down preview of `window` for the panel, fitted inside
+    /// `max`. Returns the size it was rendered at — the fit rather than `max`,
+    /// which depends on the window's aspect ratio — along with tightly packed
+    /// R, G, B, A rows.
+    ///
+    /// Defaults to "no preview": a backend that cannot spare a renderer just
+    /// leaves the panel showing whatever it last had.
+    fn panel_thumbnail(
+        &mut self,
+        _window: &WindowElement,
+        _max: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Option<(smithay::utils::Size<i32, smithay::utils::Buffer>, Vec<u8>)> {
+        None
+    }
 }

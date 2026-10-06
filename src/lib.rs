@@ -15,6 +15,7 @@ pub mod input_handler;
 pub mod libei;
 pub mod panel;
 pub mod panel_ipc;
+pub mod panel_proto;
 pub mod render;
 pub mod shell;
 pub mod state;
