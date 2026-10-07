@@ -100,6 +100,13 @@ pub enum PanelMessage {
     Focus(u64),
     /// Close the window with this id, and only that one.
     Close(u64),
+    /// Start the app with this id.
+    ///
+    /// An id rather than a command line, so the panel cannot ask for something
+    /// to be run that was never an installed application: the compositor looks
+    /// the id up in the desktop entries itself and runs what it finds, or
+    /// nothing.
+    Launch(String),
     /// The panel is showing a preview of this window and wants it scaled to fit
     /// inside the given box.
     Preview {
@@ -496,6 +503,14 @@ fn parse_frame(frame: &[u8]) -> Incoming {
             Some(id) => Incoming::Message(PanelMessage::Close(id)),
             None => Incoming::Ignored,
         },
+        Some("launch") => match fields.get(1) {
+            // Already sanitized by the framing rule on the sending side, and bounded
+            // here in case it was not.
+            Some(id) if !id.is_empty() => {
+                Incoming::Message(PanelMessage::Launch(panel_proto::truncate(id).to_string()))
+            }
+            _ => Incoming::Ignored,
+        },
         Some("accent") => match parse_accent(&fields) {
             Some(rgb) => Incoming::Message(PanelMessage::Accent(rgb)),
             None => Incoming::Ignored,
@@ -598,6 +613,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             match message {
                 PanelMessage::Focus(id) => self.focus_panel_window(id),
                 PanelMessage::Close(id) => self.close_panel_window(id),
+                PanelMessage::Launch(id) => self.launch_app(&id),
                 PanelMessage::Accent(rgb) => crate::shell::set_preview_color(rgb),
                 PanelMessage::Preview {
                     id,
@@ -831,6 +847,63 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         self.send_close(&window);
     }
 
+    /// Start the app the panel named, from its desktop entry.
+    ///
+    /// Spawned here rather than by the panel, for two reasons. The app becomes a child
+    /// of the session rather than of the panel, which the compositor can outlive; and
+    /// the command that runs is one the compositor looked up itself, out of the
+    /// installed entries, rather than a string the panel sent over a socket.
+    ///
+    /// An id with no entry, or an entry with nothing runnable in it, is reported and
+    /// otherwise ignored. A pinned app whose entry has since been uninstalled is the
+    /// case that actually happens.
+    fn launch_app(&mut self, id: &str) {
+        use std::process::{Command, Stdio};
+
+        let Some(app) = crate::desktop::lookup(id) else {
+            warn!(app = %id, "Panel asked to launch an app with no desktop entry");
+            return;
+        };
+        let Some((program, arguments)) = app.command() else {
+            warn!(app = %id, exec = %app.exec, "Desktop entry has nothing runnable");
+            return;
+        };
+
+        let mut command = Command::new(&program);
+        command.args(&arguments);
+        // The app has to land on *this* compositor, not on whatever this process
+        // inherited. A nested session's compositor is itself a Wayland client of the
+        // one above it, so its `WAYLAND_DISPLAY` is the outer display and an app
+        // launched with it would open a window somewhere else entirely.
+        //
+        // Unless the entry sets one itself — `Exec=env WAYLAND_DISPLAY=foo app` is a
+        // thing people write, and overriding that would break it.
+        if !crate::desktop::split_command(&app.exec)
+            .iter()
+            .any(|word| word.starts_with("WAYLAND_DISPLAY="))
+            && let Some(socket_name) = self.socket_name.clone()
+        {
+            command.env("WAYLAND_DISPLAY", &socket_name);
+        }
+        let spawned = command
+            // Nothing of ours on its standard streams: the app would otherwise inherit
+            // this process's terminal and be killed with it.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                tracing::info!(app = %id, name = %app.label(), pid = child.id(), "Launched");
+                // Deliberately not waited on. Reaping it would mean holding a list of
+                // children for a panel that is a UI and has better things to do, and a
+                // child that exits on its own is reaped by init either way.
+                drop(child);
+            }
+            Err(err) => warn!(app = %id, program = %program, %err, "Failed to launch app"),
+        }
+    }
+
     /// Build the `list\t...` snapshot of every open window, including minimized ones
     /// (which are unmapped from `Space`). Each window gets its own entry, so several
     /// instances of the same app stay distinct.
@@ -990,6 +1063,10 @@ mod tests {
         assert!(matches!(message("focus\t7"), Some(PanelMessage::Focus(7))));
         assert!(matches!(message("close\t7"), Some(PanelMessage::Close(7))));
         assert!(matches!(
+            message("launch\tfirefox"),
+            Some(PanelMessage::Launch(a)) if a == "firefox"
+        ));
+        assert!(matches!(
             message("preview\t7\t360\t118\t0"),
             Some(PanelMessage::Preview { id: 7, max_width: 360, max_height: 118, wanted: false })
         ));
@@ -997,6 +1074,24 @@ mod tests {
             message("accent\t0.5\t0.5\t0.5"),
             Some(PanelMessage::Accent([0.5, 0.5, 0.5]))
         ));
+    }
+
+    #[test]
+    fn an_app_id_arrives_as_one_field_however_awkward_it_is() {
+        // The panel sanitizes before sending, so this is belt and braces — but an id
+        // that reached `Command::new` with a newline in it would be worth refusing.
+        match parse_frame(&body("launch\tan\tapp\twith\ttabs")) {
+            Incoming::Message(PanelMessage::Launch(id)) => assert_eq!(id, "an"),
+            other => panic!("{other:?}"),
+        }
+        // And a long one is bounded rather than passed on whole.
+        let long = "x".repeat(panel_proto::MAX_FIELD_BYTES * 2);
+        match parse_frame(&body(&format!("launch\t{long}"))) {
+            Incoming::Message(PanelMessage::Launch(id)) => {
+                assert_eq!(id.len(), panel_proto::MAX_FIELD_BYTES)
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

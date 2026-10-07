@@ -8,12 +8,14 @@
 )]
 
 pub mod cursor;
+pub mod desktop;
 pub mod drawing;
 pub mod focus;
 pub mod input_handler;
 #[cfg(feature = "libei")]
 pub mod libei;
 pub mod panel;
+pub mod panel_conf;
 pub mod panel_ipc;
 pub mod panel_proto;
 pub mod render;

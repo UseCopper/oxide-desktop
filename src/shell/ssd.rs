@@ -499,6 +499,11 @@ pub fn fullscreen_content_offset() -> Point<i32, Logical> {
     Point::from((0, HEADER_BAR_HEIGHT))
 }
 
+/// The compositor's close glyph, published so the panel can assert its own copy
+/// of these bytes stays identical.
+#[cfg(test)]
+pub const CLOSE_ICON_FOR_TESTS: [u8; 20] = CLOSE_ICON;
+
 const CLOSE_ICON: [u8; 20] = [
     0x03, 0xFF, 0x87, 0xFF, 0xCE, 0xFD, 0xFC, 0xFC, 0x78, 0xFC, 0x78, 0xFC, 0xFC, 0xFC, 0xCE, 0xFD,
     0x87, 0xFF, 0x03, 0xFF,
