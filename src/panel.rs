@@ -2631,6 +2631,10 @@ struct ContextMenu {
     /// Whether the app menu is up *or on its way out*. Only cleared once the fade has
     /// finished, so nothing else can put another menu in the same place mid-fade.
     shown: Cell<bool>,
+    /// Whether that fade is already running. A second close while it runs is a
+    /// no-op rather than a restart of the animation, and a click that lands during
+    /// it belongs to the square rather than to a menu that is already leaving.
+    closing: Cell<bool>,
     animation: Rc<Cell<u64>>,
     /// The width the surface is being eased between, when a transition is running.
     ///
@@ -2698,6 +2702,7 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
         rows,
         app: RefCell::new(None),
         shown: Cell::new(false),
+        closing: Cell::new(false),
         animation: Rc::new(Cell::new(0)),
         width_from: Cell::new(0),
         width_to: Cell::new(0),
@@ -3089,6 +3094,9 @@ fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
 
 /// Open the app menu for an app, or move an open one onto it.
 fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], button: &Button) {
+    // A reopen during the close fade takes the menu back: the fade that was running
+    // is not a close any more, so a later close must be able to run again.
+    context.closing.set(false);
     let (icon_center, bar_width) = icon_metrics(button);
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
@@ -3146,9 +3154,10 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
 
 /// Take the context menu off screen, then let it go.
 fn context_close(context: &Rc<ContextMenu>) {
-    if !context.shown.get() {
+    if !context.shown.get() || context.closing.get() {
         return;
     }
+    context.closing.set(true);
     // Whatever the pointer was last over, it is not over a menu that is no longer
     // there, so a close cannot be left scheduled against it.
     context.hover.inside.set(false);
@@ -3189,6 +3198,7 @@ fn context_close(context: &Rc<ContextMenu>) {
         // Now it really is gone: the surface itself, not just its contents.
         fading.window.set_visible(false);
         fading.shown.set(false);
+        fading.closing.set(false);
         glib::ControlFlow::Break
     });
 }
@@ -4346,6 +4356,48 @@ fn rebuild_tasks(
 
 }
 
+/// One decision for a press that ends on a square.
+///
+/// The three things a click can mean — put a carried square down, dismiss the
+/// app menu, or activate — are decided once, here, in that order. The button's
+/// own click is the only caller: a drag that leaves the square cancels the
+/// button's click, so the drag gesture's end has nothing to decide, and there is
+/// no second copy of these rules to drift out of step with.
+fn square_click(
+    button: &Button,
+    stream: &Channel,
+    key: &str,
+    windows: &[WindowInfo],
+    menu: &Rc<Menu>,
+    context: &Rc<ContextMenu>,
+    multiple: bool,
+) {
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: click {key:?} drag_active={} context_shown={} context_closing={}",
+            drag_active(),
+            context.shown.get(),
+            context.closing.get()
+        );
+    }
+    if drag_active() {
+        // The opted-in drag gesture claimed this press; the drop is its business.
+        // A square put straight back down is not a drop, though: it lifted and
+        // returned, which is a click, so the decision falls through to activate.
+        if drag_end() {
+            glib::idle_add_local_once(|| rebuild_bar());
+            return;
+        }
+    }
+    if context.shown.get() && !context.closing.get() {
+        // First click takes the app menu down; it does not also act. One whose
+        // fade is already running has nothing left to dismiss.
+        context_close(context);
+        return;
+    }
+    activate(stream, key, windows, menu, button, multiple);
+}
+
 /// What a click on a square does: bring one window forward, or show the previews.
 ///
 /// A square with nothing behind it is a pinned app's, and starts it — there is no
@@ -5160,34 +5212,16 @@ fn app_button(
         let square = button.clone();
         let button = button.clone();
         square.connect_clicked(move |_| {
-            if menu_debug() {
-                eprintln!(
-                    "oxide-panel: clicked {key:?} drag_active={} context_shown={}",
-                    drag_active(),
-                    context.shown.get()
-                );
-            }
-            if drag_active() {
-                // The opted-in drag gesture claimed this press; the drop is its
-                // business, not a click.
-                let moved = drag_end();
-                if moved {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
-                return;
-            }
-            if context.shown.get() {
-                context_close(&context);
-                return;
-            }
-            activate(&stream, &key, &owned, &menu, &button, multiple);
+            square_click(&button, &stream, &key, &owned, &menu, &context, multiple);
         });
     }
 
     // Reordering by dragging is opt-in (`OXIDE_PANEL_DRAG`) and rides its own
-    // `GestureDrag` alongside the click. Whichever gesture claims the sequence,
-    // the press still ends in an activation attempt — both carry the click — so
-    // opting in cannot make the squares unclickable again.
+    // `GestureDrag` alongside the click. The gesture only ever *drags*: the
+    // decision about what the release meant is the button's `connect_clicked`
+    // alone, which fires when the press and release both stayed on the square —
+    // a real drag left it, and was cancelled as a click — and `square_click`
+    // treats a lift-and-put-back as the click it is.
     if std::env::var_os("OXIDE_PANEL_DRAG").is_some() {
         let gesture = gtk4::GestureDrag::new();
         gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
@@ -5198,17 +5232,12 @@ fn app_button(
         // travel: the gesture's offsets are widget-relative and this drag moves
         // the widget.
         let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        // Whether GTK's threshold was crossed, so a gesture that did cross it
-        // and then ended cannot fall through to a click on a stray release.
-        let gesture_began = Rc::new(Cell::new(false));
         {
             let key = key.to_string();
             let start_row = start_row.clone();
-            let gesture_began = gesture_began.clone();
             gesture.connect_drag_begin({
                 let button = button.clone();
                 move |g, _, _| {
-                    gesture_began.set(true);
                     let origin = tasks_box().and_then(|tasks| {
                         button.translate_coordinates(&tasks, 0.0, 0.0)
                     });
@@ -5244,36 +5273,14 @@ fn app_button(
                 }
             });
         }
-        {
-            let stream = stream.clone();
-            let key = key.to_string();
-            let menu = menu.clone();
-            let context = context.clone();
-            let owned = owned.clone();
-            let button = button.clone();
-            let gesture_began = gesture_began.clone();
-            gesture.connect_drag_end(move |_, _, _| {
-                start_row.set(None);
-                let crossed = gesture_began.get();
-                gesture_began.set(false);
-                if drag_active() {
-                    let moved = drag_end();
-                    if moved {
-                        glib::idle_add_local_once(|| rebuild_bar());
-                    }
-                    return;
+        gesture.connect_drag_end(move |_, _, _| {
+            start_row.set(None);
+            if drag_active() {
+                if drag_end() {
+                    glib::idle_add_local_once(|| rebuild_bar());
                 }
-                if crossed {
-                    // A real drag gesture; not a click either.
-                    return;
-                }
-                if context.shown.get() {
-                    context_close(&context);
-                    return;
-                }
-                activate(&stream, &key, &owned, &menu, &button, multiple);
-            });
-        }
+            }
+        });
         button.add_controller(gesture);
     }
 
