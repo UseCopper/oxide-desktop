@@ -188,6 +188,9 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             }
             if let Some(window) = self.window_for_surface(&root) {
                 window.0.on_commit();
+                // Mark the contents as changed, so the panel's preview of this
+                // window is worth re-rendering.
+                window.decoration_state().content_generation += 1;
                 // Keep the buffers the client just committed alive, so an
                 // app-triggered close can be drawn from them after the surface
                 // is gone. This is a cheap `Arc` clone per surface, not a GPU
@@ -935,7 +938,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         self.tick_visibility_animations(&windows, now);
         self.tick_snap_preview(now);
-        #[cfg(feature = "panel")]
         self.tick_panel();
     }
 

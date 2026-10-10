@@ -82,7 +82,6 @@ fn main() {
     let backend = arg.as_deref().or_else(|| detect_backend());
 
     match backend {
-        #[cfg(feature = "panel")]
         Some("--panel") => {
             oxide_desktop::panel::run_panel();
         }
