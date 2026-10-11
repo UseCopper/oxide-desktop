@@ -2785,15 +2785,14 @@ fn build_context_shield(app: &Application, monitor: &gdk::Monitor) -> gtk4::Wind
 }
 
 /// One row of the context menu: an icon and a label, in a button.
-///
-/// Every row is the same kind of button. The app's own row starts it rather
-/// than commanding one of its windows, and that is a fact of what it does, not
-/// of what it looks like.
-fn context_row(icon_name: &str, label: &str) -> gtk4::Button {
+fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
     let row = gtk4::Button::new();
     // Same as the squares: the first click must activate, not grab focus.
     row.set_focus_on_click(false);
     row.add_css_class("context-row");
+    if emphasis {
+        row.add_css_class("app");
+    }
     row.set_has_frame(false);
 
     let icon = gtk4::Image::from_icon_name(icon_name);
@@ -2845,7 +2844,7 @@ fn context_rows_for(
         // opened behind it.
         1 => {
             let id = windows[0].id;
-            let row = context_row(ICON_CLOSE_ONE, "Quit window");
+            let row = context_row(ICON_CLOSE_ONE, "Quit window", false);
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2858,7 +2857,7 @@ fn context_rows_for(
             // Every window it has, closed. Sent one at a time because the protocol
             // closes one window per message and has no "quit this app" in it.
             let ids: Vec<u64> = windows.iter().map(|info| info.id).collect();
-            let row = context_row(ICON_CLOSE_ALL, "Quit all windows");
+            let row = context_row(ICON_CLOSE_ALL, "Quit all windows", false);
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2879,7 +2878,7 @@ fn context_rows_for(
         } else {
             ("Pin to panel", ICON_PIN)
         };
-        let row = context_row(icon_name, label);
+        let row = context_row(icon_name, label, false);
         let id = key.to_string();
         // The windows are kept so the menu can refill itself: the row's own label
         // and icon are what just changed, and rebuilding it needs to know how many
@@ -2904,7 +2903,7 @@ fn context_rows_for(
         let label = crate::desktop::cached(key)
             .map(|app| app.label().to_string())
             .unwrap_or_else(|| key.to_string());
-        let row = context_row(&resolve_icon(key), &label);
+        let row = context_row(&resolve_icon(key), &label, true);
         let id = key.to_string();
         let owned = context.clone();
         row.connect_clicked(move |_| {
@@ -3342,18 +3341,14 @@ impl Square {
                 let group = group_for_key(&key);
                 if group.is_empty() {
                     // An app with no windows has no previews to offer, so there is
-                    // nothing to switch to. It is not a reason to leave the previous
-                    // app's menu on screen: leaving the previews up while the pointer
-                    // rests somewhere they have nothing to do with is how a menu ends
-                    // up floating over an icon it does not belong to.
+                    // nothing to switch to and nothing to show. It is not a reason to
+                    // leave the previous app's menu on screen: leaving the previews up
+                    // while the pointer rests somewhere they have nothing to do with is
+                    // how a menu ends up floating over an icon it does not belong to.
                     if menu.shown.get() && menu.app.borrow().is_some() {
                         menu_close(&menu);
                     }
-                    // And it is not nothing either: a square of a pinned app that
-                    // has not been started is there to be started from, so a dwell
-                    // on it opens the very menu a right click would have — what
-                    // the app is called, and what to do with something that has no
-                    // windows. Same dwell, same disarming, decided at the fire.
+                    return;
                 }
                 // One menu at a time: the app menu is up, so this square does
                 // nothing while the pointer is on it. The app menu stays anchored
@@ -3394,14 +3389,7 @@ impl Square {
                     }
                     let group = group_for_key(&dwell_key);
                     if group.is_empty() {
-                        // A square of a pinned app that has nothing open: the
-                        // dwell opens the app menu for it — the same rows a
-                        // right click would have brought up — so a hover works
-                        // on every square, whatever is behind it.
-                        if !context.stream.is_connected() || context.shown.get() {
-                            return glib::ControlFlow::Break;
-                        }
-                        context_open(&context, &dwell_key, &group, &button);
+                        // The app really has gone. Nothing to open.
                         return glib::ControlFlow::Break;
                     }
                     if menu.app.borrow().as_deref() == Some(key.as_str()) {
@@ -4103,6 +4091,7 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
     let cell_edge_a = CELL_EDGE.3;
+    let cell_edge_hover_a = CELL_EDGE_HOVER.3;
     let cell_radius = CELL_RADIUS.round() as i32;
     format!(
         "
@@ -4191,14 +4180,24 @@ button.context-row {{
     font-weight: 500;
 }}
 button.context-row:hover {{
-    /* The panel's own hover: the pointer's mark, nothing else moving. The
-       row keeps its cell outline at rest and under the pointer alike. */
     background-color: rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, {cell_edge_hover_a});
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
 button.context-row label {{
     color: #e8e8e8;
     background: transparent;
+}}
+/* The app itself, which is the one row that is not a command. Treated the way
+   a focused square in the bar is, in the same accent the previews put in their
+   titles and the bar puts in a focused square's fill. */
+button.context-row.app {{
+    background-color: rgba({r}, {g}, {b}, 0.22);
+    border: 1px solid rgba({r}, {g}, {b}, 0.55);
+}}
+button.context-row.app label {{
+    color: rgb({r}, {g}, {b});
+    font-weight: 700;
 }}
 "
     )
