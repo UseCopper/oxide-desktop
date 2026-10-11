@@ -4082,6 +4082,17 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // into two different greys.
     let (panel_r, panel_g, panel_b) = BAR_PANEL;
     let panel_a = BAR_PANEL_ALPHA;
+    // The app menu's body and cells are the preview menu's own palette, read off
+    // the same constants the cairo drawing reads, so the two menus are one look
+    // by construction rather than by two careful copies of the same hexes.
+    let menu_fill_r = (MENU_FILL.0 * 255.0).round() as u8;
+    let menu_fill_a = MENU_FILL.3;
+    let menu_edge_a = MENU_EDGE.3;
+    let menu_radius = MENU_RADIUS.round() as i32;
+    let cell_fill_a = CELL_FILL.3;
+    let cell_edge_a = CELL_EDGE.3;
+    let cell_edge_hover_a = CELL_EDGE_HOVER.3;
+    let cell_radius = CELL_RADIUS.round() as i32;
     format!(
         "
 window.panel-window {{
@@ -4131,11 +4142,12 @@ button.task.minimized {{
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
-/* The app menu, opened by a right click. Widgets, so it is styled here.
-   Its fill is the bar's own panel colour, not the previews' 0.35 black: a preview
-   cell is 0.35 black *around an opaque window capture*, so only its padding shows,
-   while every part of this is background. A square has no background of its own, so
-   what a square is made of is the bar — and that is what this is.
+/* The app menu, opened by a right click. Widgets, so it is styled here --
+   and styled out of the thumbnail menu's own palette, so the two menus read
+   as one object. The body is the previews' fill and edge at the previews'
+   radius; a row is a preview cell: 0.35 black fill, CELL_EDGE outline,
+   CELL_RADIUS corners, brightening to the hover edge it would get as a cell.
+   The text and the hover fill are the taskbar's.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4145,35 +4157,46 @@ window.context {{
     border: none;
 }}
 .context-rows {{
-    padding: 4px;
-    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
+    /* The previews' body, not the bar's panel grey: the thumbnail menu runs a
+       shade darker and more opaque than the bar, and two menus side by side
+       would show any drift. */
+    padding: 5px;
+    background-color: rgba({menu_fill_r}, {menu_fill_r}, {menu_fill_r}, {menu_fill_a});
     /* The theme paints a window background image on top of a window's background
        colour, which would put a fill of its own over this and make it a third value
        again. */
     background-image: none;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, {menu_edge_a});
+    border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    background: transparent;
+    background: rgba(0, 0, 0, {cell_fill_a});
     background-image: none;
-    border: none;
+    border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
     padding: 7px 10px;
-    border-radius: 7px;
+    border-radius: {cell_radius}px;
     color: #e8e8e8;
     font-weight: 500;
 }}
 button.context-row:hover {{
     background-color: rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, {cell_edge_hover_a});
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
 button.context-row label {{
     color: #e8e8e8;
     background: transparent;
 }}
-/* The app itself, which is the one row that is not a command. */
+/* The app itself, which is the one row that is not a command. Treated the way
+   a focused square in the bar is, in the same accent the previews put in their
+   titles and the bar puts in a focused square's fill. */
+button.context-row.app {{
+    background-color: rgba({r}, {g}, {b}, 0.22);
+    border: 1px solid rgba({r}, {g}, {b}, 0.55);
+}}
 button.context-row.app label {{
+    color: rgb({r}, {g}, {b});
     font-weight: 700;
 }}
 "
@@ -6930,40 +6953,48 @@ mod tests {
     }
 
     #[test]
-    fn the_previews_and_the_app_menu_are_the_same_fill() {
-        // Two menus belonging to one panel should not be two different greys, and
-        // the previews are cairo-drawn, so they are the fixed point: the stylesheet
-        // is the thing that has to match them. Both are 35% black over whatever is
-        // behind them.
+    fn the_app_menu_is_styled_from_the_previews_palette() {
+        // Two menus belonging to one panel should look like one object. The
+        // previews are cairo-driven, so their constants are the fixed point:
+        // the stylesheet reads the same constants as the drawing reads, and
+        // this test pins the stylesheet to them in case a rule restarts from a
+        // hand-copied value.
         let sheet = style_sheet((1, 2, 3));
-        // The fill moved off the window and onto the rows box when the gap strip was
-        // added: a fill on the window would paint the strip and leave no gap at all.
+        // The body, from the rows-box rule ...
         let rule = sheet
             .split(".context-rows {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows");
-        // Not the previews' 0.35, and the reason is in the rule itself: a cell is
-        // 0.35 black *around an opaque capture*, so only its padding is see-through,
-        // while every part of the app menu is background. Matching the number would
-        // have matched the transparency and not the appearance, which is what
-        // "more transparent than the thumbnail menu" was.
-        // The bar's own panel colour, at the bar's own alpha, from the one place it is
-        // defined. A square has no background of its own, so this is what a square is
-        // made of, and it is a dark *grey* rather than the near-black it was.
         assert!(
             rule.contains(&format!(
                 "rgba({}, {}, {}, {})",
-                BAR_PANEL.0, BAR_PANEL.1, BAR_PANEL.2, BAR_PANEL_ALPHA
+                (MENU_FILL.0 * 255.0).round() as u8,
+                (MENU_FILL.0 * 255.0).round() as u8,
+                (MENU_FILL.1 * 255.0).round() as u8,
+                MENU_FILL.3
             )),
-            "the app menu is not the colour a square is: {rule}"
+            "the app menu body is not the previews' body: {rule}"
         );
-        // And nothing painted over the top of it. The theme's window background image
-        // is the difference between "the same 35% black" and "a more solid panel than
-        // the previews", and it is invisible in a stylesheet.
+        // ... it must match what the previews' body is, rather than the bar's
+        // grey, because the two menus show side by side and run one shade
+        // darker and more opaque than the bar.
+        assert_eq!(MENU_FILL, (0.11, 0.11, 0.11, 0.94), "and the previews moved");
+        // The theme's window background image would put a fill of its own over
+        // this, and it is invisible in a stylesheet.
         assert!(
             rule.contains("background-image: none"),
             "the theme's window background is back over the app menu's fill: {rule}"
+        );
+        // A row is a preview cell, so it takes the cell's fill.
+        let row_rule = sheet
+            .split("button.context-row {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("a rule for the app menu rows' buttons");
+        assert!(
+            row_rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
+            "an app-menu row is not a preview cell's fill: {row_rule}"
         );
         assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         // The window itself paints nothing: the strip above the rows has to stay
@@ -6978,7 +7009,7 @@ mod tests {
             "the app menu window paints over the gap strip: {window_rule}"
         );
         // The mini-CSD adds no fill of its own. The cell's fill is already under it,
-        // and setting the strip to the same value does not make it the same colour —
+        // and setting the strip to the same value does not make it the same colour --
         // it stacks, and two 35% blacks are 58%, so the strip came out darker than
         // the cell it belongs to.
         assert_eq!(TITLEBAR_FILL.3, 0.0, "the strip must not paint over the cell");
