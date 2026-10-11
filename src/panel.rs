@@ -2785,14 +2785,15 @@ fn build_context_shield(app: &Application, monitor: &gdk::Monitor) -> gtk4::Wind
 }
 
 /// One row of the context menu: an icon and a label, in a button.
-fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
+///
+/// Every row is the same kind of button. The app's own row starts the app
+/// rather than commanding one of its windows, and that is a fact of what it
+/// does, not of what it looks like.
+fn context_row(icon_name: &str, label: &str) -> gtk4::Button {
     let row = gtk4::Button::new();
     // Same as the squares: the first click must activate, not grab focus.
     row.set_focus_on_click(false);
     row.add_css_class("context-row");
-    if emphasis {
-        row.add_css_class("app");
-    }
     row.set_has_frame(false);
 
     let icon = gtk4::Image::from_icon_name(icon_name);
@@ -2844,7 +2845,7 @@ fn context_rows_for(
         // opened behind it.
         1 => {
             let id = windows[0].id;
-            let row = context_row(ICON_CLOSE_ONE, "Quit window", false);
+            let row = context_row(ICON_CLOSE_ONE, "Quit window");
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2857,7 +2858,7 @@ fn context_rows_for(
             // Every window it has, closed. Sent one at a time because the protocol
             // closes one window per message and has no "quit this app" in it.
             let ids: Vec<u64> = windows.iter().map(|info| info.id).collect();
-            let row = context_row(ICON_CLOSE_ALL, "Quit all windows", false);
+            let row = context_row(ICON_CLOSE_ALL, "Quit all windows");
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2878,7 +2879,7 @@ fn context_rows_for(
         } else {
             ("Pin to panel", ICON_PIN)
         };
-        let row = context_row(icon_name, label, false);
+        let row = context_row(icon_name, label);
         let id = key.to_string();
         // The windows are kept so the menu can refill itself: the row's own label
         // and icon are what just changed, and rebuilding it needs to know how many
@@ -2903,7 +2904,7 @@ fn context_rows_for(
         let label = crate::desktop::cached(key)
             .map(|app| app.label().to_string())
             .unwrap_or_else(|| key.to_string());
-        let row = context_row(&resolve_icon(key), &label, true);
+        let row = context_row(&resolve_icon(key), &label);
         let id = key.to_string();
         let owned = context.clone();
         row.connect_clicked(move |_| {
@@ -4091,7 +4092,6 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
     let cell_edge_a = CELL_EDGE.3;
-    let cell_edge_hover_a = CELL_EDGE_HOVER.3;
     let cell_radius = CELL_RADIUS.round() as i32;
     format!(
         "
@@ -4139,6 +4139,14 @@ button.task.carrying {{
 button.task.minimized {{
     background-color: rgba(255, 255, 255, 0.04);
 }}
+/* A hovered square shows the panel's hover, whatever its rest state is. The
+   minimized rule above is where a pinned empty square parks between sessions,
+   and at equal specificity the later rule wins -- so without this, hovering
+   an empty square stayed dim instead of marking. A focused square keeps its
+   accent under the pointer and wins here anyway, by being later. */
+button.task.minimized:hover {{
+    background-color: rgba(255, 255, 255, 0.10);
+}}
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
@@ -4180,24 +4188,18 @@ button.context-row {{
     font-weight: 500;
 }}
 button.context-row:hover {{
+    /* The panel's own hover: the pointer's fill, nothing else moving. The
+       theme pours a hovering fill of its own through `background-image`,
+       which vanishes the rest rule and puts back the vanilla look, so the
+       hover has to kill it the way the rest rule does. */
     background-color: rgba(255, 255, 255, 0.10);
-    border: 1px solid rgba(255, 255, 255, {cell_edge_hover_a});
+    background-image: none;
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
 button.context-row label {{
     color: #e8e8e8;
     background: transparent;
 }}
-/* The app itself, which is the one row that is not a command. Treated the way
-   a focused square in the bar is, in the same accent the previews put in their
-   titles and the bar puts in a focused square's fill. */
-button.context-row.app {{
-    background-color: rgba({r}, {g}, {b}, 0.22);
-    border: 1px solid rgba({r}, {g}, {b}, 0.55);
-}}
-button.context-row.app label {{
-    color: rgb({r}, {g}, {b});
-    font-weight: 700;
 }}
 "
     )
