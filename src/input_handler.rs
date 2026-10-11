@@ -260,6 +260,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             let location = self.pointer.current_location();
             self.update_keyboard_focus(location, serial);
 
+
             // SSD resizing is compositor-owned, so resolve it straight from the
             // space hit test instead of relying on the client pointer focus.
             if button == BTN_LEFT {
@@ -391,6 +392,32 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 }
 
                 let layers = layer_map_for_output(output);
+                // A press that lands on a top-layer strip that does not ask for
+                // keyboard focus — the panel — leaves the keyboard focus exactly
+                // where it is. Clearing it here (the empty-space path below) made
+                // every press on the panel change a window's state, and every
+                // state change a snapshot: the square under the press was being
+                // re-listed mid-gesture, and the click needed a second press to
+                // land. Desktops do not unfocus your terminal because you
+                // clicked the taskbar.
+                if let Some(layer) = layers
+                    .layer_under(WlrLayer::Overlay, location - output_geo.loc.to_f64())
+                    .or_else(|| {
+                        layers.layer_under(WlrLayer::Top, location - output_geo.loc.to_f64())
+                    })
+                    .filter(|layer| !layer.can_receive_keyboard_focus())
+                {
+                    if layer
+                        .surface_under(
+                            location - output_geo.loc.to_f64()
+                                - layers.layer_geometry(layer).unwrap().loc.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .is_some()
+                    {
+                        return;
+                    }
+                }
                 if let Some(layer) = layers
                     .layer_under(WlrLayer::Overlay, location - output_geo.loc.to_f64())
                     .or_else(|| layers.layer_under(WlrLayer::Top, location - output_geo.loc.to_f64()))
