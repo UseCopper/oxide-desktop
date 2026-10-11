@@ -313,15 +313,51 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
+    /// Focus a window, and bring it to the front while at it.
+    ///
+    /// Focusing and raising were split apart across the call sites that grant
+    /// focus — the click path raised and focused, a new window relied on its
+    /// map having put it on top, and a self-activating app was raised without
+    /// being focused — and a window could end up holding the keyboard while
+    /// sitting underneath another one, on SSD and CSD alike. This is the one
+    /// door: whoever focuses a window here also raises it to the front, which
+    /// also moves the activated state off every other window the way the
+    /// window's own frame reads it (ssd or csd).
+    ///
+    /// The founding exception: a window being focused *for someone else's*
+    /// click — summed up by the fullscreen mode — keeps its own raise rules,
+    /// and passing `raise: false` spares it.
+    pub fn focus_window(&mut self, window: &WindowElement, raise: bool) {
+        if raise {
+            self.space.raise_element(window, true);
+            #[cfg(feature = "xwayland")]
+            if let Some(surface) = window.0.x11_surface()
+                && let Some(xwm) = self.xwm.as_mut()
+            {
+                let _ = xwm.raise_window(surface);
+            }
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Some(window.clone().into()),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+    }
+
     /// Give keyboard focus to any window `place_new_window` just mapped.
     pub fn focus_new_windows(&mut self) {
         let window = PENDING_FOCUS.with(|cell| cell.borrow_mut().take());
         let Some(window) = window else {
             return;
         };
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(window.into()), SERIAL_COUNTER.next_serial());
-        }
+        // A new window maps on top, so the raise is usually redundant — but
+        // focusing is also the window's public debut, and anything that has
+        // meanwhile touched the stack (a churning fixup, a popup's grab) must
+        // not leave it holding the keyboard under something else. The raise is
+        // cheap idempotence; the invariant is the point.
+        self.focus_window(&window, true);
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {

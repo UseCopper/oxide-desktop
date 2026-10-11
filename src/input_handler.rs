@@ -380,13 +380,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     if let Some((_, _)) =
                         window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
-                        #[cfg(feature = "xwayland")]
-                        if let Some(surface) = window.0.x11_surface()
-                            && let Some(xwm) = self.xwm.as_mut()
-                        {
-                            let _ = xwm.raise_window(surface);
-                        }
-                        keyboard.set_focus(self, Some(window.into()), serial);
+                        // No raise on purpose: the fullscreen surface is the
+                        // front by definition, and lifting it in the space
+                        // would fight whatever fullscreening put there.
+                        self.focus_window(&window, false);
                         return;
                     }
                 }

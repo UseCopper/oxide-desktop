@@ -513,14 +513,17 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
         surface: WlSurface,
     ) {
         if token_data.timestamp.elapsed().as_secs() < 10 {
-            // Just grant the wish
+            // Just grant the wish, focusing as well as raising: an app that
+            // asks to be activated without a focus change is half of an
+            // activation, and a fuller answer also means the windows that were
+            // focused without rising have one fewer way to happen.
             let w = self
                 .space
                 .elements()
                 .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
-                self.space.raise_element(&window, true);
+                self.focus_window(&window, true);
             }
         }
     }
