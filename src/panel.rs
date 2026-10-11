@@ -1849,7 +1849,7 @@ fn schedule_resync(menu: &Rc<Menu>) {
 
 /// Bring the open menu into step with the most recent snapshot.
 ///
-/// The same thing [`rebuild_tasks`] does for an open menu, reachable without a rebuild —
+/// The same thing [`sync_bar`] does for an open menu, reachable without a snapshot —
 /// a rebuild is driven by a snapshot arriving, and a snapshot that arrived while the row
 /// was switched out has nothing left to drive one.
 fn menu_replace_current(menu: &Rc<Menu>) {
@@ -1864,7 +1864,7 @@ fn menu_replace_current(menu: &Rc<Menu>) {
 
 /// The windows belonging to one app, as the bar groups them.
 ///
-/// Shared with [`rebuild_tasks`] so the two cannot disagree about what "this app's
+/// Shared with [`sync_bar`] so the two cannot disagree about what "this app's
 /// windows" means — a window with no app id is a group of its own, named after its panel
 /// id, and a resync that forgot that would prune a perfectly good cell.
 fn group_for<'a>(key: &str, windows: &'a [WindowInfo]) -> Vec<&'a WindowInfo> {
@@ -2626,6 +2626,13 @@ fn animate_surface(
 struct ContextMenu {
     window: gtk4::Window,
     rows: GtkBox,
+    /// A full-screen catcher that sits below the menu while it is up. It is
+    /// what makes clicks on the desktop, on windows, or anywhere on the bar
+    /// close the menu: GTK4 cannot grab across toplevels the way a popover
+    /// does, so a layer-shell menu borrows the gridiron pattern — one
+    /// invisible surface behind the menu that takes the clicks the menu does
+    /// not want and takes the menu down.
+    shield: gtk4::Window,
     /// The app it is open for, or none while it is closed.
     app: RefCell<Option<String>>,
     /// Whether the app menu is up *or on its way out*. Only cleared once the fade has
@@ -2636,20 +2643,18 @@ struct ContextMenu {
     /// it belongs to the square rather than to a menu that is already leaving.
     closing: Cell<bool>,
     animation: Rc<Cell<u64>>,
-    /// The width the surface is being eased between, when a transition is running.
+    /// The width the surface is being eased between by `context_ease`.
     ///
-    /// The same idea as the preview menu's `width_from`/`width_to`, and for the same
-    /// reason: a move used to fade the whole surface out, swap the rows, and fade it back
-    /// in at whatever width the new app's rows happened to be, so the menu changed size in
-    /// one step in the middle of a transition meant to be moving. Nothing is held here at
-    /// rest.
+    /// Every caller of that ease passes the same width at both ends — open and
+    /// close hold their size — so the cells are fixed-width bookkeeping kept
+    /// from when the menu also moved between squares. They earn their keep only
+    /// in the ease's land step, which pins the final width.
     width_from: Cell<i32>,
     width_to: Cell<i32>,
     /// Where the square that opened it is, so the menu can sit under it.
     icon_center: Cell<i32>,
     bar_width: Cell<i32>,
     stream: Channel,
-    hover: Rc<Hover>,
 }
 
 /// The icon each row is drawn with.
@@ -2670,6 +2675,11 @@ const ICON_PIN: &str = "starred-symbolic";
 const ICON_UNPIN: &str = "list-remove-symbolic";
 
 fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<ContextMenu> {
+    // The shield first, only because the menu must exist after it to be able to
+    // hold it. They hide and show together; ordering between them is settled by
+    // the layers they are on, not by mapping order.
+    let shield = build_context_shield(app, monitor);
+
     let window = gtk4::Window::builder().application(app).build();
     window.set_decorated(false);
     window.add_css_class("panel-window");
@@ -2678,6 +2688,8 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
     // The same namespace as the preview menu, so a compositor that hides panels by
     // namespace treats the two alike.
     window.set_namespace(Some("oxide-panel-menu"));
+    // Top, the same as the preview menu. The shield is underneath on Bottom, so
+    // the menu is above it and its clicks always reach the rows.
     window.set_layer(Layer::Top);
     window.set_monitor(Some(monitor));
     window.set_anchor(Edge::Top, true);
@@ -2697,9 +2709,13 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
     rows.set_margin_top(MENU_GAP);
     window.set_child(Some(&rows));
 
+    // Kept out of the struct, which takes the original by move: attaching the
+    // controller is the last thing the shield needs.
+    let shield_for_input = shield.clone();
     let context = Rc::new(ContextMenu {
         window,
         rows,
+        shield,
         app: RefCell::new(None),
         shown: Cell::new(false),
         closing: Cell::new(false),
@@ -2709,9 +2725,63 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
         icon_center: Cell::new(0),
         bar_width: Cell::new(0),
         stream,
-        hover: Rc::new(Hover::default()),
     });
+
+    // The shield dismisses the menu it was built with. Held weakly, so the
+    // shield's controller does not keep the whole menu alive all by itself.
+    let closer = context.clone();
+    let shield_click = gtk4::GestureClick::new();
+    shield_click.connect_pressed(glib::clone!(
+        #[weak]
+        closer,
+        #[upgrade_or]
+        return,
+        move |_, _, _, _| {
+            context_close(&closer);
+        }
+    ));
+    shield_for_input.add_controller(shield_click);
+
     context
+}
+
+/// The full-screen catcher that sits below the context menu while it is up.
+///
+/// A transparent surface is otherwise eventless — GTK cuts input regions from
+/// what is drawn, and nothing here is drawn — so its one child paints the barest
+/// wash of alpha: invisible to the eye, and enough of a drawing that every click
+/// over the whole output lands on it.
+fn build_context_shield(app: &Application, monitor: &gdk::Monitor) -> gtk4::Window {
+    let window = gtk4::Window::builder().application(app).build();
+    window.set_decorated(false);
+    window.add_css_class("panel-window");
+    window.init_layer_shell();
+    window.set_namespace(Some("oxide-panel-shield"));
+    // Bottom: above every window and the desktop, below the bar and both
+    // menus. A click lands on the shield exactly when it was not aimed at
+    // anything of the panel's — which is the whole trick — and hovering the
+    // bar with the menu up still moves the menu, because the bar is above.
+    window.set_layer(Layer::Bottom);
+    window.set_monitor(Some(monitor));
+    for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+        window.set_anchor(edge, true);
+    }
+    // Not an exclusive zone: the shield is not furniture, it hides with the menu.
+    window.set_exclusive_zone(-1);
+
+    let catcher = DrawingArea::new();
+    catcher.set_hexpand(true);
+    catcher.set_vexpand(true);
+    catcher.set_draw_func(|_, context, width, height| {
+        // One in a hundred alpha. The eye reads nothing; the input region reads
+        // a surface.
+        context.set_source_rgba(0.0, 0.0, 0.0, 0.01);
+        context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
+        let _ = context.fill();
+    });
+    window.set_child(Some(&catcher));
+    window.set_visible(false);
+    window
 }
 
 /// One row of the context menu: an icon and a label, in a button.
@@ -2749,20 +2819,6 @@ fn context_row(icon_name: &str, label: &str, emphasis: bool) -> gtk4::Button {
 /// pinning is the panel's own state.
 fn context_fill(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo]) {
     context_install(context, context_rows_for(context, key, windows));
-}
-
-/// Put a built set of rows on screen, replacing whatever was there.
-///
-/// Separate from building them because a move has to know how wide the incoming rows
-/// will be — to slide the menu to the right place — without showing them arriving
-/// early, underneath the outgoing app's menu.
-fn context_install(context: &Rc<ContextMenu>, rows: Vec<gtk4::Widget>) {
-    while let Some(child) = context.rows.first_child() {
-        context.rows.remove(&child);
-    }
-    for row in rows {
-        context.rows.append(&row);
-    }
 }
 
 /// The rows for one app, built but not yet on screen.
@@ -2859,144 +2915,28 @@ fn context_rows_for(
     rows
 }
 
-/// Move an open app menu onto a different app, as the pointer travels along the bar.
+/// Put a built set of rows on screen, replacing whatever was there.
 ///
-/// The same shape as the previews' app switch, and for the same reason: two apps'
-/// rows have nothing in common, so anything that keeps the surface on screen across
-/// the exchange shows both at once. Fade out over what is there, exchange, fade back
-/// in — and slide to the square the pointer is on, which
-/// [`animate_surface`] cannot do because an open and a close have nowhere to slide
-/// to.
-///
-/// The incoming rows are built up front but *not* installed: the width they will want
-/// is what the slide is aimed at, and installing them before the fade out would show
-/// the new app's rows sitting there under the outgoing app's menu.
-fn context_move(
-    context: &Rc<ContextMenu>,
-    key: &str,
-    windows: &[WindowInfo],
-    button: &Button,
-) {
-    let (icon_center, bar_width) = icon_metrics(button);
-    let from_left = context.window.margin(Edge::Left);
-    let rows = context_rows_for(context, key, windows);
-    let to_left = menu_left(
-        icon_center,
-        bar_width,
-        measure_rows(context, &rows),
-    );
-    if menu_debug() {
-        eprintln!(
-            "oxide-panel: context move to {key:?}, {} windows, {from_left} to {to_left}",
-            windows.len()
-        );
+/// Separate from building them because the swap must never be visible mid-row:
+/// widgets are unparented and reparented as they are installed, and doing that
+/// one at a time on the live menu would show a broken in-between. Everything
+/// arrives whole or not at all.
+fn context_install(context: &Rc<ContextMenu>, rows: Vec<gtk4::Widget>) {
+    while let Some(child) = context.rows.first_child() {
+        context.rows.remove(&child);
     }
-
-    // The app key is the new one from here: the fade out belongs to the transition, and
-    // a landing that finds a different key under it has been superseded by another
-    // square crossed.
-    context.app.replace(Some(key.to_string()));
-    context.icon_center.set(icon_center);
-    context.bar_width.set(bar_width);
-    // The hover clock starts over, so the grace period is measured from arriving here
-    // rather than from whenever the menu happened to open.
-    context.hover.inside.set(true);
-    context.hover.token.set(context.hover.token.get().wrapping_add(1));
-
-    // The top does not move during a move — it is already out of the bar.
-    let top = PANEL_HEIGHT;
-    // The widths at each end of the transition, so the size eases with everything else
-    // instead of stepping once the rows are swapped.
-    let from_width = context.window.width().max(1);
-    let to_width = measure_rows(context, &rows).max(1);
-    let token = context_ease(
-        context,
-        1.0,
-        0.0,
-        from_left,
-        to_left,
-        top,
-        top,
-        from_width,
-        to_width,
-        // The rows fade; the panel behind them does not.
-        false,
-    );
-    let landing = context.clone();
-    // Behind an Option because the timer may be called again before it breaks, and
-    // the rows cannot be given away twice.
-    //
-    // The swap happens at the midpoint, not after a pause.
-    //
-    // It used to fade the rows all the way out, wait a whole `MENU_FADE`, and only then
-    // bring the new ones up — so there was a full `MENU_FADE` of nothing at all, with the
-    // panel still there, and the menu read as three events rather than one movement. The
-    // preview menu swaps in the frame the old row reaches zero and comes straight back
-    // up, and that is what this does now: one motion, half each way, no gap.
-    let mut incoming: Option<Vec<gtk4::Widget>> = Some(rows);
-    glib::timeout_add_local(MENU_FADE / 2, move || {
-        let Some(rows) = incoming.take() else {
-            return glib::ControlFlow::Break;
-        };
-        // Superseded: another square crossed, or the menu closed underneath.
-        if landing.animation.get() != token || !landing.shown.get() {
-            return glib::ControlFlow::Break;
-        }
-        context_install(&landing, rows);
-        // Straight back up, from wherever the fade had got to.
-        let _ = context_ease(
-            &landing,
-            0.0,
-            1.0,
-            to_left,
-            to_left,
-            top,
-            top,
-            to_width,
-            to_width,
-            false,
-        );
-        glib::ControlFlow::Break
-    });
+    for row in rows {
+        context.rows.append(&row);
+    }
 }
 
-/// How wide a set of rows wants the menu to be.
+/// Slide the context menu in or out of the bar while it fades.
 ///
-/// The rows are not in the box yet, so they are measured by putting them in, asking,
-/// and taking them out again. Doing it the other way round — installing first and
-/// fading afterwards — is what showed the incoming app's rows under the outgoing
-/// app's menu, which is the thing this is all about not doing.
-fn measure_rows(context: &Rc<ContextMenu>, rows: &[gtk4::Widget]) -> i32 {
-    if rows.is_empty() {
-        return context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
-    }
-    // Measured in a box of their own rather than by installing them and asking. A
-    // widget has one parent, so they are parented to the scratch box, measured, and
-    // unparented again — and crucially the real box is never touched, because the
-    // whole point is that the outgoing app's rows are what the fade out is over.
-    let scratch = GtkBox::new(Orientation::Vertical, 2);
-    for row in rows {
-        scratch.append(row);
-    }
-    let width = scratch.measure(gtk4::Orientation::Horizontal, -1).1;
-    for row in rows {
-        scratch.remove(row);
-    }
-    width
-}
-
-/// Move the app menu: the whole thing fades, and it slides to the new square.
-///
-/// The whole surface fades — fill, outline and rows together. Fading only the rows
-/// and holding the panel was a misreading of "fade everything except the menu": it
-/// leaves an empty frame hanging over the desktop with the contents gone, which does
-/// not read as a menu going anywhere.
-///
-/// What this does that [`animate_surface`] does not, is ease the *left* margin. That
-/// one eases the window's opacity and the top margin, and sets the left outright,
-/// because an open and a close have nowhere to slide to. A move has two squares
-/// between them.
-#[allow(clippy::too_many_arguments)]
+/// The arrive and leave the preview menu makes, on the same curve and over the
+/// same `MENU_FADE`: arrivals ease out onto the screen, departures ease off it.
+/// What this does that [`animate_surface`] does not is ease the *left* margin:
+/// that one sets it outright, because an open and a close have nowhere to slide
+/// to sideways.
 fn context_ease(
     context: &Rc<ContextMenu>,
     from_opacity: f64,
@@ -3005,63 +2945,31 @@ fn context_ease(
     to_left: i32,
     from_top: i32,
     to_top: i32,
-    from_width: i32,
-    to_width: i32,
-    // Whether the surface itself fades, or only what is inside it.
-    //
-    // True when the menu is opening or closing, where the whole thing going is the point.
-    // False when moving between apps, where the panel is a fixed object that happens to
-    // change its contents: fading it out leaves an empty frame hanging over the desktop
-    // with nothing in it, which does not read as a menu moving anywhere.
-    fade_surface: bool,
+    width: i32,
 ) -> u64 {
     let context = context.clone();
     context.animation.set(context.animation.get().wrapping_add(1));
     let token = context.animation.get();
     let start = glib::monotonic_time();
-    context.width_from.set(from_width);
-    context.width_to.set(to_width);
+    context.width_from.set(width);
+    context.width_to.set(width);
     glib::timeout_add_local(Duration::from_millis(16), move || {
         if context.animation.get() != token {
             return glib::ControlFlow::Break;
         }
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
-        // Half the usual length for a move: the rows go out and come back up as one
-        // movement, so each half has to fit in half the time.
-        let full = if fade_surface {
-            MENU_FADE
-        } else {
-            MENU_FADE / 2
-        };
-        let t: f64 = (elapsed / full.as_secs_f64()).clamp(0.0, 1.0);
-        // The same curve the preview menu opens and closes on: arrivals ease out
-        // onto the screen, departures ease off it, and a move's two halves are one
-        // ease in followed by one ease out.
+        let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
         let curve: fn(f64) -> f64 = if to_opacity < from_opacity {
             ease_in
         } else {
             ease_out
         };
         let eased = phase_value(curve, t).0;
-        let opacity = from_opacity + (to_opacity - from_opacity) * eased;
-
-        if fade_surface {
-            context.window.set_opacity(opacity);
-        } else {
-            // Only the rows. Each is faded on its own, so the panel behind them stays put
-            // and the menu reads as one object changing its contents rather than
-            // something appearing and being replaced.
-            let mut child = context.rows.first_child();
-            while let Some(widget) = child {
-                widget.set_opacity(opacity.clamp(0.0, 1.0));
-                child = widget.next_sibling();
-            }
-        }
-
-        // The width, eased. Nothing here moves the menu's size except this, so the row
-        // that shrinks the menu does it as part of the motion rather than in one jump
-        // halfway through.
-        let width = ease_margin(from_width, to_width, eased);
+        context
+            .window
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+        // The width holds for the length of the slide; only it and the two
+        // margins move.
         context.window.set_size_request(width.max(1), -1);
         context.window.set_default_size(width.max(1), -1);
         context
@@ -3073,13 +2981,10 @@ fn context_ease(
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
-        if fade_surface {
-            context.window.set_opacity(to_opacity);
-        }
-        // Row opacity is left at whatever it ended on: the rows are replaced wholesale
-        // mid-move, so restoring it here would only matter for a row that survived.
-        context.window.set_size_request(to_width.max(1), -1);
-        context.window.set_default_size(to_width.max(1), -1);
+        // Land exactly on the ends, so no rounding residue is left behind.
+        context.window.set_opacity(to_opacity);
+        context.window.set_size_request(width.max(1), -1);
+        context.window.set_default_size(width.max(1), -1);
         context.window.set_margin(Edge::Left, to_left);
         context.window.set_margin(Edge::Top, to_top);
         glib::ControlFlow::Break
@@ -3092,16 +2997,33 @@ fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
     (f64::from(from) + (f64::from(to) - f64::from(from)) * f).round() as i32
 }
 
-/// Open the app menu for an app, or move an open one onto it.
+/// Open the app menu for an app.
+///
+/// A menu that is already on screen takes the new app's rows, width and place
+/// in one step, with no transition of any kind: the move between squares is a
+/// change of subject, not an event, and the arrival and departure animations
+/// are for the menu itself.
 fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], button: &Button) {
-    // A reopen during the close fade takes the menu back: the fade that was running
-    // is not a close any more, so a later close must be able to run again.
-    context.closing.set(false);
     let (icon_center, bar_width) = icon_metrics(button);
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
     context.app.replace(Some(key.to_string()));
     context_fill(context, key, windows);
+    if context.shown.get() {
+        let width = context
+            .rows
+            .measure(gtk4::Orientation::Horizontal, -1)
+            .1
+            .max(1);
+        context.window.set_size_request(width, -1);
+        context.window.set_default_size(width, -1);
+        context.window.set_margin(Edge::Left, menu_left(icon_center, bar_width, width));
+        sync_tooltips_from_context(&context);
+        return;
+    }
+    // A reopen during the close fade takes the menu back: the fade that was running
+    // is not a close any more, so a later close must be able to run again.
+    context.closing.set(false);
     if menu_debug() {
         let mut count = 0;
         let mut child = context.rows.first_child();
@@ -3117,27 +3039,25 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
     }
     context.shown.set(true);
     sync_tooltips_from_context(&context);
-    context.window.present();
+    // The catcher goes up with the menu, and goes first, so a click aimed
+    // anywhere at all lands on it rather than on whatever the menu sits over.
+    context.shield.set_visible(true);
     // Under the square, measured from the rows that were just built. Measured rather
     // than waited for: a surface that has not been mapped has no width yet, and by
     // the time it does the menu has been in the wrong place.
-    let left = menu_left(
-        icon_center,
-        bar_width,
-        context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
-    );
+    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
+    // Sized before it shows, the way the preview menu is: the surface arrives in
+    // final shape and only slides and fades. Easing the width on the way in made
+    // the menu grow sideways while it appeared — motion nothing of the kind the
+    // thumbnail menu has — and the width of an unmapped surface is zero, so the
+    // first open grew from nothing every time.
+    context.window.set_size_request(width.max(1), -1);
+    context.window.set_default_size(width.max(1), -1);
+    context.window.present();
     // And the slide out of the bar, which `animate_surface` would have done along
     // with the window's opacity.
     let resting = PANEL_HEIGHT;
-    // Opening and closing fade the whole surface: the menu appearing from nothing is the
-    // point. Only a move between apps holds the surface and fades the rows.
-    //
-    // From the width the surface is actually at, not the width its rows measure to. A
-    // menu left wide by a move measures narrower than it is, and easing from the
-    // measurement made the close jump to that width before it began — the close animation
-    // playing at a width the menu was not.
-    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
-    let from_width = context.window.width().max(1);
+    let left = menu_left(icon_center, bar_width, width);
     let _ = context_ease(
         context,
         0.0,
@@ -3146,9 +3066,7 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
         left,
         resting - MENU_SLIDE,
         resting,
-        from_width,
-        width,
-        true,
+        width.max(1),
     );
 }
 
@@ -3158,10 +3076,9 @@ fn context_close(context: &Rc<ContextMenu>) {
         return;
     }
     context.closing.set(true);
-    // Whatever the pointer was last over, it is not over a menu that is no longer
-    // there, so a close cannot be left scheduled against it.
-    context.hover.inside.set(false);
-    context.hover.token.set(context.hover.token.get().wrapping_add(1));
+    // The catcher's work is done: clicks during the close fade land wherever
+    // they were aimed, and the menu is already on its way out.
+    context.shield.set_visible(false);
     context.app.replace(None);
     sync_tooltips_from_context(context);
     let left = menu_left(
@@ -3170,10 +3087,12 @@ fn context_close(context: &Rc<ContextMenu>) {
         context.rows.measure(gtk4::Orientation::Horizontal, -1).1,
     );
     let fading = context.clone();
-    // The whole menu fades as it slides back up into the bar.
+    // The whole menu fades as it slides back up into the bar, at the size it is
+    // — the same leave the preview menu makes: slide and fade, nothing else
+    // moving. Easing to the width the rows measure closed the menu at one size
+    // while it shrank to another.
     let resting = PANEL_HEIGHT;
-    let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
-    let from_width = context.window.width().max(1);
+    let width = context.window.width().max(1);
     let token = context_ease(
         context,
         1.0,
@@ -3182,10 +3101,7 @@ fn context_close(context: &Rc<ContextMenu>) {
         left,
         resting,
         resting - MENU_SLIDE,
-        from_width,
         width,
-        // The whole surface: a menu closing is a menu closing.
-        true,
     );
     // `shown` is not cleared here. It is cleared when the fade lands, so that a hover
     // arriving in the next 180ms cannot put the previews into a menu that is still on
@@ -3201,64 +3117,6 @@ fn context_close(context: &Rc<ContextMenu>) {
         fading.closing.set(false);
         glib::ControlFlow::Break
     });
-}
-
-/// Close the context menu once the pointer has been off it for a moment.
-///
-/// The same treatment the preview menu gets, and for the same reason: the pointer
-/// has to cross the bar to reach the menu, so a leave on one surface is not the
-/// pointer leaving both.
-fn watch_context_hover(context: &Rc<ContextMenu>, bar_row: &GtkBox) {
-    let context = context.clone();
-    // The bar as well as the menu, and for the same reason the preview menu watches
-    // both: the pointer has to cross the bar to reach the menu, so a leave on one is
-    // not the pointer leaving both. Without the bar here, walking back up to the bar
-    // left the app menu on screen with nothing to dismiss it but another right click.
-    //
-    // The window as well as the rows, so that the gap strip above the rows — which
-    // belongs to this menu — counts as being on it.
-    let widgets: Vec<gtk4::Widget> = vec![
-        bar_row.clone().upcast(),
-        context.rows.clone().upcast(),
-        context.window.clone().upcast(),
-    ];
-    for rows in widgets {
-    let context = context.clone();
-    let motion = gtk4::EventControllerMotion::new();
-
-    let on_move = context.hover.clone();
-    motion.connect_motion(move |_, _, _| {
-        on_move.inside.set(true);
-        on_move.token.set(on_move.token.get().wrapping_add(1));
-    });
-    let on_enter = context.hover.clone();
-    motion.connect_enter(move |_, _, _| {
-        on_enter.inside.set(true);
-        on_enter.token.set(on_enter.token.get().wrapping_add(1));
-    });
-
-    let on_leave = context.hover.clone();
-    motion.connect_leave(move |_| {
-        on_leave.inside.set(false);
-        let token = on_leave.token.get().wrapping_add(1);
-        on_leave.token.set(token);
-        let context = context.clone();
-        glib::timeout_add_local(HOVER_GRACE, move || {
-            if context.hover.token.get() != token {
-                return glib::ControlFlow::Break;
-            }
-            // A surface being resized under a stationary pointer is handed a leave,
-            // and the next resize hands it another. So while it is still moving, the
-            // close waits: the pointer has not gone anywhere, the surface has.
-            if context.shown.get() && !context.hover.inside.get() {
-                context_close(&context);
-            }
-            glib::ControlFlow::Break
-        });
-    });
-
-    rows.add_controller(motion);
-    }
 }
 
 thread_local! {
@@ -3282,13 +3140,662 @@ thread_local! {
     static OVERLAY: RefCell<Option<gtk4::Overlay>> = const { RefCell::new(None) };
 }
 
-/// Build the bar again from the last snapshot.
+// ---------------------------------------------------------------- the squares
+
+/// One square in the bar: the app it stands for and the widgets that show it.
+///
+/// Built the first time its app is seen and kept for the rest of the session,
+/// updated in place by every snapshot after that. A square that was destroyed
+/// and rebuilt on every snapshot took everything attached to it with it — a
+/// hover mid-dwell, a press half-way through a click, the square a drag is
+/// carrying — and that destruction was the source of most of the panel's
+/// races. Kept, those all survive a title change.
+struct Square {
+    /// The app the square stands for, or the synthetic `#id` key of a window
+    /// that never said what it is.
+    key: String,
+    /// The square itself, which the row lays out and the pointer presses.
+    button: Button,
+    /// The window-count indicator under the icon.
+    dots: DrawingArea,
+}
+
+// The squares, in bar order.
+thread_local! {
+    static SQUARES: RefCell<Vec<Square>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The app id a key names. A synthetic `#id` key names a panel id, not an app,
+/// and has no app id to speak of.
+fn app_id_of(key: &str) -> &str {
+    if key.starts_with('#') {
+        ""
+    } else {
+        key
+    }
+}
+
+/// The app's windows, from the latest snapshot.
+///
+/// Owned data rather than a slice into the snapshot cell: render ticks and
+/// timers read this, and a borrow held across one of those would fight every
+/// `sync_bar`.
+fn group_for_key(key: &str) -> Vec<WindowInfo> {
+    SNAPSHOT.with(|cell| {
+        cell.borrow()
+            .iter()
+            .filter(|info| group_key(info) == key)
+            .cloned()
+            .collect()
+    })
+}
+
+impl Square {
+    /// Build a square, wire it up, and leave its state to [`Square::refresh`].
+    fn build(key: &str, stream: &Channel, menu: &Rc<Menu>, context: &Rc<ContextMenu>) -> Square {
+        let key = key.to_string();
+        let button = Button::new();
+        // The click must not be spent grabbing focus first: without this, the first
+        // click on a square while some other app holds focus activates the window
+        // instead of the button, and only the second one registers.
+        button.set_focus_on_click(false);
+        // Named for the app, which is how a drag and a dwell timer find this
+        // square again: the row moves squares by app, and a button carries
+        // nothing else that survives.
+        button.set_widget_name(&format!("{APP_NAME_PREFIX}{key}"));
+        button.add_css_class("task");
+        // Without this the HBox stretches the button to the panel height.
+        button.set_valign(gtk4::Align::Center);
+        button.set_halign(gtk4::Align::Center);
+        button.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+
+        let icon = resolve_icon(app_id_of(&key));
+        let image = if icon.starts_with('/') {
+            Image::from_file(&icon)
+        } else {
+            Image::from_icon_name(&icon)
+        };
+        image.set_pixel_size(ICON_SIZE);
+
+        // The button's 1px border is inside its 36px box, so the content area is
+        // 34px and the whole square stays 36x36.
+        let inner = SQUARE_SIZE - 2 * SQUARE_BORDER;
+        let dots = DrawingArea::new();
+        dots.set_content_width(inner);
+        dots.set_content_height(INDICATOR_HEIGHT);
+        dots.set_size_request(inner, INDICATOR_HEIGHT);
+        dots.set_valign(gtk4::Align::End);
+        // Live state, not captured state: the dots redraw from the snapshot
+        // whenever a refresh asks them to, so a window opening or a focus
+        // change shows up without the square being rebuilt.
+        let dots_key = key.clone();
+        dots.set_draw_func(move |_, context, width, height| {
+            let group = group_for_key(&dots_key);
+            let focused = group.iter().any(|window| window.focused);
+            let color = if focused { accent_rgb() } else { MUTED_COLOR };
+            draw_indicators(context, width, height, group.len(), color);
+        });
+
+        let column = GtkBox::new(Orientation::Vertical, 0);
+        column.set_halign(gtk4::Align::Center);
+        column.set_valign(gtk4::Align::Center);
+        column.append(&image);
+        column.append(&dots);
+        button.set_child(Some(&column));
+
+        let square = Square {
+            key: key.clone(),
+            button,
+            dots,
+        };
+
+        square.wire_hover(menu, context, stream);
+        square.wire_click(stream, menu, context);
+        square.wire_drag();
+        square.wire_context(context, menu);
+        square.refresh();
+
+        square
+    }
+
+    /// Bring the square's state in line with the snapshot.
+    ///
+    /// Widgets are not touched unless their state changed, so a snapshot that
+    /// only renamed a window repaints one tooltip and a couple of CSS classes —
+    /// and a snapshot that changed nothing repaints nothing at all. The dots'
+    /// draw function reads the snapshot itself when it is asked to redraw.
+    fn refresh(&self) {
+        let group = group_for_key(&self.key);
+        let count = group.len();
+        let focused = group.iter().any(|window| window.focused);
+        // Only when every one of the app's windows is minimized, so the square says
+        // the app is there but not on screen rather than implying anything about
+        // the others. A square with nothing behind it is a pinned app's, there to
+        // be started from — not minimized, with no window to have been.
+        let dimmed = (count > 0 && group.iter().all(|window| window.minimized)) || count == 0;
+        if dimmed {
+            self.button.add_css_class("minimized");
+        } else {
+            self.button.remove_css_class("minimized");
+        }
+        if focused {
+            self.button.add_css_class("focused");
+        } else {
+            self.button.remove_css_class("focused");
+        }
+
+        // A square with nothing behind it names the app rather than counting windows it
+        // does not have.
+        let tooltip = match count {
+            0 => crate::desktop::cached(app_id_of(&self.key))
+                .map(|app| app.label().to_string())
+                .unwrap_or_else(|| "Not running".to_string()),
+            1 => window_title(&group[0]),
+            _ => format!("{count} windows"),
+        };
+        self.button.set_tooltip_text(Some(&tooltip));
+        // Whether it is *shown* is not decided here: an open menu would otherwise
+        // have the tooltip come up underneath it and draw through it. Re-synced
+        // from the menus every time, exactly as a build used to do, so a snapshot
+        // arriving while a menu is up does not put the tooltips back.
+        if let Some((_, menu, _, _, context)) = LAST_BAR.with(|cell| cell.borrow().clone()) {
+            sync_tooltip(&self.button, &menu, &context);
+        }
+        self.dots.queue_draw();
+    }
+
+    /// Hovering a square opens that app's menu, and moves an open one to the app
+    /// under the pointer, so travelling along the bar moves the menu with it.
+    ///
+    /// After a moment, not immediately. A square that opened its menu on the pointer
+    /// arriving would open one for every square the pointer crossed on the way to
+    /// somewhere, and the last of those would be the only one left standing.
+    fn wire_hover(&self, menu: &Rc<Menu>, context: &Rc<ContextMenu>, stream: &Channel) {
+        let key = self.key.clone();
+        let menu = menu.clone();
+        let context = context.clone();
+        let stream = stream.clone();
+        // Shared with the timeout, so leaving the square or moving to another one
+        // cancels the open that was about to happen.
+        let token = Rc::new(Cell::new(0u64));
+        let on_dwell = token.clone();
+        let on_leave = token.clone();
+        let hover = gtk4::EventControllerMotion::new();
+
+        hover.connect_enter(glib::clone!(
+            #[weak]
+            menu,
+            #[weak]
+            context,
+            #[upgrade_or]
+            return,
+            move |_, _, _| {
+                // Captured by value; cloned here so the handler can run any number of
+                // times.
+                let key = key.clone();
+                let stream = stream.clone();
+                let on_dwell = on_dwell.clone();
+                // Entering anywhere on the row cancels a close scheduled by leaving the
+                // square before, whether this square has anything to show or not.
+                menu.hover_token.set(menu.hover_token.get() + 1);
+                let group = group_for_key(&key);
+                if group.is_empty() {
+                    // An app with no windows has no previews to offer, so there is
+                    // nothing to switch to and nothing to show. It is not a reason to
+                    // leave the previous app's menu on screen: leaving the previews up
+                    // while the pointer rests somewhere they have nothing to do with is
+                    // how a menu ends up floating over an icon it does not belong to.
+                    if menu.shown.get() && menu.app.borrow().is_some() {
+                        menu_close(&menu);
+                    }
+                    return;
+                }
+                // One menu at a time: the app menu is up, so this square does
+                // nothing while the pointer is on it. The app menu stays anchored
+                // to the app it was opened for — hovering does not move it — and
+                // hovering it does not start opening the previews either, which
+                // would land a second menu underneath it. A menu already fading
+                // out no longer holds the pointer: the previews may arm as usual.
+                if context.shown.get() && !context.closing.get() {
+                    return;
+                }
+                // The previews open after a dwell, not instantly, so travelling
+                // along the bar does not open a menu for every square crossed.
+                // The timer below is the only path: it re-looks the square up,
+                // cancels if the pointer has moved on, and no-ops if this app's
+                // menu is already the one up.
+                let ticket = on_dwell.get().wrapping_add(1);
+                on_dwell.set(ticket);
+                // The timer below outlives this handler by up to a quarter of a second,
+                // and a snapshot can refresh the square underneath it in the meantime.
+                // The timer must not hold the square — a strong reference would keep a
+                // removed one alive for the session — but it must equally not give up
+                // when it goes, or a refresh in the middle of a hover cancels the hover
+                // and the previews never open. It looks the square up again when it
+                // fires instead, and rechecks the group against the snapshot, in case
+                // the windows it was going to show have all gone.
+                let dwell_key = key.clone();
+                glib::timeout_add_local(HOVER_OPEN, move || {
+                    let Some(button) = tasks_box()
+                        .as_ref()
+                        .and_then(|tasks| square_for(tasks, &key))
+                    else {
+                        // The square has left the bar. Nothing to open onto.
+                        return glib::ControlFlow::Break;
+                    };
+                    if on_dwell.get() != ticket {
+                        // Left, or moved to another square, before it was due.
+                        return glib::ControlFlow::Break;
+                    }
+                    let group = group_for_key(&dwell_key);
+                    if group.is_empty() {
+                        // The app really has gone. Nothing to open.
+                        return glib::ControlFlow::Break;
+                    }
+                    if menu.app.borrow().as_deref() == Some(key.as_str()) {
+                        return glib::ControlFlow::Break;
+                    }
+                    // An app menu is up. Checked *here* and not only where the timer
+                    // was armed: the pointer can arrive on a square, and be right
+                    // clicked, inside the quarter of a second before this fires —
+                    // and then this opened the previews straight over the app menu
+                    // that the right click had just put there.
+                    if context.shown.get() {
+                        return glib::ControlFlow::Break;
+                    }
+                    let group: Vec<&WindowInfo> = group.iter().collect();
+                    menu_open(&menu, &key, &group, &button, &stream);
+                    glib::ControlFlow::Break
+                });
+            }
+        ));
+
+        hover.connect_leave(move |_| {
+            // Cancels a dwell-open that has not fired yet; nothing more. Leaving a
+            // square does *not* close the menu: the panel itself is a safe zone, so
+            // the menu stays up while the pointer moves around the bar, and the
+            // close comes from `watch_hover` only — which fires when the pointer
+            // leaves the panel, the menu, or the gap between them for good.
+            on_leave.set(on_leave.get().wrapping_add(1));
+        });
+        self.button.add_controller(hover);
+    }
+
+    /// The left click: one decision for the press, made by [`square_click`].
+    ///
+    /// The button's own click signal is what carries it — an external GestureClick
+    /// gets the *press* on a GtkButton, but the button's internals claim the
+    /// sequence and cancel it before the release — and keyboard activation comes
+    /// free with it.
+    fn wire_click(&self, stream: &Channel, menu: &Rc<Menu>, context: &Rc<ContextMenu>) {
+        let stream = stream.clone();
+        let key = self.key.clone();
+        let menu = menu.clone();
+        let context = context.clone();
+        let square = self.button.clone();
+        let button = self.button.clone();
+        square.connect_clicked(move |_| {
+            let windows = group_for_key(&key);
+            square_click(&button, &stream, &key, &windows, &menu, &context);
+        });
+    }
+
+    /// Reordering by dragging is opt-in (`OXIDE_PANEL_DRAG`) and rides its own
+    /// `GestureDrag` alongside the click. The gesture only ever *drags*: the
+    /// decision about what the release meant is the button's click signal
+    /// alone — a real drag left the square, and was cancelled as a click —
+    /// and `square_click` treats a lift-and-put-back as the click it is.
+    fn wire_drag(&self) {
+        if std::env::var_os("OXIDE_PANEL_DRAG").is_none() {
+            return;
+        }
+        let key = self.key.clone();
+        let button = self.button.clone();
+        let gesture = gtk4::GestureDrag::new();
+        gesture.set_button(gdk::BUTTON_PRIMARY);
+        // The pointer's row position where the gesture started (square's place
+        // in the row plus the gesture's start point), captured at drag-begin
+        // while the square is still in the row — together with the square's
+        // origin then, which the update uses to correct for the widget's own
+        // travel: the gesture's offsets are widget-relative and this drag moves
+        // the widget.
+        let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        {
+            let start_row = start_row.clone();
+            let button = button.clone();
+            gesture.connect_drag_begin(
+                move |g, _, _| {
+                    let origin = tasks_box()
+                        .and_then(|tasks| button.translate_coordinates(&tasks, 0.0, 0.0));
+                    let start = g.start_point();
+                    if let (Some((left, _)), Some((sx, _))) = (origin, start) {
+                        start_row.set(Some((left + sx, left)));
+                    }
+                    drag_begin(&key);
+                }
+            );
+        }
+        {
+            let start_row = start_row.clone();
+            let button = button.clone();
+            gesture.connect_drag_update(move |_, ox, _| {
+                let Some((row_start, origin0)) = start_row.get() else {
+                    return;
+                };
+                let Some(origin1) = tasks_box()
+                    .and_then(|tasks| button.translate_coordinates(&tasks, 0.0, 0.0))
+                    .map(|(left, _)| left)
+                else {
+                    return;
+                };
+                let travel = ox + (origin1 - origin0);
+                let pointer_x = row_start + travel;
+                if drag_update(pointer_x, (travel, 0.0)) {
+                    if let Some(tasks) = tasks_box() {
+                        tasks.queue_allocate();
+                    }
+                }
+            });
+        }
+        gesture.connect_drag_end(move |_, _, _| {
+            start_row.set(None);
+            if drag_active() {
+                if drag_end() {
+                    glib::idle_add_local_once(|| rebuild_bar());
+                }
+            }
+        });
+        self.button.add_controller(gesture);
+    }
+
+    /// The right click: the app's menu of actions.
+    fn wire_context(&self, context: &Rc<ContextMenu>, menu: &Rc<Menu>) {
+        let key = self.key.clone();
+        let menu = menu.clone();
+        let context = context.clone();
+        let square = self.button.clone();
+        let secondary = gtk4::GestureClick::new();
+        secondary.set_button(gdk::BUTTON_SECONDARY);
+        secondary.connect_released(glib::clone!(
+            #[weak]
+            square,
+            #[upgrade_or]
+            return,
+            move |_, _, _, _| {
+                // The previews are replaced, not faded out from under. The app menu goes
+                // up in the same place a frame later, and a preview menu still fading out
+                // beneath it is two surfaces in the same place — which is what "the menu
+                // just opens over it" was. Cut, and let the app menu do the fading.
+                // A second right click on the same square closes it, as a second left
+                // click on the previews does.
+                let windows = group_for_key(&key);
+                if context.shown.get()
+                    && context.app.borrow().as_deref() == Some(key.as_str())
+                {
+                    context_close(&context);
+                    return;
+                }
+                // The previews play their own close, and the app menu opens when that has
+                // finished. Not overlapped and not cut: overlapping was two surfaces in one
+                // place, and cutting threw away an animation the pointer had just earned.
+                // One after the other, each doing its own thing.
+                let opening = context.clone();
+                let right_key = key.clone();
+                let button = square.clone();
+                if menu_open_now(&menu) {
+                    menu_close(&menu);
+                    glib::timeout_add_local(MENU_FADE, move || {
+                        if opening.shown.get() {
+                            // Something else opened the app menu while the previews were
+                            // closing. Two of them at once is what this is avoiding.
+                            return glib::ControlFlow::Break;
+                        }
+                        context_open(&opening, &right_key, &windows, &button);
+                        glib::ControlFlow::Break
+                    });
+                    return;
+                }
+                context_open(&context, &key, &windows, &square);
+            }
+        ));
+        self.button.add_controller(secondary);
+    }
+}
+
+/// Bring the bar in line with the last snapshot, without waiting for a new one.
+///
+/// Pinning is the panel's own state, not the compositor's: nothing in the window
+/// list changes when an app is pinned, so there is no snapshot coming. The
+/// snapshot already stored is what a pin adds its square against.
 fn rebuild_bar() {
     let state = LAST_BAR.with(|cell| cell.borrow().clone());
     let Some((tasks, menu, windows, stream, context)) = state else {
         return;
     };
-    rebuild_tasks(&tasks, &menu, &windows, &stream, &context);
+    sync_bar(&tasks, &menu, &windows, &stream, &context);
+}
+
+/// Bring the bar in line with a snapshot of windows.
+///
+/// The squares are kept, not rebuilt: one per app is created the first time it
+/// is seen and updated in place from then on. A rebuild destroyed every button
+/// the bar had — the hover mid-dwell, the press half-way through a click, the
+/// square a drag is carrying — and that destruction was the source of most of
+/// the panel's races. A snapshot is instead a diff: squares for apps that have
+/// gone are removed, squares for newly seen apps are built, everything else is
+/// refreshed where it stands, and the row is listed in the remembered order.
+fn sync_bar(
+    tasks: &GtkBox,
+    menu: &Rc<Menu>,
+    windows: &[WindowInfo],
+    stream: &Channel,
+    context: &Rc<ContextMenu>,
+) {
+    SNAPSHOT.with(|cell| *cell.borrow_mut() = windows.to_vec());
+    LAST_BAR.with(|cell| {
+        *cell.borrow_mut() = Some((
+            tasks.clone(),
+            menu.clone(),
+            windows.to_vec(),
+            stream.clone(),
+            context.clone(),
+        ));
+    });
+    // A live drag survives a snapshot: snapshots arrive *because* of ordinary use
+    // — the focus change from a click is itself a snapshot — and cancelling the
+    // drag on every snapshot killed every attempt a frame after it started. What
+    // `drag_cancel` still handles is the stale case: an overlay left behind with
+    // no drag under way.
+    if !drag_active() {
+        drag_cancel();
+    }
+
+    // Group the windows by app. Windows with no app id get a key of their own so
+    // they don't all collapse together.
+    let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
+    for info in windows {
+        // The same rule the menu's own reconciliation uses, so a refresh and a
+        // resync cannot disagree about which windows belong to an app.
+        let key = group_key(info);
+        match groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+            Some((_, group)) => group.push(info),
+            None => groups.push((key, vec![info])),
+        }
+    }
+
+    // A pinned app with nothing open gets a square of its own, so there is somewhere
+    // in the bar to start it from — and somewhere to unpin it from.
+    for id in pinned_without_windows(&groups) {
+        groups.push((id, Vec::new()));
+    }
+
+    // And the bar goes in the order the panel remembers, not the order the snapshot
+    // happened to list the apps in.
+    let keys: Vec<String> = groups.iter().map(|(key, _)| key.clone()).collect();
+    let positions = arrange(&keys);
+    let mut ordered: Vec<(String, Vec<&WindowInfo>)> = Vec::with_capacity(groups.len());
+    for index in positions {
+        ordered.push(groups[index].clone());
+    }
+
+    // An open preview menu is kept in step with every snapshot, *including* one
+    // where its app has no windows left. Skipping that case — or closing the menu
+    // outright on it — is what stopped the close animation: with no group to find,
+    // the entries were never told to go, and the menu simply vanished. An empty
+    // group instead animates them away, and the menu closes itself once the last
+    // one has.
+    let open_key = menu.app.borrow().clone();
+    let every: Vec<&WindowInfo> = windows.iter().collect();
+    if let Some(key) = &open_key {
+        // A refresh is itself the reconciliation, so anything the row missed while a
+        // switch was running has now been applied.
+        menu.resync_pending.set(false);
+        let group: Vec<&WindowInfo> = ordered
+            .iter()
+            .find(|(group_key, _)| group_key == key)
+            .map(|(_, group)| group.clone())
+            .unwrap_or_default();
+        // Every window, minimized ones included. A minimized window cannot be
+        // captured, so the compositor answers with the last frame it took for it and
+        // the cell shows that: more use than a hole in the row, and it keeps the count
+        // on the square and the number of previews in step.
+        menu_replace(menu, &every, &group, stream);
+        if menu_debug() {
+            // The bar and the menu disagreeing about which windows exist is the
+            // awkward one to read off the screen: the count is right and the row is
+            // empty, with nothing in between to say why.
+            let entries = menu.entries.borrow();
+            let order = menu.order.borrow();
+            let with_preview = order
+                .iter()
+                .filter(|id| {
+                    entries
+                        .get(id)
+                        .is_some_and(|entry| entry.preview.borrow().is_some())
+                })
+                .count();
+            eprintln!(
+                "oxide-panel: snapshot {} windows, {} minimized; menu order {order:?}, \
+                 {with_preview} with a preview",
+                windows.len(),
+                windows.iter().filter(|info| info.minimized).count(),
+            );
+        }
+    }
+
+    // An open app menu is kept in step with the new snapshot too. What it offers
+    // depends on the window count — one window is closed by name, several are
+    // closed together, none means no row at all — so a window opened or closed
+    // underneath it has to change what is on screen.
+    // `shown` rather than `app`: the app key outlives the fade now, so refilling a
+    // menu that is on its way out would be work for nothing.
+    if let Some(key) = context.shown.get().then(|| context.app.borrow().clone()).flatten() {
+        let group: Vec<WindowInfo> = ordered
+            .iter()
+            .find(|(group_key, _)| *group_key == key)
+            .map(|(_, group)| group.iter().map(|info| (*info).clone()).collect())
+            .unwrap_or_default();
+        context_fill(context, &key, &group);
+    }
+
+    // The square a drag is carrying lives in the overlay, outside the row. A
+    // refresh updates its state like any other, but nothing here may re-parent
+    // it into the row or re-create it: the row is holding the placeholder's hole
+    // open where it left, and that arrangement is undone by the drop, not by a
+    // snapshot.
+    let carried = drag_active().then(|| {
+        DRAG.with(|drag| {
+            drag.borrow()
+                .as_ref()
+                .map(|state| state.borrow().app.clone())
+        })
+    });
+    let carried = carried.flatten();
+    let wants = |key: &str| !drag_active() || carried.as_deref() != Some(key);
+
+    // Squares for apps that have gone are removed, in the row and from the list.
+    let keys: HashSet<&String> = ordered.iter().map(|(key, _)| key).collect();
+    SQUARES.with(|cell| {
+        cell.borrow_mut().retain(|square| {
+            if keys.contains(&square.key) {
+                return true;
+            }
+            if !wants(&square.key) {
+                // Being carried: keep the square until the drop, which puts it
+                // back wherever the pointer let go of it.
+                return true;
+            }
+            tasks.remove(&square.button);
+            if menu_debug() {
+                eprintln!("oxide-panel: square {:?} retired", square.key);
+            }
+            false
+        })
+    });
+
+    // Squares for apps newly seen are built.
+    let have: HashSet<String> =
+        SQUARES.with(|cell| cell.borrow().iter().map(|s| s.key.clone()).collect());
+    for (key, _) in &ordered {
+        if !have.contains(key) && wants(key) {
+            let square = Square::build(key, stream, menu, context);
+            tasks.append(&square.button);
+            SQUARES.with(|cell| cell.borrow_mut().push(square));
+        }
+    }
+
+    // Everything is refreshed where it stands. The widgets are not touched
+    // unless their state changed, so a snapshot that renamed a window repaints
+    // a tooltip and nothing else.
+    SQUARES.with(|cell| {
+        for square in cell.borrow().iter() {
+            square.refresh();
+        }
+    });
+
+    // And the row is listed in the remembered order — but only if the order has
+    // actually changed. Every re-list unparents and re-inserts every button,
+    // and a press whose gesture is still mid-flight (the pointer is down over
+    // one of them) does not survive that: the click lands dead, and needs a
+    // second press. Snapshots arrive between presses more often than they
+    // change the order — a focus change caused by the previous click is one —
+    // so the common case is leaving the row alone.
+    if !drag_active() {
+        let buttons: HashMap<String, Button> = SQUARES.with(|cell| {
+            cell.borrow()
+                .iter()
+                .map(|square| (square.key.clone(), square.button.clone()))
+                .collect()
+        });
+        let keys: Vec<String> = ordered.iter().map(|(key, _)| key.clone()).collect();
+        let listed: Vec<String> = {
+            let mut cursor = tasks.first_child();
+            let mut names = Vec::new();
+            while let Some(widget) = cursor {
+                if let Some(key) = app_of(&widget) {
+                    names.push(key);
+                }
+                cursor = widget.next_sibling();
+            }
+            names
+        };
+        if listed != keys {
+            let mut index = 0usize;
+            for key in &keys {
+                let Some(button) = buttons.get(key) else { continue };
+                put_child(tasks, button.upcast_ref(), index);
+                index += 1;
+            }
+        }
+    }
+
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: synced bar with {} window(s) for {:?}",
+            windows.len(),
+            open_key.as_deref().unwrap_or("<none>")
+        );
+    }
 }
 
 thread_local! {
@@ -3592,10 +4099,6 @@ window.panel-window {{
 .panel label {{
     color: #e8e8e8;
     font-weight: 500;
-}}
-.panel .title {{
-    color: rgb({r}, {g}, {b});
-    font-weight: 700;
 }}
 .panel .tasks {{
     margin-left: 6px;
@@ -3915,16 +4418,21 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     let menu = build_menu(app, &monitor, channel.clone());
     // The app menu, opened by a right click. A third surface for the same reason
     // the menu is a second: an unpainted region of a surface still takes clicks.
+    // It is dismissed by clicks only — a row of its own, a square, another right
+    // click — not by the pointer leaving it.
     let context = build_context_menu(app, &monitor, channel.clone());
-    // Watching needs the bar, so it is wired here rather than at the build.
-    watch_context_hover(&context, &bar_row);
     let hover = Rc::new(Hover::default());
 
 
-    // Hover-out closes the menu. The pointer has to cross the bar to reach the
+    // Hover-out closes the preview menu. The pointer has to cross the bar to reach the
     // menu, so "inside" spans both surfaces, and the close is deferred briefly so
     // passing between them is not read as leaving.
     watch_hover(&bar_row, &menu, &hover);
+    // The shield underneath takes clicks aimed at the desktop and at windows,
+    // but the bar is above it. A click on the bar between the squares is the
+    // pointer's attention going somewhere the menu is not, so the menu loses it
+    // there the same way it loses it to a square.
+    watch_bar_click_off(&bar_row, &context);
 
     if let Some(stream) = socket {
         channel.send(&format!("accent\t{:.6}\t{:.6}\t{:.6}", accent_rgb().0, accent_rgb().1, accent_rgb().2));
@@ -3961,9 +4469,6 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     row.add_css_class("panel");
     row.set_size_request(-1, PANEL_HEIGHT);
 
-    let title = Label::new(Some("oxide"));
-    title.add_css_class("title");
-
     let tasks = GtkBox::new(Orientation::Horizontal, 2);
     tasks.add_css_class("tasks");
 
@@ -3971,7 +4476,6 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     clock.set_hexpand(true);
     clock.set_halign(gtk4::Align::End);
 
-    row.append(&title);
     row.append(&tasks);
     row.append(&clock);
 
@@ -4014,8 +4518,44 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     (window, row, tasks)
 }
 
-/// Tell the compositor the accent so it can tint the snap preview.
+/// Close the right-click menu when a click lands on the bar but off its squares.
 ///
+/// The menu is not hover-closed, so the pointer is free to roam; the moment the
+/// pointer *presses* somewhere the menu is not — here, that is the bar's own
+/// background between and around the squares — it has gone to something the
+/// menu is not for. (Desktop and windows are the shield's job, one layer down.)
+/// Presses on a square are left to the square: its release decides whether the
+/// click dismisses the menu only or also acts.
+fn watch_bar_click_off(bar_row: &GtkBox, context: &Rc<ContextMenu>) {
+    let context = context.clone();
+    let bar = bar_row.clone().upcast::<gtk4::Widget>();
+    let click = gtk4::GestureClick::new();
+    click.connect_pressed(move |_, _, x, y| {
+        let Some(tasks) = tasks_box() else { return };
+        let bar = bar.clone();
+        let mut on_square = false;
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            cursor = widget.next_sibling();
+            if let Some(button) = widget.downcast_ref::<Button>()
+                && let Some((left, top)) = button.translate_coordinates(&bar, 0.0, 0.0)
+                && x >= left
+                && x <= left + f64::from(button.width())
+                && y >= top
+                && y <= top + f64::from(button.height())
+            {
+                on_square = true;
+                break;
+            }
+        }
+        if !on_square {
+            context_close(&context);
+        }
+    });
+    bar_row.add_controller(click);
+}
+
+/// Tell the compositor the accent so it can tint the snap preview.
 /// Sent on every connect rather than once at startup, because the compositor forgets it
 /// when it exits: a panel that outlives its compositor has to say it again or the snap
 /// preview comes back in whatever colour the last session ended on.
@@ -4086,7 +4626,7 @@ fn start_polling(
             match event {
                 PanelEvent::Snapshot(list) => {
                     windows.replace(list.clone());
-                    rebuild_tasks(&tasks, &menu, &list, &channel_poll, &context);
+                    sync_bar(&tasks, &menu, &list, &channel_poll, &context);
                 }
                 PanelEvent::Image {
                     id,
@@ -4107,7 +4647,7 @@ fn start_polling(
                     // The compositor sends a fresh list on connect, so nothing has to be
                     // asked for by hand.
                     windows.replace(Vec::new());
-                    rebuild_tasks(&tasks, &menu, &[], &channel_poll, &context);
+                    sync_bar(&tasks, &menu, &[], &channel_poll, &context);
                     reconnect(&channel_poll);
                 }
             }
@@ -4196,166 +4736,6 @@ fn icon_metrics(button: &Button) -> (i32, i32) {
     }
 }
 
-/// Rebuild the icon row, and keep any open menu in step with it.
-fn rebuild_tasks(
-    tasks: &GtkBox,
-    menu: &Rc<Menu>,
-    windows: &[WindowInfo],
-    stream: &Channel,
-    context: &Rc<ContextMenu>,
-) {
-    // Remembered before anything else, so a rebuild asked for by the panel's own
-    // state — a pin, an unpin — can be served without waiting for a snapshot.
-    SNAPSHOT.with(|cell| *cell.borrow_mut() = windows.to_vec());
-    LAST_BAR.with(|cell| {
-        *cell.borrow_mut() = Some((
-            tasks.clone(),
-            menu.clone(),
-            windows.to_vec(),
-            stream.clone(),
-            context.clone(),
-        ));
-    });
-    // A live drag survives a rebuild: snapshots arrive *because* of ordinary use
-    // — the focus change from a click is itself a snapshot — and cancelling the
-    // drag on every rebuild killed every attempt a frame after it started. The
-    // carried square lives in the overlay, outside the row being cleared, so the
-    // clear does not touch it. What `drag_cancel` still handles is the stale
-    // case: an overlay left behind with no drag under way.
-    if !drag_active() {
-        drag_cancel();
-    }
-    while let Some(child) = tasks.first_child() {
-        tasks.remove(&child);
-    }
-    if menu_debug() {
-        eprintln!(
-            "oxide-panel: rebuilt bar with {} window(s) for {:?}",
-            windows.len(),
-            menu.app.borrow().as_deref().unwrap_or("<none>")
-        );
-    }
-
-    // Group the windows by app. Windows with no app id get a key of their own so
-    // they don't all collapse together.
-    let mut groups: Vec<(String, Vec<&WindowInfo>)> = Vec::new();
-    for info in windows {
-        // The same rule [`group_for`] uses, so a rebuild and a resync cannot disagree
-        // about which windows belong to an app.
-        let key = group_key(info);
-        match groups.iter_mut().find(|(group_key, _)| *group_key == key) {
-            Some((_, group)) => group.push(info),
-            None => groups.push((key, vec![info])),
-        }
-    }
-
-    // A pinned app with nothing open gets a square of its own, so there is somewhere
-    // in the bar to start it from — and somewhere to unpin it from.
-    for id in pinned_without_windows(&groups) {
-        groups.push((id, Vec::new()));
-    }
-
-    // And the bar goes in the order the panel remembers, not the order the snapshot
-    // happened to list the apps in.
-    let keys: Vec<String> = groups.iter().map(|(key, _)| key.clone()).collect();
-    let positions = arrange(&keys);
-    let mut ordered: Vec<(String, Vec<&WindowInfo>)> = Vec::with_capacity(groups.len());
-    for index in positions {
-        ordered.push(groups[index].clone());
-    }
-    let groups = ordered;
-
-    // An open menu is kept in step with every snapshot, *including* one where its
-    // app has no windows left. Skipping that case — or closing the menu outright on
-    // it — is what stopped the close animation: with no group to find, the entries
-    // were never told to go, and the menu simply vanished. An empty group instead
-    // animates them away, and the menu closes itself once the last one has.
-    let open_key = menu.app.borrow().clone();
-    let every: Vec<&WindowInfo> = windows.iter().collect();
-    if let Some(key) = &open_key {
-        // A rebuild is itself the reconciliation, so anything the row missed while a
-        // switch was running has now been applied.
-        menu.resync_pending.set(false);
-        let group: Vec<&WindowInfo> = groups
-            .iter()
-            .find(|(group_key, _)| group_key == key)
-            .map(|(_, group)| group.clone())
-            .unwrap_or_default();
-        // Every window, minimized ones included. A minimized window cannot be
-        // captured, so the compositor answers with the last frame it took for it and
-        // the cell shows that: more use than a hole in the row, and it keeps the count
-        // on the square and the number of previews in step.
-        menu_replace(menu, &every, &group, stream);
-        if menu_debug() {
-            // The bar and the menu disagreeing about which windows exist is the
-            // awkward one to read off the screen: the count is right and the row is
-            // empty, with nothing in between to say why.
-            let entries = menu.entries.borrow();
-            let order = menu.order.borrow();
-            let with_preview = order
-                .iter()
-                .filter(|id| {
-                    entries
-                        .get(id)
-                        .is_some_and(|entry| entry.preview.borrow().is_some())
-                })
-                .count();
-            eprintln!(
-                "oxide-panel: snapshot {} windows, {} minimized; menu order {order:?}, \
-                 {with_preview} with a preview",
-                windows.len(),
-                windows.iter().filter(|info| info.minimized).count(),
-            );
-        }
-    }
-
-    // An open app menu is kept in step with the new snapshot too. What it offers
-    // depends on the window count — one window is closed by name, several are closed
-    // together, none means no row at all — so a window opened or closed underneath
-    // it has to change what is on screen.
-    // `shown` rather than `app`: the app key outlives the fade now, so refilling a
-    // menu that is on its way out would be work for nothing.
-    if let Some(key) = context.shown.get().then(|| context.app.borrow().clone()).flatten() {
-        let group: Vec<WindowInfo> = groups
-            .iter()
-            .find(|(group_key, _)| *group_key == key)
-            .map(|(_, group)| group.iter().map(|info| (*info).clone()).collect())
-            .unwrap_or_default();
-        context_fill(context, &key, &group);
-    }
-
-    for (key, group) in &groups {
-        // The square being carried is rebuilt fresh while it is still in the
-        // overlay — that would put two copies of one app in the row. It comes
-        // back on the rebuild the drop triggers.
-        if drag_active()
-            && DRAG.with(|drag| {
-                drag.borrow()
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().app == *key)
-            })
-        {
-            continue;
-        }
-        let app_id = if key.starts_with('#') { "" } else { key.as_str() };
-        let multiple = group.len() > 1;
-        let button = app_button(
-            app_id,
-            group,
-            stream,
-            multiple,
-            key,
-            menu,
-            context,
-        );
-        tasks.append(&button);
-    }
-
-    // Bring an open menu in step with the new snapshot, so a title change or a
-    // focus change shows up without reopening it.
-
-}
-
 /// One decision for a press that ends on a square.
 ///
 /// The three things a click can mean — put a carried square down, dismiss the
@@ -4370,7 +4750,6 @@ fn square_click(
     windows: &[WindowInfo],
     menu: &Rc<Menu>,
     context: &Rc<ContextMenu>,
-    multiple: bool,
 ) {
     if menu_debug() {
         eprintln!(
@@ -4395,22 +4774,22 @@ fn square_click(
         context_close(context);
         return;
     }
-    activate(stream, key, windows, menu, button, multiple);
+    activate(stream, key, windows, menu, button);
 }
 
 /// What a click on a square does: bring one window forward, or show the previews.
 ///
 /// A square with nothing behind it is a pinned app's, and starts it — there is no
-/// window to bring forward.
-#[allow(clippy::too_many_arguments)]
+/// window to bring forward. Several windows open are a confusion the bar settles
+/// by showing every one of them.
 fn activate(
     stream: &Channel,
     key: &str,
     windows: &[WindowInfo],
     menu: &Rc<Menu>,
     button: &Button,
-    multiple: bool,
 ) {
+    let multiple = windows.len() > 1;
     if menu_debug() {
         eprintln!(
             "oxide-panel: activate {key:?} multiple={multiple} windows={} connected={}",
@@ -4455,11 +4834,6 @@ fn app_of(widget: &gtk4::Widget) -> Option<String> {
         return None;
     }
     Some(name.strip_prefix(APP_NAME_PREFIX)?.to_string())
-}
-
-/// Name a square, so a drag can find it again.
-fn set_app_of(button: &Button, app: &str) {
-    button.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
 }
 
 /// Which gap in a row a pointer at this x is over.
@@ -4964,377 +5338,6 @@ fn sync_tooltips(menu: &Rc<Menu>, context: &Rc<ContextMenu>) {
         }
         child = widget.next_sibling();
     }
-}
-
-/// One square (1:1) per app, with indicator dots for its window count.
-///
-/// With several windows open the square opens a menu of their previews
-/// instead of focusing; a lone window is just focused.
-fn app_button(
-    app_id: &str,
-    windows: &[&WindowInfo],
-    stream: &Channel,
-    multiple: bool,
-    key: &str,
-    menu: &Rc<Menu>,
-    context: &Rc<ContextMenu>,
-) -> Button {
-    let focused = windows.iter().any(|window| window.focused);
-    // Only when every one of the app's windows is minimized, so the square says the
-    // app is there but not on screen rather than implying anything about the others.
-    let minimized = !windows.is_empty() && windows.iter().all(|window| window.minimized);
-    let count = windows.len();
-    // A pinned app with nothing open. Its square is here to be started from, so it
-    // is not "minimized" — there is no window of its own to have been minimized.
-    let idle = count == 0;
-
-    let button = Button::new();
-    // Named for the app, which is how a drag finds this square again: the row moves
-    // squares by app, and a button carries nothing else that survives a rebuild.
-    set_app_of(&button, key);
-    // The click must not be spent grabbing focus first: without this, the first
-    // click on a square while some other app holds focus activates the window
-    // instead of the button, and only the second one registers.
-    button.set_focus_on_click(false);
-    button.add_css_class("task");
-    if minimized || idle {
-        button.add_css_class("minimized");
-    }
-    if focused {
-        button.add_css_class("focused");
-    }
-    // Without this the HBox stretches the button to the panel height.
-    button.set_valign(gtk4::Align::Center);
-    button.set_halign(gtk4::Align::Center);
-    button.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
-
-    // A square with nothing behind it names the app rather than counting windows it
-    // does not have.
-    let tooltip = match count {
-        0 => crate::desktop::cached(key)
-            .map(|app| app.label().to_string())
-            .unwrap_or_else(|| "Not running".to_string()),
-        1 => window_title(windows[0]),
-        _ => format!("{count} windows"),
-    };
-    // The text is always set; whether it is *shown* is not decided here. That used to be
-    // decided here, from whether a menu was open at the moment this square was built —
-    // and nothing ever turned it back on except another rebuild, which needs a window
-    // title to change. So closing a preview menu left every square in the bar without a
-    // tooltip until something unrelated happened, and the text computed above was thrown
-    // away. See `sync_tooltips`, which both menus call when they open and close.
-    button.set_tooltip_text(Some(&tooltip));
-    sync_tooltip(&button, menu, context);
-
-    let icon = resolve_icon(app_id);
-    let image = if icon.starts_with('/') {
-        Image::from_file(&icon)
-    } else {
-        Image::from_icon_name(&icon)
-    };
-    image.set_pixel_size(ICON_SIZE);
-
-    // The button's 1px border is inside its 36px box, so the content area is
-    // 34px and the whole square stays 36x36.
-    let inner = SQUARE_SIZE - 2 * SQUARE_BORDER;
-    let dots = DrawingArea::new();
-    dots.set_content_width(inner);
-    dots.set_content_height(INDICATOR_HEIGHT);
-    dots.set_size_request(inner, INDICATOR_HEIGHT);
-    dots.set_valign(gtk4::Align::End);
-    let color = if focused { accent_rgb() } else { MUTED_COLOR };
-    dots.set_draw_func(move |_, context, width, height| {
-        draw_indicators(context, width, height, count, color);
-    });
-
-    let column = GtkBox::new(Orientation::Vertical, 0);
-    column.set_halign(gtk4::Align::Center);
-    column.set_valign(gtk4::Align::Center);
-    column.append(&image);
-    column.append(&dots);
-    button.set_child(Some(&column));
-
-    // Hovering a square opens that app's menu, and moves an open one to the app
-    // under the pointer, so travelling along the bar moves the menu with it.
-    //
-    // After a moment, not immediately. A square that opened its menu on the pointer
-    // arriving would open one for every square the pointer crossed on the way to
-    // somewhere, and the last of those would be the only one left standing.
-    //
-    // Any number of windows, including one. A lone window used to open nothing here
-    // and had to be clicked to be seen at all, which made an app that keeps a single
-    // window — a chat client in a tray, a browser with one tab — the one app in the
-    // bar with nothing to show for it.
-    {
-        let hover_menu = menu.clone();
-        let hover_key = key.to_string();
-        let hover_group: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
-        let hover_stream = stream.clone();
-        let hover_context = context.clone();
-        // Shared with the timeout, so leaving the square or moving to another one
-        // cancels the open that was about to happen.
-        let token = Rc::new(Cell::new(0u64));
-        let hover = gtk4::EventControllerMotion::new();
-
-        // Owned handles for the handler, because a controller can outlive this
-        // function. The button is the exception: it is held weakly, because this
-        // controller is added *to* that button, and a strong capture would make a cycle
-        // that no `unparent` breaks. Every rebuild of the bar would leave one behind.
-        let on_enter = token.clone();
-        let (enter_menu, enter_key) = (hover_menu.clone(), hover_key.clone());
-        let (enter_group, enter_stream, enter_context) = (
-            hover_group.clone(),
-            hover_stream.clone(),
-            hover_context.clone(),
-        );
-        hover.connect_enter(glib::clone!(
-            #[weak]
-            button,
-            #[upgrade_or]
-            return,
-            move |_, _, _| {
-                let (menu, key, group, stream, context) = (
-                    &enter_menu,
-                    &enter_key,
-                    &enter_group,
-                    &enter_stream,
-                    &enter_context,
-                );
-                // Entering anywhere on the row cancels a close scheduled by leaving the
-                // square before, whether this square has anything to show or not.
-                menu.hover_token.set(menu.hover_token.get() + 1);
-                if group.is_empty() {
-                    // An app with no windows has no previews to offer, so there is
-                    // nothing to switch to and nothing to show. It is not a reason to
-                    // leave the previous app's menu on screen: leaving the previews up
-                    // while the pointer rests somewhere they have nothing to do with is
-                    // how a menu ends up floating over an icon it does not belong to.
-                    if menu.shown.get() && menu.app.borrow().is_some() {
-                        menu_close(menu);
-                    }
-                    return;
-                }
-                // One menu at a time: the app menu is up, so this must not open the
-                // previews on top of it. But it should *follow* — the previews move
-                // along the bar with the pointer, and an app menu that stayed on the
-                // app it was opened for meant resting on one square and moving to
-                // another left it offering to close three windows that were not the
-                // ones under the pointer.
-                if context.shown.get() {
-                    if context.app.borrow().as_deref() != Some(key.as_str()) {
-                        context_move(&context, &key, &group, &button);
-                    }
-                    return;
-                }
-                // Moving between squares while the menu is open transitions after the
-                // same dwell as opening one, so travelling along the bar does not
-                // chain a transition for every square crossed. The timer below is
-                // the only path: it re-looks the square up, cancels if the pointer
-                // has moved on, and no-ops if this app's menu is already the one up.
-                let ticket = on_enter.get().wrapping_add(1);
-                on_enter.set(ticket);
-                // The timer below outlives this handler by up to a quarter of a second,
-                // and the bar can be rebuilt underneath it in the meantime: every window
-                // title change throws away every square and builds new ones. So the timer
-                // must not hold this square — a strong reference would keep the old one
-                // alive for the session — but it must equally not give up when it goes,
-                // or a rebuild in the middle of a hover cancels the hover and the previews
-                // never open. It looks the square up again when it fires instead.
-                let pending_key = key.clone();
-                let menu = menu.clone();
-                let key = key.clone();
-                let group = group.clone();
-                let stream = stream.clone();
-                let token = on_enter.clone();
-                let context = context.clone();
-                glib::timeout_add_local(HOVER_OPEN, move || {
-                    // The square this hover started on may have been rebuilt away. That
-                    // is not a reason to abandon the hover: the pointer is still resting
-                    // on the same app, which is still in the bar. Found again by name,
-                    // because a rebuild replaces the widget and its position with it.
-                    let Some(button) = tasks_box()
-                        .as_ref()
-                        .and_then(|tasks| square_for(tasks, &pending_key))
-                    else {
-                        // The app really has gone. Nothing to open.
-                        return glib::ControlFlow::Break;
-                    };
-                    if token.get() != ticket {
-                        // Left, or moved to another square, before it was due.
-                        return glib::ControlFlow::Break;
-                    }
-                    if menu.app.borrow().as_deref() == Some(key.as_str()) {
-                        return glib::ControlFlow::Break;
-                    }
-                    // An app menu is up. Checked *here* and not only where the timer
-                    // was armed: the pointer can arrive on a square, and be right
-                    // clicked, inside the quarter of a second before this fires — and
-                    // then this opened the previews straight over the app menu that
-                    // the right click had just put there.
-                    if context.shown.get() {
-                        if context.app.borrow().as_deref() != Some(key.as_str()) {
-                            context_move(&context, &key, &group, &button);
-                        }
-                        return glib::ControlFlow::Break;
-                    }
-                    let group: Vec<&WindowInfo> = group.iter().collect();
-                    menu_open(&menu, &key, &group, &button, &stream);
-                    glib::ControlFlow::Break
-                });
-            }
-        ));
-
-        let on_leave = token.clone();
-        hover.connect_leave(move |_| {
-            // Cancels a dwell-open that has not fired yet; nothing more. Leaving a
-            // square does *not* close the menu: the panel itself is a safe zone, so
-            // the menu stays up while the pointer moves around the bar, and the
-            // close comes from `watch_hover` only — which fires when the pointer
-            // leaves the panel, the menu, or the gap between them for good.
-            on_leave.set(on_leave.get().wrapping_add(1));
-        });
-        button.add_controller(hover);
-    }
-
-    // The primary button of a square activates through `connect_clicked` —
-    // GTK's own button activation: press and release over the widget. An
-    // external GestureClick gets the *press* on a GtkButton, but the button's
-    // internals claim the sequence and cancel it before the release — the
-    // `pressed`-then-`cancelled` pair the debug log showed — so the click rides
-    // the signal the widget exists to provide. Keyboard activation comes free.
-    let owned: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
-    {
-        let stream = stream.clone();
-        let key = key.to_string();
-        let menu = menu.clone();
-        let context = context.clone();
-        let owned = owned.clone();
-        let square = button.clone();
-        let button = button.clone();
-        square.connect_clicked(move |_| {
-            square_click(&button, &stream, &key, &owned, &menu, &context, multiple);
-        });
-    }
-
-    // Reordering by dragging is opt-in (`OXIDE_PANEL_DRAG`) and rides its own
-    // `GestureDrag` alongside the click. The gesture only ever *drags*: the
-    // decision about what the release meant is the button's `connect_clicked`
-    // alone, which fires when the press and release both stayed on the square —
-    // a real drag left it, and was cancelled as a click — and `square_click`
-    // treats a lift-and-put-back as the click it is.
-    if std::env::var_os("OXIDE_PANEL_DRAG").is_some() {
-        let gesture = gtk4::GestureDrag::new();
-        gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
-        // The pointer's row position where the gesture started (square's place
-        // in the row plus the gesture's start point), captured at drag-begin
-        // while the square is still in the row — together with the square's
-        // origin then, which the update uses to correct for the widget's own
-        // travel: the gesture's offsets are widget-relative and this drag moves
-        // the widget.
-        let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        {
-            let key = key.to_string();
-            let start_row = start_row.clone();
-            gesture.connect_drag_begin({
-                let button = button.clone();
-                move |g, _, _| {
-                    let origin = tasks_box().and_then(|tasks| {
-                        button.translate_coordinates(&tasks, 0.0, 0.0)
-                    });
-                    let start = g.start_point();
-                    if let (Some((left, _)), Some((sx, _))) = (origin, start) {
-                        start_row.set(Some((left + sx, left)));
-                    }
-                    drag_begin(&key);
-                }
-            });
-        }
-        {
-            let start_row = start_row.clone();
-            gesture.connect_drag_update({
-                let button = button.clone();
-                move |_, ox, _| {
-                    let Some((row_start, origin0)) = start_row.get() else {
-                        return;
-                    };
-                    let Some(origin1) = tasks_box()
-                        .and_then(|tasks| button.translate_coordinates(&tasks, 0.0, 0.0))
-                        .map(|(left, _)| left)
-                    else {
-                        return;
-                    };
-                    let travel = ox + (origin1 - origin0);
-                    let pointer_x = row_start + travel;
-                    if drag_update(pointer_x, (travel, 0.0)) {
-                        if let Some(tasks) = tasks_box() {
-                            tasks.queue_allocate();
-                        }
-                    }
-                }
-            });
-        }
-        gesture.connect_drag_end(move |_, _, _| {
-            start_row.set(None);
-            if drag_active() {
-                if drag_end() {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
-            }
-        });
-        button.add_controller(gesture);
-    }
-
-    let right_key = key.to_string();
-    let right_menu = menu.clone();
-    let context = context.clone();
-    let right_windows: Vec<WindowInfo> = windows.iter().map(|info| (*info).clone()).collect();
-    let secondary = gtk4::GestureClick::new();
-    secondary.set_button(gdk::BUTTON_SECONDARY);
-    secondary.connect_released(glib::clone!(
-        #[weak]
-        button,
-        #[upgrade_or]
-        return,
-        move |_, _, _, _| {
-            // The previews are replaced, not faded out from under. The app menu goes
-            // up in the same place a frame later, and a preview menu still fading out
-            // beneath it is two surfaces in the same place — which is what "the menu
-            // just opens over it" was. Cut, and let the app menu do the fading.
-            // A second right click on the same square closes it, as a second left
-            // click on the previews does.
-            if context.shown.get()
-                && context.app.borrow().as_deref() == Some(right_key.as_str())
-            {
-                context_close(&context);
-                return;
-            }
-            // The previews play their own close, and the app menu opens when that has
-            // finished. Not overlapped and not cut: overlapping was two surfaces in one
-            // place, and cutting threw away an animation the pointer had just earned.
-            // One after the other, each doing its own thing.
-            let opening = context.clone();
-            let key = right_key.clone();
-            let windows = right_windows.clone();
-            let button = button.clone();
-            if menu_open_now(&right_menu) {
-                menu_close(&right_menu);
-                glib::timeout_add_local(MENU_FADE, move || {
-                    if opening.shown.get() {
-                        // Something else opened the app menu while the previews were
-                        // closing. Two of them at once is what this is avoiding.
-                        return glib::ControlFlow::Break;
-                    }
-                    context_open(&opening, &key, &windows, &button);
-                    glib::ControlFlow::Break
-                });
-                return;
-            }
-            context_open(&context, &right_key, &right_windows, &button);
-        }
-    ));
-    button.add_controller(secondary);
-
-    button
 }
 
 /// Draw one dot per window under the icon, or a line when they don't fit.
