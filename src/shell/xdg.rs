@@ -110,8 +110,65 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // the surface is not already configured
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
         window.begin_open();
-        place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
-        self.focus_new_windows();
+        // A toplevel that maps while a window already holds the keyboard is a
+        // latecomer — a dialog an app opens seconds after start, or a window
+        // the app felt like opening. It gets neither the keyboard nor the
+        // front: it anchorst just below whatever the user is working in, and
+        // nothing that mapped late can leap-frog an app the user has
+        // focused. An app that genuinely wants the front asks through
+        // activation, whose handler raises *and* focuses.
+        let focused = self.seat.get_keyboard().and_then(|keyboard| {
+            match keyboard.current_focus() {
+                Some(KeyboardFocusTarget::Window(window)) => Some(window),
+                _ => None,
+            }
+        });
+        // The element in the space the new window belongs *behind*: the one
+        // just behind the focused window in the back-to-front stack. The
+        // stack iterates back to front, so a smaller slot is further back.
+        let focus_slot = focused
+            .and_then(|focused| {
+                self.space
+                    .elements()
+                    .position(|element| element.0 == focused)
+            });
+        // And the window of that slot. `Space::map_element` always maps on
+        // the front of the stack, so the newcomer starts in front and is
+        // stepped back onto its slot afterwards.
+        let steps_back = focus_slot
+            .and_then(|slot| {
+                if slot == 0 {
+                    None
+                } else {
+                    self.space
+                        .elements()
+                        .nth(slot - 1)
+                        .cloned()
+                }
+            });
+        match steps_back {
+            Some(reference) => {
+                place_new_window(
+                    &mut self.space,
+                    self.pointer.current_location(),
+                    &window,
+                    false,
+                );
+                // Onto the slot: straight under the focused window.
+                self.space.raise_element_above(&window, &reference, false);
+            }
+            // Nothing is focused (or the focused element is already at the
+            // very back): the ordinary path, map on the front and focus it.
+            None => {
+                place_new_window(
+                    &mut self.space,
+                    self.pointer.current_location(),
+                    &window,
+                    true,
+                );
+                self.focus_new_windows();
+            }
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
