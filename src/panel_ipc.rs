@@ -978,7 +978,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if self.minimized.iter().any(|(w, _)| w == &window) {
             self.unminimize_request(window.clone());
         }
-        self.focus_window(&window, true);
+        self.focus_window(&window);
     }
 }
 

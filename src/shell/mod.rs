@@ -320,22 +320,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// map having put it on top, and a self-activating app was raised without
     /// being focused — and a window could end up holding the keyboard while
     /// sitting underneath another one, on SSD and CSD alike. This is the one
-    /// door: whoever focuses a window here also raises it to the front, which
-    /// also moves the activated state off every other window the way the
-    /// window's own frame reads it (ssd or csd).
-    ///
-    /// The founding exception: a window being focused *for someone else's*
-    /// click — summed up by the fullscreen mode — keeps its own raise rules,
-    /// and passing `raise: false` spares it.
-    pub fn focus_window(&mut self, window: &WindowElement, raise: bool) {
-        if raise {
-            self.space.raise_element(window, true);
-            #[cfg(feature = "xwayland")]
-            if let Some(surface) = window.0.x11_surface()
-                && let Some(xwm) = self.xwm.as_mut()
-            {
-                let _ = xwm.raise_window(surface);
-            }
+    /// door: whoever focuses a window also raises it to the front, which also
+    /// moves the activated state off every other window the way the window's
+    /// own frame reads it (ssd or csd). No exceptions, no separate raise call,
+    /// and no site that focuses without this.
+    pub fn focus_window(&mut self, window: &WindowElement) {
+        self.space.raise_element(window, true);
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.0.x11_surface()
+            && let Some(xwm) = self.xwm.as_mut()
+        {
+            let _ = xwm.raise_window(surface);
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(
@@ -357,7 +352,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // meanwhile touched the stack (a churning fixup, a popup's grab) must
         // not leave it holding the keyboard under something else. The raise is
         // cheap idempotence; the invariant is the point.
-        self.focus_window(&window, true);
+        self.focus_window(&window);
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {

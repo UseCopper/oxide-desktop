@@ -523,7 +523,7 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
                 .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
-                self.focus_window(&window, true);
+                self.focus_window(&window);
             }
         }
     }

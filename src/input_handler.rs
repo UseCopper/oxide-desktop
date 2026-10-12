@@ -380,10 +380,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     if let Some((_, _)) =
                         window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
-                        // No raise on purpose: the fullscreen surface is the
-                        // front by definition, and lifting it in the space
-                        // would fight whatever fullscreening put there.
-                        self.focus_window(&window, false);
+                        // Focusing raises it like any other window: the
+                        // fullscreen surface sits at the front already, so the
+                        // raise costs nothing, and no site focuses without
+                        // raising.
+                        self.focus_window(&window);
                         return;
                     }
                 }
