@@ -4152,10 +4152,10 @@ button.task.focused {{
 }}
 /* The app menu, opened by a right click. Widgets, so it is styled here --
    and styled out of the thumbnail menu's own palette, so the two menus read
-   as one object. The body is the previews' fill and edge at the previews'
-   radius; a row is a preview cell: 0.35 black fill, CELL_EDGE outline,
-   CELL_RADIUS corners, brightening to the hover edge it would get as a cell.
-   The text and the hover fill are the taskbar's.
+   as one object. The body is the previews' 0.35 black and the rows take the
+   previews' body fill: the two shades swapped, so the lighter buttons sit in
+   front of the darker, more open background. Edges, radii, text and hover
+   are the previews' and the taskbar's as before.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4169,7 +4169,10 @@ window.context {{
        shade darker and more opaque than the bar, and two menus side by side
        would show any drift. */
     padding: 5px;
-    background-color: rgba({menu_fill_r}, {menu_fill_r}, {menu_fill_r}, {menu_fill_a});
+    /* The cell fill, not the previews' body: the fills of the body and the
+       rows are swapped, so the rows run the lighter, more opaque shade of
+       the two and sit in front against a darker, more open background. */
+    background-color: rgba(0, 0, 0, {cell_fill_a});
     /* The theme paints a window background image on top of a window's background
        colour, which would put a fill of its own over this and make it a third value
        again. */
@@ -4178,7 +4181,7 @@ window.context {{
     border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    background: rgba(0, 0, 0, {cell_fill_a});
+    background: rgba({menu_fill_r}, {menu_fill_r}, {menu_fill_r}, {menu_fill_a});
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
@@ -6966,25 +6969,19 @@ mod tests {
         // this test pins the stylesheet to them in case a rule restarts from a
         // hand-copied value.
         let sheet = style_sheet((1, 2, 3));
-        // The body, from the rows-box rule ...
+        // The body, from the rows-box rule. The body takes the *cell* fill --
+        // the two shades swapped -- so the rows sit lighter and more opaque in
+        // front of a darker, more open background.
         let rule = sheet
             .split(".context-rows {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows");
         assert!(
-            rule.contains(&format!(
-                "rgba({}, {}, {}, {})",
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.1 * 255.0).round() as u8,
-                MENU_FILL.3
-            )),
-            "the app menu body is not the previews' body: {rule}"
+            rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
+            "the app menu body is not the swapped cell fill: {rule}"
         );
-        // ... it must match what the previews' body is, rather than the bar's
-        // grey, because the two menus show side by side and run one shade
-        // darker and more opaque than the bar.
+        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         assert_eq!(MENU_FILL, (0.11, 0.11, 0.11, 0.94), "and the previews moved");
         // The theme's window background image would put a fill of its own over
         // this, and it is invisible in a stylesheet.
@@ -6992,17 +6989,22 @@ mod tests {
             rule.contains("background-image: none"),
             "the theme's window background is back over the app menu's fill: {rule}"
         );
-        // A row is a preview cell, so it takes the cell's fill.
+        // And a row takes the body fill, which is the other side of the swap.
         let row_rule = sheet
             .split("button.context-row {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows' buttons");
         assert!(
-            row_rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
-            "an app-menu row is not a preview cell's fill: {row_rule}"
+            row_rule.contains(&format!(
+                "rgba({}, {}, {}, {})",
+                (MENU_FILL.0 * 255.0).round() as u8,
+                (MENU_FILL.0 * 255.0).round() as u8,
+                (MENU_FILL.1 * 255.0).round() as u8,
+                MENU_FILL.3
+            )),
+            "an app-menu row is not the swapped body fill: {row_rule}"
         );
-        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         // The window itself paints nothing: the strip above the rows has to stay
         // see-through for the gap between the menu and the panel to be a gap.
         let window_rule = sheet
