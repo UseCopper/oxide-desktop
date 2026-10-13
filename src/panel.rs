@@ -4083,11 +4083,11 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // into two different greys.
     let (panel_r, panel_g, panel_b) = BAR_PANEL;
     let panel_a = BAR_PANEL_ALPHA;
-    // The app menu's body and cells are the preview menu's own palette, read off
-    // the same constants the cairo drawing reads, so the two menus are one look
-    // by construction rather than by two careful copies of the same hexes.
-    let menu_fill_r = (MENU_FILL.0 * 255.0).round() as u8;
-    let menu_fill_a = MENU_FILL.3;
+    // The app menu's body is the preview menu's cell fill, read off the same
+    // constant the cairo drawing reads, so the two engines agree by
+    // construction rather than by two careful copies of the same hexes. The
+    // rows are a white step on the hover's own ladder instead of a second
+    // grey, so nothing at rest keeps the body fill's variables alive.
     let menu_edge_a = MENU_EDGE.3;
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
@@ -4151,11 +4151,10 @@ button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
 /* The app menu, opened by a right click. Widgets, so it is styled here --
-   and styled out of the thumbnail menu's own palette, so the two menus read
-   as one object. The body is the previews' 0.35 black and the rows take the
-   previews' body fill: the two shades swapped, so the lighter buttons sit in
-   front of the darker, more open background. Edges, radii, text and hover
-   are the previews' and the taskbar's as before.
+   styled out of the thumbnail menu's own palette, with the body at the
+   previews' 0.35 black and one row a step lighter: the same fill ladder the
+   hover's own white sits on. Edges, radii, text and hover are the previews'
+   and the taskbar's as before.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4181,7 +4180,10 @@ window.context {{
     border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    background: rgba({menu_fill_r}, {menu_fill_r}, {menu_fill_r}, {menu_fill_a});
+    /* A shade of white over the body rather than a second grey: the row is
+       exactly one step lighter than the fill behind it, on the same ladder
+       the hover sits on. */
+    background: rgba(255, 255, 255, 0.05);
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
@@ -6989,21 +6991,16 @@ mod tests {
             rule.contains("background-image: none"),
             "the theme's window background is back over the app menu's fill: {rule}"
         );
-        // And a row takes the body fill, which is the other side of the swap.
+        // And a row is one step lighter than that fill, on the hover's own
+        // white ladder -- not a second grey from another palette.
         let row_rule = sheet
             .split("button.context-row {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows' buttons");
         assert!(
-            row_rule.contains(&format!(
-                "rgba({}, {}, {}, {})",
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.1 * 255.0).round() as u8,
-                MENU_FILL.3
-            )),
-            "an app-menu row is not the swapped body fill: {row_rule}"
+            row_rule.contains("rgba(255, 255, 255, 0.05)"),
+            "an app-menu row is not the one-step-lighter fill: {row_rule}"
         );
         // The window itself paints nothing: the strip above the rows has to stay
         // see-through for the gap between the menu and the panel to be a gap.
