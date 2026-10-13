@@ -380,13 +380,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     if let Some((_, _)) =
                         window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
-                        #[cfg(feature = "xwayland")]
-                        if let Some(surface) = window.0.x11_surface()
-                            && let Some(xwm) = self.xwm.as_mut()
-                        {
-                            let _ = xwm.raise_window(surface);
-                        }
-                        keyboard.set_focus(self, Some(window.into()), serial);
+                        // Focusing raises it like any other window: the
+                        // fullscreen surface sits at the front already, so the
+                        // raise costs nothing, and no site focuses without
+                        // raising.
+                        self.focus_window(&window);
                         return;
                     }
                 }

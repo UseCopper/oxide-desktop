@@ -72,13 +72,6 @@ use self::ssd::{
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
 
-thread_local! {
-    /// A freshly mapped window waiting for keyboard focus. `place_new_window`
-    /// runs with only a `Space`, so the actual focus is applied by
-    /// [`AnvilState::focus_new_windows`] right after.
-    static PENDING_FOCUS: RefCell<Option<WindowElement>> = const { RefCell::new(None) };
-}
-
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
 
@@ -223,7 +216,13 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     if let Some(buffer_offset) = buffer_offset
                         && let Some(current_loc) = self.space.element_location(&window)
                     {
-                        self.space.map_element(window, current_loc + buffer_offset, false);
+                        // Relocated, not re-mapped: `map_element` re-appends
+                        // the window to the front of the stack, so a window
+                        // mid-resize would jump above the one the user just
+                        // raised and every focused window would read as
+                        // focused-but-covered. A commit only moves the
+                        // window; it does not reorder the desktop.
+                        self.space.relocate_element(&window, current_loc + buffer_offset);
                     }
                 }
             }
@@ -313,14 +312,31 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
-    /// Give keyboard focus to any window `place_new_window` just mapped.
-    pub fn focus_new_windows(&mut self) {
-        let window = PENDING_FOCUS.with(|cell| cell.borrow_mut().take());
-        let Some(window) = window else {
-            return;
-        };
+    /// Focus a window, and bring it to the front while at it.
+    ///
+    /// Focusing and raising were split apart across the call sites that grant
+    /// focus — the click path raised and focused, a new window relied on its
+    /// map having put it on top, and a self-activating app was raised without
+    /// being focused — and a window could end up holding the keyboard while
+    /// sitting underneath another one, on SSD and CSD alike. This is the one
+    /// door: whoever focuses a window also raises it to the front, which also
+    /// moves the activated state off every other window the way the window's
+    /// own frame reads it (ssd or csd). No exceptions, no separate raise call,
+    /// and no site that focuses without this.
+    pub fn focus_window(&mut self, window: &WindowElement) {
+        self.space.raise_element(window, true);
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.0.x11_surface()
+            && let Some(xwm) = self.xwm.as_mut()
+        {
+            let _ = xwm.raise_window(surface);
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(window.into()), SERIAL_COUNTER.next_serial());
+            keyboard.set_focus(
+                self,
+                Some(window.clone().into()),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
     }
 
@@ -1230,17 +1246,9 @@ fn place_new_window(
     ));
     space.map_element(window.clone(), location, activate);
 
-    // `map_element(.., true)` only sets the xdg activated state; give the
-    // window the actual keyboard focus too.
-    if activate {
-        state_focus(space, window);
-    }
-}
-
-/// Hand `window` to [`AnvilState::focus_new_windows`], which applies the real
-/// keyboard focus. `place_new_window` only has a `Space`, so it can't do it here.
-fn state_focus(_space: &Space<WindowElement>, window: &WindowElement) {
-    PENDING_FOCUS.with(|cell| *cell.borrow_mut() = Some(window.clone()));
+    // `map_element(.., true)` gives the window the xdg activated state, which
+    // is all that top level needs to render its frame as the active one.
+    // The keyboard follows a click, not a mapping — Anvil's own rule.
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {

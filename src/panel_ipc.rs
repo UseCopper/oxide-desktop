@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smithay::utils::SERIAL_COUNTER as SCOUNTER;
+
 use tracing::{debug, warn};
 
 use crate::{
@@ -978,16 +978,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if self.minimized.iter().any(|(w, _)| w == &window) {
             self.unminimize_request(window.clone());
         }
-        self.space.raise_element(&window, true);
-        #[cfg(feature = "xwayland")]
-        if let Some(surface) = window.0.x11_surface()
-            && let Some(xwm) = self.xwm.as_mut()
-        {
-            let _ = xwm.raise_window(surface);
-        }
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(window.into()), SCOUNTER.next_serial());
-        }
+        self.focus_window(&window);
     }
 }
 
