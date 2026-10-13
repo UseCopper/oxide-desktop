@@ -4186,6 +4186,10 @@ button.context-row {{
     border-radius: {cell_radius}px;
     color: #e8e8e8;
     font-weight: 500;
+    /* No state transitions: the theme eases button fills over hundreds of
+       milliseconds, and a hover highlight that arrives late reads as lag.
+       The taskbar squares snap for the same reason. */
+    transition: none;
 }}
 button.context-row:hover {{
     /* The panel's own hover: the pointer's fill, nothing else moving. The
