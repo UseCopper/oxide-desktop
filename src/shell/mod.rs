@@ -216,7 +216,13 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     if let Some(buffer_offset) = buffer_offset
                         && let Some(current_loc) = self.space.element_location(&window)
                     {
-                        self.space.map_element(window, current_loc + buffer_offset, false);
+                        // Relocated, not re-mapped: `map_element` re-appends
+                        // the window to the front of the stack, so a window
+                        // mid-resize would jump above the one the user just
+                        // raised and every focused window would read as
+                        // focused-but-covered. A commit only moves the
+                        // window; it does not reorder the desktop.
+                        self.space.relocate_element(&window, current_loc + buffer_offset);
                     }
                 }
             }

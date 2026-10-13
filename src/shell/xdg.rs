@@ -838,7 +838,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if let Some((location, _)) = geometry
             && let Some((window, _, _)) = restore
         {
-            self.space.map_element(window, location, false);
+            // Back where it was, in its own slot: no re-map, which would
+            // otherwise put the unfullscreened window over whatever the user
+            // had focused since.
+            self.space.relocate_element(&window, location);
         }
 
         // Clear the output's fullscreen surface so rendering falls back to the
@@ -1186,7 +1189,7 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
 
         if new_loc.x.is_some() || new_loc.y.is_some() {
             // If TOP or LEFT side of the window got resized, we have to move it
-            space.map_element(window.clone(), window_loc, false);
+            space.relocate_element(&window, window_loc);
         }
     }
 
