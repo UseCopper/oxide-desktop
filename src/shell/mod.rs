@@ -72,13 +72,6 @@ use self::ssd::{
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
 
-thread_local! {
-    /// A freshly mapped window waiting for keyboard focus. `place_new_window`
-    /// runs with only a `Space`, so the actual focus is applied by
-    /// [`AnvilState::focus_new_windows`] right after.
-    static PENDING_FOCUS: RefCell<Option<WindowElement>> = const { RefCell::new(None) };
-}
-
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
 
@@ -339,20 +332,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 SERIAL_COUNTER.next_serial(),
             );
         }
-    }
-
-    /// Give keyboard focus to any window `place_new_window` just mapped.
-    pub fn focus_new_windows(&mut self) {
-        let window = PENDING_FOCUS.with(|cell| cell.borrow_mut().take());
-        let Some(window) = window else {
-            return;
-        };
-        // A new window maps on top, so the raise is usually redundant — but
-        // focusing is also the window's public debut, and anything that has
-        // meanwhile touched the stack (a churning fixup, a popup's grab) must
-        // not leave it holding the keyboard under something else. The raise is
-        // cheap idempotence; the invariant is the point.
-        self.focus_window(&window);
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
@@ -1261,17 +1240,9 @@ fn place_new_window(
     ));
     space.map_element(window.clone(), location, activate);
 
-    // `map_element(.., true)` only sets the xdg activated state; give the
-    // window the actual keyboard focus too.
-    if activate {
-        state_focus(space, window);
-    }
-}
-
-/// Hand `window` to [`AnvilState::focus_new_windows`], which applies the real
-/// keyboard focus. `place_new_window` only has a `Space`, so it can't do it here.
-fn state_focus(_space: &Space<WindowElement>, window: &WindowElement) {
-    PENDING_FOCUS.with(|cell| *cell.borrow_mut() = Some(window.clone()));
+    // `map_element(.., true)` gives the window the xdg activated state, which
+    // is all that top level needs to render its frame as the active one.
+    // The keyboard follows a click, not a mapping — Anvil's own rule.
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {
