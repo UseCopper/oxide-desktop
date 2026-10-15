@@ -2623,6 +2623,14 @@ fn animate_surface(
 /// Not a second preview menu. Choosing between an app's windows is a left click, or
 /// a hover; this is for the things a picker cannot do — start the app again, close
 /// everything it has open, and keep it in the bar when it has nothing open.
+/// Where an open is headed. One of at a time: a second right-click replaces it.
+struct ContextOpening {
+    key: String,
+    windows: Vec<WindowInfo>,
+    icon_center: i32,
+    bar_width: i32,
+}
+
 struct ContextMenu {
     window: gtk4::Window,
     rows: GtkBox,
@@ -2642,6 +2650,10 @@ struct ContextMenu {
     /// no-op rather than a restart of the animation, and a click that lands during
     /// it belongs to the square rather than to a menu that is already leaving.
     closing: Cell<bool>,
+    /// A menu waiting to open the moment the one fading out has left, set by a
+    /// right click on another square while this one is on its way out. The
+    /// close's own completion timer runs it, so leave and arrive never overlap.
+    pending_open: RefCell<Option<ContextOpening>>,
     animation: Rc<Cell<u64>>,
     /// The width the surface is being eased between by `context_ease`.
     ///
@@ -2719,6 +2731,7 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
         app: RefCell::new(None),
         shown: Cell::new(false),
         closing: Cell::new(false),
+        pending_open: RefCell::new(None),
         animation: Rc::new(Cell::new(0)),
         width_from: Cell::new(0),
         width_to: Cell::new(0),
@@ -3006,22 +3019,50 @@ fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
 /// are for the menu itself.
 fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], button: &Button) {
     let (icon_center, bar_width) = icon_metrics(button);
+    context_open_at(context, key, windows, icon_center, bar_width);
+}
+
+/// Ask for an open that waits behind whatever is leaving.
+///
+/// A right-click on another square while this menu is up (or already on its way
+/// out) comes through here: the outgoing one plays its close, and the arrival
+/// is held until it has finished. The newest wish wins if another arrives
+/// during the wait.
+fn context_open_after(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    icon_center: i32,
+    bar_width: i32,
+) {
+    if context.closing.get() {
+        *context.pending_open.borrow_mut() = Some(ContextOpening {
+            key: key.to_string(),
+            windows: windows.to_vec(),
+            icon_center,
+            bar_width,
+        });
+        return;
+    }
+    context_open_at(context, key, windows, icon_center, bar_width);
+}
+
+/// The body of an open, given where the menu should sit.
+///
+/// A menu that is already up keeps its place and its animation; this is called
+/// at most once per arrival, from [`context_open`] or from the close that
+/// [`context_open_after`] chained behind.
+fn context_open_at(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    icon_center: i32,
+    bar_width: i32,
+) {
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
     context.app.replace(Some(key.to_string()));
     context_fill(context, key, windows);
-    if context.shown.get() {
-        let width = context
-            .rows
-            .measure(gtk4::Orientation::Horizontal, -1)
-            .1
-            .max(1);
-        context.window.set_size_request(width, -1);
-        context.window.set_default_size(width, -1);
-        context.window.set_margin(Edge::Left, menu_left(icon_center, bar_width, width));
-        sync_tooltips_from_context(&context);
-        return;
-    }
     // A reopen during the close fade takes the menu back: the fade that was running
     // is not a close any more, so a later close must be able to run again.
     context.closing.set(false);
@@ -3048,10 +3089,7 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
     // the time it does the menu has been in the wrong place.
     let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
     // Sized before it shows, the way the preview menu is: the surface arrives in
-    // final shape and only slides and fades. Easing the width on the way in made
-    // the menu grow sideways while it appeared — motion nothing of the kind the
-    // thumbnail menu has — and the width of an unmapped surface is zero, so the
-    // first open grew from nothing every time.
+    // final shape and only slides and fades.
     context.window.set_size_request(width.max(1), -1);
     context.window.set_default_size(width.max(1), -1);
     context.window.present();
@@ -3073,6 +3111,10 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
 
 /// Take the context menu off screen, then let it go.
 fn context_close(context: &Rc<ContextMenu>) {
+    // A close cancels whatever was waiting to open behind an earlier close:
+    // the pointer has told the menu to go away, and a menu arriving after
+    // that is not what anyone asked for.
+    *context.pending_open.borrow_mut() = None;
     if !context.shown.get() || context.closing.get() {
         return;
     }
@@ -3116,6 +3158,18 @@ fn context_close(context: &Rc<ContextMenu>) {
         fading.window.set_visible(false);
         fading.shown.set(false);
         fading.closing.set(false);
+        // And the menu a right click queued behind this close now has room
+        // to come up, next to the square it is for.
+        let waiting = fading.pending_open.borrow_mut().take();
+        if let Some(opening) = waiting {
+            context_open_at(
+                &fading,
+                &opening.key,
+                &opening.windows,
+                opening.icon_center,
+                opening.bar_width,
+            );
+        }
         glib::ControlFlow::Break
     });
 }
@@ -3534,6 +3588,17 @@ impl Square {
                     && context.app.borrow().as_deref() == Some(key.as_str())
                 {
                     context_close(&context);
+                    return;
+                }
+                // Another app's menu is up: it leaves with its own close, and
+                // this one comes up when there is room, next to its square.
+                // The close's completion timer runs the arrival, so the two
+                // never overlap and never restart each other; a rapid run of
+                // right clicks queues the newest behind whichever is leaving.
+                if context.shown.get() {
+                    let (icon_center, bar_width) = icon_metrics(&square);
+                    context_close(&context);
+                    context_open_after(&context, &key, &windows, icon_center, bar_width);
                     return;
                 }
                 // The previews play their own close, and the app menu opens when that has
