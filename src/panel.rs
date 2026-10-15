@@ -3598,6 +3598,17 @@ impl Square {
                 }
             });
         }
+        // A cancelled gesture is a release that never came: the square is still
+        // lifted, and nothing else would put it back. It is dropped where it sits,
+        // exactly as a release would have dropped it.
+        gesture.connect_cancel(move |_, _| {
+            if drag_active() {
+                let moved = drag_end();
+                if moved {
+                    glib::idle_add_local_once(|| rebuild_bar());
+                }
+            }
+        });
         self.button.add_controller(gesture);
     }
 
@@ -4989,8 +5000,9 @@ fn gap_at(middles: &[f64], x: f64) -> usize {
 
 /// Where each square in the row is, in the row's own coordinates.
 struct RowGeometry {
-    /// The middles of the visible children, left to right. A placeholder is one of them,
-    /// because the hole it leaves is exactly as wide as the square that left it.
+    /// The middles of the squares, left to right. The placeholder is not one of them:
+    /// its middle is where the hole is, not a square the pointer can have passed, and
+    /// counting it made every rightward crossing swap one slot too far.
     middles: Vec<f64>,
 }
 
@@ -5007,8 +5019,10 @@ fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     while let Some(widget) = child {
         let square = widget.upcast::<gtk4::Widget>();
         // A square that has not been allocated yet has no position, and contributes
-        // nothing to the row either.
-        if let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0) {
+        // nothing to the row either. The hole is skipped: it is not a square.
+        if square.widget_name() != GAP_NAME
+            && let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0)
+        {
             middles.push(left + f64::from(square.width()) / 2.0);
         }
         child = square.next_sibling();
@@ -5098,8 +5112,15 @@ fn drag_begin(app: &str) {
     // Taken first deliberately: inserting the placeholder at `index` pushes the square
     // one place along, so measuring afterwards lands a whole square out — every drag
     // began from the wrong position.
-    let (left, top) = square
+    // The pointer is measured against the row, so the row's own x is kept for that.
+    let (row_left, _) = square
         .translate_coordinates(&tasks, 0.0, 0.0)
+        .unwrap_or((0.0, 0.0));
+    // The carried square is placed in the carried layer, which covers the whole bar
+    // (the row's padding and margins included). Its origin is measured there, or the
+    // square jumps by exactly that inset the moment it is lifted.
+    let (left, top) = square
+        .translate_coordinates(overlay.upcast_ref::<gtk4::Widget>(), 0.0, 0.0)
         .unwrap_or((0.0, 0.0));
 
     // The placeholder. Invisible, the same size as a square, and holding the gap open.
@@ -5124,7 +5145,7 @@ fn drag_begin(app: &str) {
             gap: index,
             original: index,
             carried_at: (left, top),
-            last_gap_x: left + f64::from(SQUARE_SIZE) / 2.0,
+            last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
             meet_x: Cell::new(f64::NAN),
         })));
     });
@@ -5338,9 +5359,54 @@ fn drag_end() -> bool {
     if menu_debug() {
         eprintln!("oxide-panel: {app:?} moved to {index}");
     }
-    // The same path a drop took, so there is one way the bar is reordered and saved.
-    place_at(&app, index);
+    persist_row_order(&tasks);
     true
+}
+
+/// Move an app's square to a place in the bar, and remember it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn place_at(id: &str, index: usize) {
+    LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        layout.order.retain(|entry| entry != id);
+        let index = index.min(layout.order.len());
+        layout.order.insert(index, id.to_string());
+    });
+    save_layout();
+}
+
+/// Save the bar's order as the row shows it right now.
+///
+/// Read from the row, not from the slot a square landed in: the saved order names
+/// apps, while the row also holds synthetic squares that the order never lists, so an
+/// index into one is not an index into the other. Apps the row does not show keep
+/// their places after the visible ones.
+fn persist_row_order(tasks: &GtkBox) {
+    let mut visible: Vec<String> = Vec::new();
+    let mut cursor = tasks.first_child();
+    while let Some(widget) = cursor {
+        if let Some(key) = app_of(&widget)
+            && !key.starts_with('#')
+        {
+            visible.push(key);
+        }
+        cursor = widget.next_sibling();
+    }
+    let changed = LAYOUT.with(|layout| {
+        let mut layout = layout.borrow_mut();
+        let mut next = visible;
+        for id in layout.order.iter() {
+            if !next.contains(id) {
+                next.push(id.clone());
+            }
+        }
+        let changed = next != layout.order;
+        layout.order = next;
+        changed
+    });
+    if changed {
+        save_layout();
+    }
 }
 
 /// The box the squares are in, while there is a bar.
@@ -5493,17 +5559,6 @@ fn child_index(parent: &GtkBox, child: &gtk4::Widget) -> Option<usize> {
         cursor = widget.next_sibling();
     }
     None
-}
-
-/// Move an app's square to a place in the bar, and remember it.
-fn place_at(id: &str, index: usize) {
-    LAYOUT.with(|layout| {
-        let mut layout = layout.borrow_mut();
-        layout.order.retain(|entry| entry != id);
-        let index = index.min(layout.order.len());
-        layout.order.insert(index, id.to_string());
-    });
-    save_layout();
 }
 
 /// Show or hide one square's tooltip, to match whether a menu is up.
@@ -7196,6 +7251,20 @@ mod tests {
         // Which is the one case where a fill *would* have been right: if the cell were
         // not already filled, the strip would need the colour itself.
         assert!(CELL_FILL.3 > 0.0, "the cell underneath is what shows through");
+    }
+
+    #[test]
+    fn a_drag_trades_with_the_square_whose_middle_it_passed() {
+        // Squares only, as `row_geometry` measures them: the hole is not one of them.
+        // The hole in slot 0, the squares in slots 1-3.
+        let middles = [58.0, 98.0, 138.0];
+        assert_eq!(gap_at(&middles, 50.0), 0, "still over the hole");
+        assert_eq!(gap_at(&middles, 70.0), 1, "past slot 1's middle: trade with it");
+        assert_eq!(gap_at(&middles, 100.0), 2, "past slot 2's middle too");
+        // The hole in slot 2, squares in slots 0, 1 and 3.
+        let middles = [18.0, 58.0, 138.0];
+        assert_eq!(gap_at(&middles, 120.0), 2, "passed slot 1 only: still the hole's slot");
+        assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
     }
 
     #[test]
