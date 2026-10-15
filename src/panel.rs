@@ -2623,6 +2623,14 @@ fn animate_surface(
 /// Not a second preview menu. Choosing between an app's windows is a left click, or
 /// a hover; this is for the things a picker cannot do — start the app again, close
 /// everything it has open, and keep it in the bar when it has nothing open.
+/// Where an open is headed. One of at a time: a second right-click replaces it.
+struct ContextOpening {
+    key: String,
+    windows: Vec<WindowInfo>,
+    icon_center: i32,
+    bar_width: i32,
+}
+
 struct ContextMenu {
     window: gtk4::Window,
     rows: GtkBox,
@@ -2642,6 +2650,10 @@ struct ContextMenu {
     /// no-op rather than a restart of the animation, and a click that lands during
     /// it belongs to the square rather than to a menu that is already leaving.
     closing: Cell<bool>,
+    /// A menu waiting to open the moment the one fading out has left, set by a
+    /// right click on another square while this one is on its way out. The
+    /// close's own completion timer runs it, so leave and arrive never overlap.
+    pending_open: RefCell<Option<ContextOpening>>,
     animation: Rc<Cell<u64>>,
     /// The width the surface is being eased between by `context_ease`.
     ///
@@ -2719,6 +2731,7 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
         app: RefCell::new(None),
         shown: Cell::new(false),
         closing: Cell::new(false),
+        pending_open: RefCell::new(None),
         animation: Rc::new(Cell::new(0)),
         width_from: Cell::new(0),
         width_to: Cell::new(0),
@@ -3006,22 +3019,50 @@ fn ease_margin(from: i32, to: i32, f: f64) -> i32 {
 /// are for the menu itself.
 fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], button: &Button) {
     let (icon_center, bar_width) = icon_metrics(button);
+    context_open_at(context, key, windows, icon_center, bar_width);
+}
+
+/// Ask for an open that waits behind whatever is leaving.
+///
+/// A right-click on another square while this menu is up (or already on its way
+/// out) comes through here: the outgoing one plays its close, and the arrival
+/// is held until it has finished. The newest wish wins if another arrives
+/// during the wait.
+fn context_open_after(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    icon_center: i32,
+    bar_width: i32,
+) {
+    if context.closing.get() {
+        *context.pending_open.borrow_mut() = Some(ContextOpening {
+            key: key.to_string(),
+            windows: windows.to_vec(),
+            icon_center,
+            bar_width,
+        });
+        return;
+    }
+    context_open_at(context, key, windows, icon_center, bar_width);
+}
+
+/// The body of an open, given where the menu should sit.
+///
+/// A menu that is already up keeps its place and its animation; this is called
+/// at most once per arrival, from [`context_open`] or from the close that
+/// [`context_open_after`] chained behind.
+fn context_open_at(
+    context: &Rc<ContextMenu>,
+    key: &str,
+    windows: &[WindowInfo],
+    icon_center: i32,
+    bar_width: i32,
+) {
     context.icon_center.set(icon_center);
     context.bar_width.set(bar_width);
     context.app.replace(Some(key.to_string()));
     context_fill(context, key, windows);
-    if context.shown.get() {
-        let width = context
-            .rows
-            .measure(gtk4::Orientation::Horizontal, -1)
-            .1
-            .max(1);
-        context.window.set_size_request(width, -1);
-        context.window.set_default_size(width, -1);
-        context.window.set_margin(Edge::Left, menu_left(icon_center, bar_width, width));
-        sync_tooltips_from_context(&context);
-        return;
-    }
     // A reopen during the close fade takes the menu back: the fade that was running
     // is not a close any more, so a later close must be able to run again.
     context.closing.set(false);
@@ -3048,10 +3089,7 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
     // the time it does the menu has been in the wrong place.
     let width = context.rows.measure(gtk4::Orientation::Horizontal, -1).1;
     // Sized before it shows, the way the preview menu is: the surface arrives in
-    // final shape and only slides and fades. Easing the width on the way in made
-    // the menu grow sideways while it appeared — motion nothing of the kind the
-    // thumbnail menu has — and the width of an unmapped surface is zero, so the
-    // first open grew from nothing every time.
+    // final shape and only slides and fades.
     context.window.set_size_request(width.max(1), -1);
     context.window.set_default_size(width.max(1), -1);
     context.window.present();
@@ -3073,6 +3111,10 @@ fn context_open(context: &Rc<ContextMenu>, key: &str, windows: &[WindowInfo], bu
 
 /// Take the context menu off screen, then let it go.
 fn context_close(context: &Rc<ContextMenu>) {
+    // A close cancels whatever was waiting to open behind an earlier close:
+    // the pointer has told the menu to go away, and a menu arriving after
+    // that is not what anyone asked for.
+    *context.pending_open.borrow_mut() = None;
     if !context.shown.get() || context.closing.get() {
         return;
     }
@@ -3116,6 +3158,18 @@ fn context_close(context: &Rc<ContextMenu>) {
         fading.window.set_visible(false);
         fading.shown.set(false);
         fading.closing.set(false);
+        // And the menu a right click queued behind this close now has room
+        // to come up, next to the square it is for.
+        let waiting = fading.pending_open.borrow_mut().take();
+        if let Some(opening) = waiting {
+            context_open_at(
+                &fading,
+                &opening.key,
+                &opening.windows,
+                opening.icon_center,
+                opening.bar_width,
+            );
+        }
         glib::ControlFlow::Break
     });
 }
@@ -3534,6 +3588,17 @@ impl Square {
                     && context.app.borrow().as_deref() == Some(key.as_str())
                 {
                     context_close(&context);
+                    return;
+                }
+                // Another app's menu is up: it leaves with its own close, and
+                // this one comes up when there is room, next to its square.
+                // The close's completion timer runs the arrival, so the two
+                // never overlap and never restart each other; a rapid run of
+                // right clicks queues the newest behind whichever is leaving.
+                if context.shown.get() {
+                    let (icon_center, bar_width) = icon_metrics(&square);
+                    context_close(&context);
+                    context_open_after(&context, &key, &windows, icon_center, bar_width);
                     return;
                 }
                 // The previews play their own close, and the app menu opens when that has
@@ -4083,11 +4148,11 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // into two different greys.
     let (panel_r, panel_g, panel_b) = BAR_PANEL;
     let panel_a = BAR_PANEL_ALPHA;
-    // The app menu's body and cells are the preview menu's own palette, read off
-    // the same constants the cairo drawing reads, so the two menus are one look
-    // by construction rather than by two careful copies of the same hexes.
-    let menu_fill_r = (MENU_FILL.0 * 255.0).round() as u8;
-    let menu_fill_a = MENU_FILL.3;
+    // The app menu's body is the preview menu's cell fill, read off the same
+    // constant the cairo drawing reads, so the two engines agree by
+    // construction rather than by two careful copies of the same hexes. The
+    // rows are a white step on the hover's own ladder instead of a second
+    // grey, so nothing at rest keeps the body fill's variables alive.
     let menu_edge_a = MENU_EDGE.3;
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
@@ -4151,11 +4216,10 @@ button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
 }}
 /* The app menu, opened by a right click. Widgets, so it is styled here --
-   and styled out of the thumbnail menu's own palette, so the two menus read
-   as one object. The body is the previews' fill and edge at the previews'
-   radius; a row is a preview cell: 0.35 black fill, CELL_EDGE outline,
-   CELL_RADIUS corners, brightening to the hover edge it would get as a cell.
-   The text and the hover fill are the taskbar's.
+   styled out of the thumbnail menu's own palette, with the body at the
+   previews' 0.35 black and one row a step lighter: the same fill ladder the
+   hover's own white sits on. Edges, radii, text and hover are the previews'
+   and the taskbar's as before.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4169,7 +4233,10 @@ window.context {{
        shade darker and more opaque than the bar, and two menus side by side
        would show any drift. */
     padding: 5px;
-    background-color: rgba({menu_fill_r}, {menu_fill_r}, {menu_fill_r}, {menu_fill_a});
+    /* The cell fill, not the previews' body: the fills of the body and the
+       rows are swapped, so the rows run the lighter, more opaque shade of
+       the two and sit in front against a darker, more open background. */
+    background-color: rgba(0, 0, 0, {cell_fill_a});
     /* The theme paints a window background image on top of a window's background
        colour, which would put a fill of its own over this and make it a third value
        again. */
@@ -4178,7 +4245,10 @@ window.context {{
     border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    background: rgba(0, 0, 0, {cell_fill_a});
+    /* A shade of white over the body rather than a second grey: the row is
+       exactly one step lighter than the fill behind it, on the same ladder
+       the hover sits on. */
+    background: rgba(255, 255, 255, 0.05);
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
@@ -4186,6 +4256,10 @@ button.context-row {{
     border-radius: {cell_radius}px;
     color: #e8e8e8;
     font-weight: 500;
+    /* No state transitions: the theme eases button fills over hundreds of
+       milliseconds, and a hover highlight that arrives late reads as lag.
+       The taskbar squares snap for the same reason. */
+    transition: none;
 }}
 button.context-row:hover {{
     /* The panel's own hover: the pointer's fill, nothing else moving. The
@@ -6962,25 +7036,19 @@ mod tests {
         // this test pins the stylesheet to them in case a rule restarts from a
         // hand-copied value.
         let sheet = style_sheet((1, 2, 3));
-        // The body, from the rows-box rule ...
+        // The body, from the rows-box rule. The body takes the *cell* fill --
+        // the two shades swapped -- so the rows sit lighter and more opaque in
+        // front of a darker, more open background.
         let rule = sheet
             .split(".context-rows {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows");
         assert!(
-            rule.contains(&format!(
-                "rgba({}, {}, {}, {})",
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.0 * 255.0).round() as u8,
-                (MENU_FILL.1 * 255.0).round() as u8,
-                MENU_FILL.3
-            )),
-            "the app menu body is not the previews' body: {rule}"
+            rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
+            "the app menu body is not the swapped cell fill: {rule}"
         );
-        // ... it must match what the previews' body is, rather than the bar's
-        // grey, because the two menus show side by side and run one shade
-        // darker and more opaque than the bar.
+        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         assert_eq!(MENU_FILL, (0.11, 0.11, 0.11, 0.94), "and the previews moved");
         // The theme's window background image would put a fill of its own over
         // this, and it is invisible in a stylesheet.
@@ -6988,17 +7056,17 @@ mod tests {
             rule.contains("background-image: none"),
             "the theme's window background is back over the app menu's fill: {rule}"
         );
-        // A row is a preview cell, so it takes the cell's fill.
+        // And a row is one step lighter than that fill, on the hover's own
+        // white ladder -- not a second grey from another palette.
         let row_rule = sheet
             .split("button.context-row {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("a rule for the app menu rows' buttons");
         assert!(
-            row_rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
-            "an app-menu row is not a preview cell's fill: {row_rule}"
+            row_rule.contains("rgba(255, 255, 255, 0.05)"),
+            "an app-menu row is not the one-step-lighter fill: {row_rule}"
         );
-        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
         // The window itself paints nothing: the strip above the rows has to stay
         // see-through for the gap between the menu and the panel to be a gap.
         let window_rule = sheet
