@@ -207,6 +207,10 @@ fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
     (ease(elapsed / PHASE_END), false)
 }
 
+/// How far a press has to travel before it is reported as a drag rather than
+/// tracked as a click in waiting. Twice GTK's own double-click radius, so a
+/// jittered click cannot read as a drag.
+const DRAG_LOG_THRESHOLD: f64 = 16.0;
 /// How long a window takes to fade in or out, separately from the width, because
 /// the two run one after the other rather than together.
 const CELL_FADE: Duration = Duration::from_millis(140);
@@ -3510,21 +3514,50 @@ impl Square {
             return;
         }
         let key = self.key.clone();
-        let begin_key = key.clone();
-        let update_key = key.clone();
         let gesture = gtk4::GestureDrag::new();
         gesture.set_button(gdk::BUTTON_PRIMARY);
-        gesture.connect_drag_begin(move |_, start_x, start_y| {
-            eprintln!("oxide-panel: drag {begin_key:?} began at ({start_x:.1}, {start_y:.1})");
-        });
-        gesture.connect_drag_update(move |_, offset_x, offset_y| {
-            eprintln!(
-                "oxide-panel: drag {update_key:?} offset ({offset_x:.1}, {offset_y:.1})"
-            );
-        });
-        gesture.connect_drag_end(move |_, _, _| {
-            eprintln!("oxide-panel: drag {key:?} ended (no-op)");
-        });
+        // A GestureDrag fires `begin` on the press itself, so a plain click
+        // would read as a drag and the log would lie. The press is tracked
+        // silently; the drag is not reported until the pointer has actually
+        // moved away from where it went down, and a gesture that ends without
+        // crossing the threshold was a click, and reports nothing.
+        let start = Rc::new(Cell::new((0.0f64, 0.0f64)));
+        let moved = Rc::new(Cell::new(false));
+        {
+            let start = start.clone();
+            gesture.connect_drag_begin(move |_, start_x, start_y| {
+                start.set((start_x, start_y));
+            });
+        }
+        {
+            let start = start.clone();
+            let moved = moved.clone();
+            let update_key = key.clone();
+            gesture.connect_drag_update(move |_, offset_x, offset_y| {
+                if !moved.get() && offset_x.abs() + offset_y.abs() < DRAG_LOG_THRESHOLD {
+                    return;
+                }
+                if !moved.get() {
+                    moved.set(true);
+                    let (start_x, start_y) = start.get();
+                    eprintln!(
+                        "oxide-panel: drag {update_key:?} began at ({start_x:.1}, {start_y:.1})"
+                    );
+                }
+                eprintln!(
+                    "oxide-panel: drag {update_key:?} offset ({offset_x:.1}, {offset_y:.1})"
+                );
+            });
+        }
+        {
+            let moved = moved.clone();
+            let key = key.clone();
+            gesture.connect_drag_end(move |_, _, _| {
+                if moved.get() {
+                    eprintln!("oxide-panel: drag {key:?} ended (no-op)");
+                }
+            });
+        }
         self.button.add_controller(gesture);
     }
 
