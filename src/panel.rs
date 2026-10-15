@@ -3397,6 +3397,11 @@ impl Square {
                 // Entering anywhere on the row cancels a close scheduled by leaving the
                 // square before, whether this square has anything to show or not.
                 menu.hover_token.set(menu.hover_token.get() + 1);
+                // A drag owns the pointer: squares it flies over are not
+                // visited, they are passed.
+                if drag_active() {
+                    return;
+                }
                 let group = group_for_key(&key);
                 if group.is_empty() {
                     // An app with no windows has no previews to offer, so there is
@@ -3510,51 +3515,86 @@ impl Square {
     /// pointer went, and nothing in the bar ever moves. Without the debug flag
     /// no gesture is attached at all.
     fn wire_drag(&self) {
-        if !menu_debug() {
-            return;
-        }
         let key = self.key.clone();
         let gesture = gtk4::GestureDrag::new();
         gesture.set_button(gdk::BUTTON_PRIMARY);
-        // A GestureDrag fires `begin` on the press itself, so a plain click
-        // would read as a drag and the log would lie. The press is tracked
-        // silently; the drag is not reported until the pointer has actually
-        // moved away from where it went down, and a gesture that ends without
-        // crossing the threshold was a click, and reports nothing.
-        let start = Rc::new(Cell::new((0.0f64, 0.0f64)));
-        let moved = Rc::new(Cell::new(false));
+        // The pointer's row position where the press went down (the square's
+        // place in the row plus the gesture's own start point), captured at
+        // drag-begin while the square is still in the row. Travel is measured
+        // against it; the lift happens wherever along that travel the
+        // threshold is crossed.
+        let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
         {
-            let start = start.clone();
-            gesture.connect_drag_begin(move |_, start_x, start_y| {
-                start.set((start_x, start_y));
+            let start_row = start_row.clone();
+            let begin_key = key.clone();
+            gesture.connect_drag_begin(move |g, _, _| {
+                // A fresh press: the last press's drag has no claim on its
+                // click.
+                CLICK_IS_DRAG.set(false);
+                let start = g.start_point();
+                if let (Some((left, _)), Some((sx, _))) = (
+                    tasks_box().and_then(|tasks| {
+                        square_for(&tasks, &begin_key).and_then(|button| {
+                            button.translate_coordinates(&tasks, 0.0, 0.0)
+                        })
+                    }),
+                    start,
+                ) {
+                    start_row.set(Some((left + sx, left)));
+                }
             });
         }
         {
-            let start = start.clone();
-            let moved = moved.clone();
+            let start_row = start_row.clone();
             let update_key = key.clone();
-            gesture.connect_drag_update(move |_, offset_x, offset_y| {
-                if !moved.get() && offset_x.abs() + offset_y.abs() < DRAG_LOG_THRESHOLD {
+            let lift_key = key.clone();
+            gesture.connect_drag_update(move |_, offset_x, _| {
+                let Some((row_start, _origin_left)) = start_row.get() else {
+                    return;
+                };
+                let pointer_x = row_start + offset_x;
+                if !drag_active() {
+                    // Not lifted yet: only the threshold stands between a
+                    // click and a drag. Past it, the square leaves the row and
+                    // starts riding the pointer -- and this same move already
+                    // carries it, so nothing waits a frame.
+                    if offset_x.abs() >= DRAG_LOG_THRESHOLD {
+                        drag_begin(&lift_key);
+                        if drag_active() {
+                            DRAG.with(|drag| {
+                                if let Some(state) = drag.borrow().as_ref() {
+                                    state.borrow().pointer_meet(pointer_x);
+                                }
+                            });
+                            if menu_debug() {
+                                eprintln!(
+                                    "oxide-panel: drag {update_key:?} lifted at ({pointer_x:.1}, row start {row_start:.1})"
+                                );
+                            }
+                            if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                                tasks.queue_allocate();
+                            }
+                        }
+                    }
                     return;
                 }
-                if !moved.get() {
-                    moved.set(true);
-                    let (start_x, start_y) = start.get();
-                    eprintln!(
-                        "oxide-panel: drag {update_key:?} began at ({start_x:.1}, {start_y:.1})"
-                    );
+                if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                    tasks.queue_allocate();
                 }
-                eprintln!(
-                    "oxide-panel: drag {update_key:?} offset ({offset_x:.1}, {offset_y:.1})"
-                );
             });
         }
         {
-            let moved = moved.clone();
-            let key = key.clone();
+            let end_key = key.clone();
             gesture.connect_drag_end(move |_, _, _| {
-                if moved.get() {
-                    eprintln!("oxide-panel: drag {key:?} ended (no-op)");
+                start_row.set(None);
+                if drag_active() {
+                    let moved = drag_end();
+                    if moved {
+                        glib::idle_add_local_once(|| rebuild_bar());
+                    }
+                    if menu_debug() {
+                        eprintln!("oxide-panel: drag {end_key:?} ended (moved: {moved})");
+                    }
                 }
             });
         }
@@ -4848,6 +4888,12 @@ fn square_click(
     menu: &Rc<Menu>,
     context: &Rc<ContextMenu>,
 ) {
+    // A drag disarm(ed) the press that carries it: whenever the click signal
+    // arrives after the square has been lifted, this is the drag's tail, not
+    // a click.
+    if CLICK_IS_DRAG.get() {
+        return;
+    }
     if menu_debug() {
         eprintln!(
             "oxide-panel: click {key:?} context_shown={} context_closing={}",
@@ -4923,13 +4969,12 @@ fn app_of(widget: &gtk4::Widget) -> Option<String> {
     Some(name.strip_prefix(APP_NAME_PREFIX)?.to_string())
 }
 
-// ---- the dormant drag system ----
-// The gap math, the carried layer and the placeholder below were the last
-// attempt at reorder-by-drag. They still hold together, but nothing may call
-// them: a drag is only logged now (see `Square::wire_drag`). The next
-// attempt should either use these or bury them for good.
+// ---- the drag system ----
+// Reorder by dragging, in swaps: the square leaves the row, rides the
+// pointer, and every neighbour its travel crosses replaces it slot for
+// slot -- the two of them trade places, and the squares between the two
+// stand still. Dropping commits the order.
 
-#[allow(dead_code)]
 /// Which gap in a row a pointer at this x is over.
 ///
 /// The bar is a row, so the gap is decided by which squares' middles the pointer is past:
@@ -4942,7 +4987,6 @@ fn gap_at(middles: &[f64], x: f64) -> usize {
     middles.iter().filter(|middle| x > **middle).count()
 }
 
-#[allow(dead_code)]
 /// Where each square in the row is, in the row's own coordinates.
 struct RowGeometry {
     /// The middles of the visible children, left to right. A placeholder is one of them,
@@ -4956,7 +5000,6 @@ impl RowGeometry {
     }
 }
 
-#[allow(dead_code)]
 /// Measure the row of squares.
 fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     let mut middles = Vec::new();
@@ -4973,12 +5016,13 @@ fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     RowGeometry { middles }
 }
 
-#[allow(dead_code)]
 /// The square being carried, and the placeholder standing in for it.
 struct DragState {
     /// The app being carried.
     app: String,
-    /// The gap it would land in if let go now.
+    /// The slot the hole (the placeholder) is in now: where the carried
+    /// square would land if let go. Neighbours swap with it as the pointer
+    /// crosses their middles, one slot at a time.
     gap: usize,
     /// Where it was picked up from, so putting it back where it started is not a change.
     original: usize,
@@ -4989,6 +5033,18 @@ struct DragState {
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
     last_gap_x: f64,
+    /// The pointer position the lift happened at, which is what the carried
+    /// square's travel is measured from: the drag starts wherever along the
+    /// press the threshold was crossed, not at the press itself.
+    meet_x: Cell<f64>,
+}
+
+impl DragState {
+    /// Note where the pointer met the threshold, so the carried square's
+    /// travel starts from there.
+    fn pointer_meet(&self, x: f64) {
+        self.meet_x.set(x);
+    }
 }
 
 thread_local! {
@@ -4996,6 +5052,10 @@ thread_local! {
     // gesture that starts the drag belongs to the pressed button, but the row has to be
     // rearranged by squares that know nothing about it.
     static DRAG: RefCell<Option<Rc<RefCell<DragState>>>> = const { RefCell::new(None) };
+    // Whether the press now ending belongs to a drag that moved: a click
+    // arriving while this is set is the tail of a drag, not a click, however
+    // the two handlers end up ordered. Reset at every fresh press.
+    static CLICK_IS_DRAG: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether a square is being carried.
@@ -5003,7 +5063,6 @@ fn drag_active() -> bool {
     DRAG.with(|drag| drag.borrow().is_some())
 }
 
-#[allow(dead_code)]
 /// Pick a square up.
 ///
 /// The square leaves the row and goes into the overlay, and a placeholder of the same
@@ -5011,12 +5070,6 @@ fn drag_active() -> bool {
 /// as it would if the square were still there and had moved. Nothing in the row is asked
 /// for a negative size.
 fn drag_begin(app: &str) {
-    // Reorder-by-dragging is opt-in: off unless `OXIDE_PANEL_DRAG` is set. The
-    // gesture this runs from also carries the square's *clicks*, which do not
-    // depend on this firing — see the drag-end handler.
-    if std::env::var_os("OXIDE_PANEL_DRAG").is_none() {
-        return;
-    }
     if drag_active() {
         // A second square cannot join the first. Ignoring it is better than ending the
         // drag in progress, which would leave the carried square stranded in the overlay.
@@ -5072,19 +5125,42 @@ fn drag_begin(app: &str) {
             original: index,
             carried_at: (left, top),
             last_gap_x: left + f64::from(SQUARE_SIZE) / 2.0,
+            meet_x: Cell::new(f64::NAN),
         })));
     });
+    // This press is a drag from here on: whatever its click signal says at
+    // release, the square has been lifted, and activating it would fire the
+    // window the pointer happened to be over when it landed.
+    CLICK_IS_DRAG.set(true);
+    // The pointer now owns the row: menus anchored to squares are about to
+    // point at slots that mean nothing while the square rides over them.
+    if let Some((_, menu, _, _, context)) = LAST_BAR.with(|cell| cell.borrow().clone()) {
+        if menu.shown.get() {
+            menu_close(&menu);
+        }
+        if context.shown.get() {
+            context_close(&context);
+        }
+    }
     if menu_debug() {
         eprintln!("oxide-panel: picked up {app:?}");
     }
 }
 
-#[allow(dead_code)]
-/// Carry the square under the pointer, and move the hole in the row to suit.
+/// Carry the square under the pointer, and make it trade slots with whatever
+/// it crosses.
 ///
-/// Returns whether the gap moved, which is the only time the row has to be laid out
-/// again.
-fn drag_update(pointer_x: f64, delta: (f64, f64)) -> bool {
+/// The carried square rides the pointer; the slot it would land in is the
+/// placeholder's slot, and every time the pointer passes the *middle* of a
+/// neighbouring slot, that slot's square and the placeholder trade places:
+/// the one square moves into the hole, and the hole moves on. Nothing else in
+/// the row shifts, which is the whole point of swaps over a sliding gap.
+///
+/// A fast fling across several slots is applied one swap at a time, so the
+/// squares the pointer swept past end up where a slow sweep would have left
+/// them: swaps are sequential by construction. Returns whether the row
+/// changed, which is the only time it has to be laid out again.
+fn drag_update(pointer_x: f64) -> bool {
     let state = DRAG.with(|drag| drag.borrow().clone());
     let Some(state) = state else {
         return false;
@@ -5095,49 +5171,83 @@ fn drag_update(pointer_x: f64, delta: (f64, f64)) -> bool {
     let Some(overlay) = carried_layer() else {
         return false;
     };
-    let _ = &overlay;
     let app = state.borrow().app.clone();
     let Some(square) = carried_square(&app) else {
         return false;
     };
 
-    // From where the square was put down, not from where it is now: adding the total
-    // travel onto the current position compounds the rounding of every step, and the
-    // square drifts away from the cursor over a long drag.
+    // From where the square was lifted, not from where it is now: adding the
+    // total travel to the current position compounds the rounding of every
+    // step, and the square drifts away from the cursor over a long drag.
+    // Vertical stays put: the square rides the bar.
     let origin = state.borrow().carried_at;
-    let (dx, _dy) = delta;
-    // Exactly the pointer's travel from where the square was picked up. No
-    // centering offset: subtracting half a square here made the carried square
-    // jump sideways and up the moment it was lifted, which is what made the drag
-    // read as broken. Vertical stays put — the square rides the bar.
-    let (x, y) = ((origin.0 + dx).round(), origin.1.round());
-    // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no parent, and this
-    // square has been in the fixed since the drag began: every reposition after the first
-    // failed the assertion and did nothing. The square froze where it was picked up while
-    // the hole in the row kept following the pointer — and, worse, the squares left
-    // stranded in the fixed stayed over the bar taking clicks that were not theirs, which
-    // is why nothing in the bar could be pressed at all.
+    let meet = state.borrow().meet_x.get();
+    let travel = pointer_x - meet;
+    let (x, y) = ((origin.0 + travel).round(), origin.1.round());
+    // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no
+    // parent, and this square has been in the fixed since the drag began.
     overlay.move_(&square, x, y);
-    // The gap is measured against the row as it is *now*, with the placeholder in it, so
-    // the hole moves and the gap follows it.
-    let gap = row_geometry(&tasks).gap_at(pointer_x);
-    if gap == state.borrow().gap {
+
+    // The gap is measured against the row as it is *now*, with the
+    // placeholder in it, so the hole and the squares swap on the same rails.
+    let mut hole = state.borrow().gap;
+    let target = row_geometry(&tasks).gap_at(pointer_x);
+    if target == hole {
         return false;
     }
     if (pointer_x - state.borrow().last_gap_x).abs() < 4.0 {
-        // Still within noise of the seam the gap last crossed; a pointer parked
-        // on a boundary would flip the slot with every pixel otherwise.
+        // Still within noise of the seam the hole last crossed; a pointer
+        // parked on a boundary would flip the slot with every pixel otherwise.
         return false;
     }
-    if let Some(placeholder) = placeholder_for(&tasks) {
-        put_child(&tasks, placeholder.upcast_ref(), gap);
+    // Swaps run one slot at a time towards the pointer, so a fling across
+    // several squares leaves them exactly as a slow sweep would have.
+    let direction = if target > hole { 1 } else { -1 };
+    let mut relisted = false;
+    while hole != target {
+        let next = (hole as isize + direction) as usize;
+        swap_row_slots(&tasks, hole, next);
+        hole = next;
+        relisted = true;
     }
-    state.borrow_mut().gap = gap;
+    state.borrow_mut().gap = hole;
     state.borrow_mut().last_gap_x = pointer_x;
     if menu_debug() {
-        eprintln!("oxide-panel: gap {gap} for {app:?} (pointer {pointer_x:.0})");
+        eprintln!(
+            "oxide-panel: {app:?} traded through to slot {hole} (pointer {pointer_x:.0})"
+        );
     }
-    true
+    relisted
+}
+
+/// Trade the contents of two slots in the row.
+///
+/// The whole row is read into order, the two entries are exchanged, and the
+/// row is written back slot by slot: `put_child` indexes against the *current*
+/// children, and doing the two moves by hand lets the indexes slide out from
+/// under the second move.
+fn swap_row_slots(tasks: &GtkBox, a: usize, b: usize) {
+    let children: Vec<gtk4::Widget> = {
+        let mut children = Vec::new();
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            children.push(widget.clone());
+            cursor = widget.next_sibling();
+        }
+        children
+    };
+    let Some(first) = children.get(a).cloned() else {
+        return;
+    };
+    let Some(second) = children.get(b).cloned() else {
+        return;
+    };
+    let mut ordered = children;
+    ordered[a] = second;
+    ordered[b] = first;
+    for (slot, widget) in ordered.iter().enumerate() {
+        put_child(tasks, widget, slot);
+    }
 }
 
 /// Abandon a drag without moving anything.
@@ -5181,7 +5291,6 @@ fn carried_square_count() -> usize {
     count
 }
 
-#[allow(dead_code)]
 /// Put the square down where it was dropped, and remember it.
 ///
 /// Returns whether it actually moved, which is what tells a press that picked a square up
