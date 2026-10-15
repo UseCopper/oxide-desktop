@@ -3495,70 +3495,35 @@ impl Square {
         });
     }
 
-    /// Reordering by dragging is opt-in (`OXIDE_PANEL_DRAG`) and rides its own
-    /// `GestureDrag` alongside the click. The gesture only ever *drags*: the
-    /// decision about what the release meant is the button's click signal
-    /// alone — a real drag left the square, and was cancelled as a click —
-    /// and `square_click` treats a lift-and-put-back as the click it is.
+    /// Dragging is disabled.
+    ///
+    /// The square used to carry a full drag-and-reorder under `OXIDE_PANEL_DRAG`,
+    /// and after five attempts across as many sessions it kept tearing the bar
+    /// apart. Everything that made a drag real — the carried layer, the
+    /// placeholder, the reorder — still exists below, disconnected. Until the
+    /// next attempt is written, a drag is only *reported*: with
+    /// `OXIDE_PANEL_DEBUG` set the gesture is attached and logs where the
+    /// pointer went, and nothing in the bar ever moves. Without the debug flag
+    /// no gesture is attached at all.
     fn wire_drag(&self) {
-        if std::env::var_os("OXIDE_PANEL_DRAG").is_none() {
+        if !menu_debug() {
             return;
         }
         let key = self.key.clone();
-        let button = self.button.clone();
+        let begin_key = key.clone();
+        let update_key = key.clone();
         let gesture = gtk4::GestureDrag::new();
         gesture.set_button(gdk::BUTTON_PRIMARY);
-        // The pointer's row position where the gesture started (square's place
-        // in the row plus the gesture's start point), captured at drag-begin
-        // while the square is still in the row — together with the square's
-        // origin then, which the update uses to correct for the widget's own
-        // travel: the gesture's offsets are widget-relative and this drag moves
-        // the widget.
-        let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        {
-            let start_row = start_row.clone();
-            let button = button.clone();
-            gesture.connect_drag_begin(
-                move |g, _, _| {
-                    let origin = tasks_box()
-                        .and_then(|tasks| button.translate_coordinates(&tasks, 0.0, 0.0));
-                    let start = g.start_point();
-                    if let (Some((left, _)), Some((sx, _))) = (origin, start) {
-                        start_row.set(Some((left + sx, left)));
-                    }
-                    drag_begin(&key);
-                }
+        gesture.connect_drag_begin(move |_, start_x, start_y| {
+            eprintln!("oxide-panel: drag {begin_key:?} began at ({start_x:.1}, {start_y:.1})");
+        });
+        gesture.connect_drag_update(move |_, offset_x, offset_y| {
+            eprintln!(
+                "oxide-panel: drag {update_key:?} offset ({offset_x:.1}, {offset_y:.1})"
             );
-        }
-        {
-            let start_row = start_row.clone();
-            let button = button.clone();
-            gesture.connect_drag_update(move |_, ox, _| {
-                let Some((row_start, origin0)) = start_row.get() else {
-                    return;
-                };
-                let Some(origin1) = tasks_box()
-                    .and_then(|tasks| button.translate_coordinates(&tasks, 0.0, 0.0))
-                    .map(|(left, _)| left)
-                else {
-                    return;
-                };
-                let travel = ox + (origin1 - origin0);
-                let pointer_x = row_start + travel;
-                if drag_update(pointer_x, (travel, 0.0)) {
-                    if let Some(tasks) = tasks_box() {
-                        tasks.queue_allocate();
-                    }
-                }
-            });
-        }
+        });
         gesture.connect_drag_end(move |_, _, _| {
-            start_row.set(None);
-            if drag_active() {
-                if drag_end() {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
-            }
+            eprintln!("oxide-panel: drag {key:?} ended (no-op)");
         });
         self.button.add_controller(gesture);
     }
@@ -4852,20 +4817,10 @@ fn square_click(
 ) {
     if menu_debug() {
         eprintln!(
-            "oxide-panel: click {key:?} drag_active={} context_shown={} context_closing={}",
-            drag_active(),
+            "oxide-panel: click {key:?} context_shown={} context_closing={}",
             context.shown.get(),
             context.closing.get()
         );
-    }
-    if drag_active() {
-        // The opted-in drag gesture claimed this press; the drop is its business.
-        // A square put straight back down is not a drop, though: it lifted and
-        // returned, which is a click, so the decision falls through to activate.
-        if drag_end() {
-            glib::idle_add_local_once(|| rebuild_bar());
-            return;
-        }
     }
     if context.shown.get() && !context.closing.get() {
         // First click takes the app menu down; it does not also act. One whose
@@ -4935,6 +4890,13 @@ fn app_of(widget: &gtk4::Widget) -> Option<String> {
     Some(name.strip_prefix(APP_NAME_PREFIX)?.to_string())
 }
 
+// ---- the dormant drag system ----
+// The gap math, the carried layer and the placeholder below were the last
+// attempt at reorder-by-drag. They still hold together, but nothing may call
+// them: a drag is only logged now (see `Square::wire_drag`). The next
+// attempt should either use these or bury them for good.
+
+#[allow(dead_code)]
 /// Which gap in a row a pointer at this x is over.
 ///
 /// The bar is a row, so the gap is decided by which squares' middles the pointer is past:
@@ -4947,6 +4909,7 @@ fn gap_at(middles: &[f64], x: f64) -> usize {
     middles.iter().filter(|middle| x > **middle).count()
 }
 
+#[allow(dead_code)]
 /// Where each square in the row is, in the row's own coordinates.
 struct RowGeometry {
     /// The middles of the visible children, left to right. A placeholder is one of them,
@@ -4960,6 +4923,7 @@ impl RowGeometry {
     }
 }
 
+#[allow(dead_code)]
 /// Measure the row of squares.
 fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     let mut middles = Vec::new();
@@ -4976,6 +4940,7 @@ fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     RowGeometry { middles }
 }
 
+#[allow(dead_code)]
 /// The square being carried, and the placeholder standing in for it.
 struct DragState {
     /// The app being carried.
@@ -5005,6 +4970,7 @@ fn drag_active() -> bool {
     DRAG.with(|drag| drag.borrow().is_some())
 }
 
+#[allow(dead_code)]
 /// Pick a square up.
 ///
 /// The square leaves the row and goes into the overlay, and a placeholder of the same
@@ -5080,6 +5046,7 @@ fn drag_begin(app: &str) {
     }
 }
 
+#[allow(dead_code)]
 /// Carry the square under the pointer, and move the hole in the row to suit.
 ///
 /// Returns whether the gap moved, which is the only time the row has to be laid out
@@ -5181,6 +5148,7 @@ fn carried_square_count() -> usize {
     count
 }
 
+#[allow(dead_code)]
 /// Put the square down where it was dropped, and remember it.
 ///
 /// Returns whether it actually moved, which is what tells a press that picked a square up
