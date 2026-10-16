@@ -5112,11 +5112,6 @@ struct DragState {
     /// Where its top left corner is in the carried layer, which is what the pointer's
     /// travel is added to.
     carried_at: (f64, f64),
-    /// Where the carried square stands *now*, in the same corner coordinates as
-    /// `carried_at`. A trade that puts a flyer into the layer re-stacks the
-    /// carried square on top of it, and that re-put needs the position the
-    /// pointer had already moved it to.
-    position: Cell<(f64, f64)>,
     /// The pointer position at the moment the gap last moved, for hysteresis: a
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
@@ -5260,7 +5255,6 @@ fn drag_begin(app: &str) {
             // teleport the glyph a pixel down, exactly where the drag felt
             // padded.
             carried_at: put,
-            position: Cell::new(put),
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
             meet_x: Cell::new(f64::NAN),
         })));
@@ -5325,7 +5319,6 @@ fn drag_update(pointer_x: f64) -> bool {
     // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no
     // parent, and this square has been in the fixed since the drag began.
     overlay.move_(&square, x, y);
-    state.borrow().position.set((x, y));
 
     // The gap is measured against the row as it is *now*, with the
     // placeholder in it and every landing slot standing where its flying
@@ -5484,26 +5477,34 @@ fn flight_active() -> bool {
 ///
 /// A trade inserts its flyer as the layer's last child, and a GtkFixed paints
 /// children in order — the flyer would slide over the square the pointer owns.
-/// This takes the carried square out and puts it straight back in at the
-/// position the drag had already moved it to, which both restores it as the
-/// last child and leaves it exactly where the pointer left it.
+/// `insert_after` does the reorder without detaching it, which keeps the
+/// carried button's own subtree alive: an unparent-put here used to make GTK
+/// paint the square as a fresh subtree for a frame or two, and the glyph
+/// blinked to nothing mid-trade.
 fn raise_carried(layer: &gtk4::Fixed) {
-    let Some((app, pos)) = DRAG.with(|drag| {
+    let Some(app) = DRAG.with(|drag| {
         let running = drag.borrow();
-        let state = running.as_ref()?;
-        let state = state.borrow();
-        Some((state.app.clone(), state.position.get()))
+        running
+            .as_ref()
+            .map(|state| state.borrow().app.clone())
     }) else {
         return;
     };
     let Some(square) = carried_square(&app) else {
         return;
     };
-    // Another widget's child: the put only works on an unparented one.
-    if square.parent().is_some() {
-        square.unparent();
+    // Restack to the end without touching geometry: within-layer reordering,
+    // so the square keeps its allocation and paints the next frame exactly
+    // where it was.
+    let mut last = square.next_sibling();
+    let mut cursor = last.clone();
+    while let Some(widget) = cursor {
+        last = Some(widget.clone());
+        cursor = widget.next_sibling();
     }
-    layer.put(&square, pos.0, pos.1);
+    if let Some(last) = last {
+        square.insert_after(layer, Some(&last));
+    }
 }
 
 /// Trade two neighbouring slots, flying the square home.
@@ -5608,9 +5609,8 @@ fn trade_slots_with(
     overlay.put(&sq_w, from.0, from.1);
     // The flyer just became the layer's last child, and a GtkFixed draws its
     // children in child order: it would paint over the square under the
-    // pointer, which is the one that should always be on top. Re-stacking is a
-    // re-put at the position the pointer had reached — unparent, put again, and
-    // the carried square is the last child again.
+    // pointer, which is the one that should always be on top. The carried
+    // square is re-stacked to the end — `insert_after`, never a re-parent.
     raise_carried(overlay);
     // A stand-in holds the landing slot — the hole's old slot, which is where
     // the square is headed — so the row never narrows and nothing downstream
