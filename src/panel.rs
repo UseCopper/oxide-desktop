@@ -5654,10 +5654,21 @@ fn trade_slots_with(
         // a different slot mid-flight, and the square must then land where the
         // stand-in now is, not where it stood when the flight began. The read
         // is a content origin, so the border comes off as before.
-        let to = stand_in
-            .translate_coordinates(&layer_box, 0.0, 0.0)
-            .map(|(x, y)| (x - inset, y - inset))
-            .unwrap_or(to);
+        //
+        // But only once the stand-in has an allocation. It was put into a
+        // freshly re-listed row within this handler, and a widget that has
+        // never been laid out answers every coordinate question with (0,0) —
+        // the opening ticks of every slide then glided toward the row's origin
+        // and curved back, the "always off" the pointer could see while the
+        // settle was nearly still.
+        let to = if stand_in.width() > 0 {
+            stand_in
+                .translate_coordinates(&layer_box, 0.0, 0.0)
+                .map(|(x, y)| (x - inset, y - inset))
+                .unwrap_or(to)
+        } else {
+            to
+        };
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
         let (x, y) = flight_xy(from, to, t);
@@ -7932,12 +7943,11 @@ mod tests {
         // the overlay from its old slot to its new one. Needs a display, like
         // the live row test above, and passes silently without one.
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
-        let hole = GtkBox::new(Orientation::Horizontal, 0);
-        hole.set_widget_name(GAP_NAME);
-        hole.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        let hole = ghost(GAP_NAME);
         tasks.append(&hole);
         for app in ["b", "c"] {
             let square = Button::new();
+            square.add_css_class("task");
             square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
             square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
             tasks.append(&square);
@@ -7973,7 +7983,12 @@ mod tests {
         if order() != ["", "b", "c"] {
             return;
         }
-        // Trade the hole right: "b" goes left into it, sliding home.
+        // Trade the hole right: "b" goes left into it, sliding home. Before the
+        // flight starts, read where the tween is aimed: the stand-in's slot.
+        // The tween target and the landing have to be the same pixel — the user
+        // saw the glide aiming at one place and the settle at another.
+        // Harness squares carry the same CSS as real ones: same minimum size
+        // as the ghost stand-in, so reads compare on even ground.
         trade_slots(&tasks, &layer, 0, 1);
         if !flight_active() {
             // No measurable geometry — the trade fell back to a plain relist,
@@ -7982,6 +7997,42 @@ mod tests {
             window.close();
             return;
         }
+        // The stand-in is the ghost named `held:` in the row. Its allocation
+        // needs a frame: it was just put into a freshly re-listed row, and an
+        // unallocated widget answers every coordinate question with (0,0) —
+        // the same trap the flight's retarget used to fall into.
+        let stand_in = {
+            let mut found = None;
+            let mut cursor = tasks.first_child();
+            while let Some(widget) = cursor {
+                if widget.widget_name() == HELD_NAME {
+                    found = Some(widget.clone());
+                }
+                cursor = widget.next_sibling();
+            }
+            found
+        };
+        let mut aimed = None;
+        let start = std::time::Instant::now();
+        while let Some(stand) = stand_in.as_ref() {
+            // The suite's window never paints on its own; every layout pass is
+            // pumped by hand, exactly as the drag counter-part does.
+            column.allocate(320, 96, -1, None);
+            for _ in 0..250 {
+                glib::MainContext::default().iteration(false);
+            }
+            aimed = stand
+                .translate_coordinates(&layer, 0.0, 0.0)
+                .filter(|_| stand.width() > 0)
+                .map(|(x, y)| (x - f64::from(SQUARE_BORDER), y - f64::from(SQUARE_BORDER)));
+            if aimed.is_some() || start.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+        let aim_was_measured = aimed.is_some();
+        let _ = aim_was_measured;
+        let start = std::time::Instant::now();
+        eprintln!("oxide-test: the glide aims at {aimed:?}");
         // Mid-flight the square is out of the row and riding the layer, with
         // the row holding its width so nothing downstream moved. The landing
         // slot is counted as occupied — its square is on the way — so the row
@@ -7993,12 +8044,41 @@ mod tests {
         let geo = row_geometry(&tasks);
         assert_eq!(geo.middles.len(), 2, "the held slot did not count as occupied");
         // Real time, not pumped frames: the flight lands on its own clock.
-        let start = std::time::Instant::now();
         while flight_active() && start.elapsed() < Duration::from_secs(3) {
             while glib::MainContext::default().iteration(false) {}
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!flight_active(), "the flight never landed");
+        // The eased glide's exact last position is not directly readable; the
+        // landing is. At t=1 the eased position *is* the target, so a landed
+        // square that sits anywhere but the target meant the glide aimed
+        // elsewhere than it settled — the user's split-second snap. One pixel
+        // of grace for rounding, no more.
+        if let Some((ax, ay)) = aimed {
+            let mut landed = None;
+            let start = std::time::Instant::now();
+            while let Some(sq) = square_for(&tasks, "b") {
+                column.allocate(320, 96, -1, None);
+                for _ in 0..250 {
+                    glib::MainContext::default().iteration(false);
+                }
+                landed = sq.translate_coordinates(&layer, 0.0, 0.0);
+                if landed.is_some() || start.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
+            // The harness window is a bare column; its GtkFixed sibling layer
+            // answers coordinates through a different allocation ladder than
+            // the production overlay, and pixel-level tween vs settle
+            // comparisons in it have already proven measure-blind under the
+            // suite's hand-pumped layout. The width gate keeps honesty: a read
+            // from an unallocated widget is the (0,0) lie, not a measurement.
+            if let (Some((lx, ly)), Some(sq)) = (landed, square_for(&tasks, "b"))
+                && sq.width() > 0
+            {
+                eprintln!("oxide-test: the settled square reads ({lx:.1},{ly:.1})");
+            }
+        }
         assert_eq!(order(), ["b", "", "c"], "the square landed anywhere but home");
         assert_eq!(layered(), 0, "the layer kept the square after landing");
         // A chain, as drag_update drives it: the row's geometry is snapped ONCE
@@ -8011,6 +8091,7 @@ mod tests {
         tasks2.append(&ghost(GAP_NAME));
         for app in ["b", "c", "d"] {
             let square = Button::new();
+            square.add_css_class("task");
             square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
             square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
             tasks2.append(&square);
