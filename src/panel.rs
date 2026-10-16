@@ -4995,6 +4995,14 @@ const DRAG_CARRYING: &str = "carrying";
 /// The widget name a placeholder carries, so it is never mistaken for a square.
 const GAP_NAME: &str = "gap:";
 
+/// The widget name a landing slot's stand-in carries while its square flies home.
+///
+/// Distinct from [`GAP_NAME`] on purpose: the drag hole is where no square is,
+/// and a landing slot is where one is *about to be* — the row's geometry treats
+/// them differently. Both are nameless to [`app_of`], so neither is ever
+/// reordered as a square, persisted, or hit-tested as one.
+const HELD_NAME: &str = "held:";
+
 /// The prefix a square's widget name carries, so a drag can tell which app a button is.
 ///
 /// Widget names are the only per-widget field a plain `Button` keeps that survives a
@@ -5031,9 +5039,16 @@ fn gap_at(middles: &[f64], x: f64) -> usize {
 
 /// Where each square in the row is, in the row's own coordinates.
 struct RowGeometry {
-    /// The middles of the squares, left to right. The placeholder is not one of them:
-    /// its middle is where the hole is, not a square the pointer can have passed, and
-    /// counting it made every rightward crossing swap one slot too far.
+    /// The middles of the squares and of the landing slots, left to right. The
+    /// drag hole is not one of them: its middle is where the hole is, not a
+    /// square the pointer can have passed, and counting it made every
+    /// rightward crossing swap one slot too far.
+    ///
+    /// A landing slot **is** one of them. Its square is flying home to it, so
+    /// as far as the row is concerned that slot is occupied — and the pointer
+    /// crossing it must advance the gap exactly as crossing the square would.
+    /// Counting only in-row squares made the gap stall one slot behind the
+    /// pointer for the whole flight.
     middles: Vec<f64>,
 }
 
@@ -5050,10 +5065,10 @@ fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     while let Some(widget) = child {
         let square = widget.upcast::<gtk4::Widget>();
         // A square that has not been allocated yet has no position, and contributes
-        // nothing to the row either. The hole is skipped: it is not a square. Matched
-        // the same way `app_of` recognises it, so the two cannot disagree about what
-        // counts.
-        if !square.widget_name().starts_with(GAP_NAME)
+        // nothing to the row either. The drag hole is skipped — it is not a square —
+        // while a landing slot is kept: its square is on its way to it. Matched
+        // exactly, so only the placeholder is skipped and the two cannot be confused.
+        if square.widget_name() != GAP_NAME
             && let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0)
         {
             middles.push(left + f64::from(square.width()) / 2.0);
@@ -5243,12 +5258,13 @@ fn drag_update(pointer_x: f64) -> bool {
     // parent, and this square has been in the fixed since the drag began.
     overlay.move_(&square, x, y);
 
-    // Whatever is still flying lands first: the gap is measured against the
-    // row as it is *now*, and a row with two holes in it is not a row the
-    // mapping knows how to count.
-    land_flight();
     // The gap is measured against the row as it is *now*, with the
-    // placeholder in it, so the hole and the squares swap on the same rails.
+    // placeholder in it and every landing slot standing where its flying
+    // square will sit — so the hole and the squares trade on the same rails
+    // whether or not a slide is in the air. Landing a slide here, on every
+    // motion that did not trade, was what cut each one off a frame after it
+    // started: the slide only survived when the crossing was the very last
+    // motion the pointer made.
     let mut hole = state.borrow().gap;
     let target = row_geometry(&tasks).gap_at(pointer_x);
     if target == hole {
@@ -5268,8 +5284,10 @@ fn drag_update(pointer_x: f64) -> bool {
     // one motion flies each square in turn and they land one after another
     // rather than all at once. That reads as a chain. For a slower hand to
     // see each slide, every trade keeps its full 250ms.
-    // With a 250ms slide each trade stays on screen long enough to read; new
-    // trades land whatever is still flying, so fast sweeps never queue.
+    // With a 250ms slide each trade stays on screen long enough to read. A
+    // trade that fires while another square is still flying lands it first, so
+    // a fling chains pixel-correctly — and slides that are merely overtaken by
+    // pointer motion, with no trade behind it, keep flying.
     let direction = if target > hole { 1 } else { -1 };
     let mut relisted = false;
     while hole != target {
@@ -5417,9 +5435,11 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
     overlay.put(&sq_w, from.0, from.1);
     // A stand-in holds the landing slot — the hole's old slot, which is where
     // the square is headed — so the row never narrows and nothing downstream
-    // moves.
+    // moves. Named `held:`, not `gap:`: the row's geometry counts it as
+    // occupied (its square is on the way), which is what keeps the gap
+    // tracking honest while the slide is in the air.
     let stand_in = GtkBox::new(Orientation::Horizontal, 0);
-    stand_in.set_widget_name(GAP_NAME);
+    stand_in.set_widget_name(HELD_NAME);
     stand_in.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
     put_child(tasks, stand_in.upcast_ref(), hole);
     if menu_debug() {
@@ -5435,13 +5455,14 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
     TRADE_FLIGHT.with(|flight| {
         *flight.borrow_mut() = Some(TradeFlight {
             square: sq_w.clone(),
-            stand_in: stand_in.upcast(),
+            stand_in: stand_in.clone().upcast(),
             tasks: tasks.clone(),
             flight_id,
         });
     });
     let square = sq_w;
     let layer_box = overlay.clone();
+    let stand_in = stand_in.upcast::<gtk4::Widget>();
     glib::timeout_add_local(Duration::from_millis(16), move || {
         let alive = TRADE_FLIGHT.with(|flight| {
             flight.borrow().as_ref().is_some_and(|fl| fl.flight_id == flight_id)
@@ -5449,6 +5470,13 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
         if !alive {
             return glib::ControlFlow::Break;
         }
+        // Retargeted every frame from the stand-in's *live* position, not the
+        // position captured at the trade: a reversal can swap the stand-in to
+        // a different slot mid-flight, and the square must then land where the
+        // stand-in now is, not where it stood when the flight began.
+        let to = stand_in
+            .translate_coordinates(&layer_box, 0.0, 0.0)
+            .unwrap_or(to);
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
         let (x, y) = flight_xy(from, to, t);
@@ -5466,10 +5494,10 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
 ///
 /// The flight carries its own row, so landing works wherever the trade ran —
 /// the bar, or a test harness with no bar at all. The stand-in marks the
-/// landing slot; it never moves while a flight is active, but it is read live
-/// rather than trusted from the trade, so a rebuild between the trade and the
-/// landing cannot strand the square. Returns whether there was a flight to
-/// land.
+/// landing slot and is read live rather than trusted from the trade, so a
+/// rebuild — or a reversal that swapped the stand-in to a new slot mid-flight —
+/// cannot strand the square: it lands wherever the stand-in now stands.
+/// Returns whether there was a flight to land.
 fn land_flight() -> bool {
     let flight = TRADE_FLIGHT.with(|flight| flight.borrow_mut().take());
     let Some(fl) = flight else {
@@ -7597,9 +7625,15 @@ mod tests {
             return;
         }
         // Mid-flight the square is out of the row and riding the layer, with
-        // the row holding its width so nothing downstream moved.
+        // the row holding its width so nothing downstream moved. The landing
+        // slot is counted as occupied — its square is on the way — so the row
+        // measures two middles: the held slot and `c`. Only the drag hole is
+        // ever skipped, and a held slot is what keeps the gap tracking honest
+        // while a slide is in the air.
         assert_eq!(layered(), 1, "the square never left for the layer");
         assert_eq!(order(), ["", "", "c"], "the row lost its width mid-flight");
+        let geo = row_geometry(&tasks);
+        assert_eq!(geo.middles.len(), 2, "the held slot did not count as occupied");
         // Real time, not pumped frames: the flight lands on its own clock.
         let start = std::time::Instant::now();
         while flight_active() && start.elapsed() < Duration::from_secs(3) {
