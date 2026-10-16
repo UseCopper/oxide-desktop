@@ -207,8 +207,8 @@ fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
     (ease(elapsed / PHASE_END), false)
 }
 
-/// How far a press has to travel before it is reported as a drag rather than
-/// tracked as a click in waiting. Twice GTK's own double-click radius, so a
+/// How far a press has to travel before it lifts its square and becomes a drag
+/// rather than staying a click. Twice GTK's own double-click radius, so a
 /// jittered click cannot read as a drag.
 const DRAG_LOG_THRESHOLD: f64 = 16.0;
 /// How long a window takes to fade in or out, separately from the width, because
@@ -232,18 +232,12 @@ const HOVER_GRACE: Duration = Duration::from_millis(60);
 /// How long the pointer must rest on a square before its menu opens. Long enough
 /// that travelling along the bar does not open a menu for every square crossed.
 const HOVER_OPEN: Duration = Duration::from_millis(250);
-/// How long a press on a square is armed before it acts.
-///
-/// Long enough that a press which becomes a drag is not also a click — a square
-/// cannot be brought forward and picked up at once — and short enough that a click is
-/// not left feeling slow. A release beats it, so a plain click acts immediately.
-/// How long a press may last before the hold is read as a drag rather than a click.
-///
-/// The gesture a square answers to: press and let go quickly and it opens its windows,
-/// press and hold — or move while pressed — and it is picked up. There is deliberately no
-/// hold-to-activate underneath this any more. There used to be one, firing at 180ms, and
-/// the two could not both be true: holding a square for a quarter of a second activated
-/// the app *and then* picked the square up.
+/// How the press on a square answers: press and let go quickly and it opens its
+/// windows, move past [`DRAG_LOG_THRESHOLD`] while held and the square is picked
+/// up instead. There is deliberately no hold-to-activate underneath this any more.
+/// There used to be one, firing at 180ms, and the two could not both be true:
+/// holding a square for a quarter of a second activated the app *and then* picked
+/// the square up.
 
 /// How long to wait for every preview before showing the menu anyway.
 ///
@@ -3310,7 +3304,6 @@ impl Square {
 
         square.wire_hover(menu, context, stream);
         square.wire_click(stream, menu, context);
-        square.wire_drag();
         square.wire_context(context, menu);
         square.refresh();
 
@@ -3502,114 +3495,6 @@ impl Square {
             let windows = group_for_key(&key);
             square_click(&button, &stream, &key, &windows, &menu, &context);
         });
-    }
-
-    /// Dragging is disabled.
-    ///
-    /// The square used to carry a full drag-and-reorder under `OXIDE_PANEL_DRAG`,
-    /// and after five attempts across as many sessions it kept tearing the bar
-    /// apart. Everything that made a drag real — the carried layer, the
-    /// placeholder, the reorder — still exists below, disconnected. Until the
-    /// next attempt is written, a drag is only *reported*: with
-    /// `OXIDE_PANEL_DEBUG` set the gesture is attached and logs where the
-    /// pointer went, and nothing in the bar ever moves. Without the debug flag
-    /// no gesture is attached at all.
-    fn wire_drag(&self) {
-        let key = self.key.clone();
-        let gesture = gtk4::GestureDrag::new();
-        gesture.set_button(gdk::BUTTON_PRIMARY);
-        // The pointer's row position where the press went down (the square's
-        // place in the row plus the gesture's own start point), captured at
-        // drag-begin while the square is still in the row. Travel is measured
-        // against it; the lift happens wherever along that travel the
-        // threshold is crossed.
-        let start_row: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        {
-            let start_row = start_row.clone();
-            let begin_key = key.clone();
-            gesture.connect_drag_begin(move |g, _, _| {
-                // A fresh press: the last press's drag has no claim on its
-                // click.
-                CLICK_IS_DRAG.set(false);
-                let start = g.start_point();
-                if let (Some((left, _)), Some((sx, _))) = (
-                    tasks_box().and_then(|tasks| {
-                        square_for(&tasks, &begin_key).and_then(|button| {
-                            button.translate_coordinates(&tasks, 0.0, 0.0)
-                        })
-                    }),
-                    start,
-                ) {
-                    start_row.set(Some((left + sx, left)));
-                }
-            });
-        }
-        {
-            let start_row = start_row.clone();
-            let update_key = key.clone();
-            let lift_key = key.clone();
-            gesture.connect_drag_update(move |_, offset_x, _| {
-                let Some((row_start, _origin_left)) = start_row.get() else {
-                    return;
-                };
-                let pointer_x = row_start + offset_x;
-                if !drag_active() {
-                    // Not lifted yet: only the threshold stands between a
-                    // click and a drag. Past it, the square leaves the row and
-                    // starts riding the pointer -- and this same move already
-                    // carries it, so nothing waits a frame.
-                    if offset_x.abs() >= DRAG_LOG_THRESHOLD {
-                        drag_begin(&lift_key);
-                        if drag_active() {
-                            DRAG.with(|drag| {
-                                if let Some(state) = drag.borrow().as_ref() {
-                                    state.borrow().pointer_meet(pointer_x);
-                                }
-                            });
-                            if menu_debug() {
-                                eprintln!(
-                                    "oxide-panel: drag {update_key:?} lifted at ({pointer_x:.1}, row start {row_start:.1})"
-                                );
-                            }
-                            if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
-                                tasks.queue_allocate();
-                            }
-                        }
-                    }
-                    return;
-                }
-                if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
-                    tasks.queue_allocate();
-                }
-            });
-        }
-        {
-            let end_key = key.clone();
-            gesture.connect_drag_end(move |_, _, _| {
-                start_row.set(None);
-                if drag_active() {
-                    let moved = drag_end();
-                    if moved {
-                        glib::idle_add_local_once(|| rebuild_bar());
-                    }
-                    if menu_debug() {
-                        eprintln!("oxide-panel: drag {end_key:?} ended (moved: {moved})");
-                    }
-                }
-            });
-        }
-        // A cancelled gesture is a release that never came: the square is still
-        // lifted, and nothing else would put it back. It is dropped where it sits,
-        // exactly as a release would have dropped it.
-        gesture.connect_cancel(move |_, _| {
-            if drag_active() {
-                let moved = drag_end();
-                if moved {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
-            }
-        });
-        self.button.add_controller(gesture);
     }
 
     /// The right click: the app's menu of actions.
@@ -4581,6 +4466,9 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // pointer's attention going somewhere the menu is not, so the menu loses it
     // there the same way it loses it to a square.
     watch_bar_click_off(&bar_row, &context);
+    // Reorder the squares by dragging. One gesture on the row, wired once: the
+    // row outlives every square in it, so the tracking survives the lift.
+    watch_bar_drag(&tasks);
 
     if let Some(stream) = socket {
         channel.send(&format!("accent\t{:.6}\t{:.6}\t{:.6}", accent_rgb().0, accent_rgb().1, accent_rgb().2));
@@ -4664,6 +4552,145 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
 
     window.set_child(Some(&overlay));
     (window, row, tasks)
+}
+
+/// Reorder the squares by dragging: past [`DRAG_LOG_THRESHOLD`] the pressed
+/// square leaves the row and rides the pointer, trading slots with every
+/// neighbour it crosses, and the drop is committed to the remembered order. A
+/// press that never travels that far stays a click, decided by [`square_click`].
+///
+/// One gesture on the row, not one per square. A drag gesture reports its
+/// offsets in its own widget's coordinates, so a gesture owned by the square
+/// being carried corrupts its own tracking the moment the square is lifted:
+/// every move of the carried square shifts what the offsets mean, the pointer
+/// freezes in place, and the neighbours never trade. The row never moves, so
+/// its offsets stay honest for the whole gesture — and lifting the square out
+/// of it cannot cancel the gesture either.
+///
+/// Wired once per bar, alongside [`watch_bar_click_off`]: the row outlives every
+/// square in it.
+fn watch_bar_drag(tasks: &GtkBox) {
+    let gesture = gtk4::GestureDrag::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+    // The press this gesture is tracking: the pointer's row position and the app
+    // whose square was under it. The begin coordinates arrive in the row's own
+    // space, so there is nothing to measure against a square that is about to
+    // leave it.
+    let pressed: Rc<RefCell<Option<(f64, String)>>> = Rc::new(RefCell::new(None));
+    {
+        let pressed = pressed.clone();
+        let row = tasks.clone();
+        gesture.connect_drag_begin(move |_, start_x, start_y| {
+            // A fresh press: the last press's drag has no claim on its click.
+            CLICK_IS_DRAG.set(false);
+            *pressed.borrow_mut() =
+                square_at(&row, start_x, start_y).map(|app| (start_x, app));
+        });
+    }
+    {
+        let pressed = pressed.clone();
+        gesture.connect_drag_update(move |_, offset_x, offset_y| {
+            let Some((row_start, app)) = pressed.borrow().clone() else {
+                return;
+            };
+            if drag_active() {
+                // A second press landing mid-drag is not the drag: only the carried
+                // square's own press drives it.
+                let mine = DRAG.with(|drag| {
+                    drag.borrow()
+                        .as_ref()
+                        .map(|state| state.borrow().app.clone())
+                });
+                if mine.as_deref() != Some(app.as_str()) {
+                    return;
+                }
+                let pointer_x = row_start + offset_x;
+                if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                    tasks.queue_allocate();
+                }
+                return;
+            }
+            // Not lifted yet: only the threshold stands between a click and a
+            // drag. Past it, the square leaves the row and starts riding the
+            // pointer -- and this same move already carries it, so nothing waits
+            // a frame. Total travel, not horizontal alone: a press dragged
+            // straight down is no more a click than one dragged sideways, and
+            // leaving the vertical out let it fall through to activate.
+            if offset_x.abs() + offset_y.abs() >= DRAG_LOG_THRESHOLD {
+                let pointer_x = row_start + offset_x;
+                drag_begin(&app);
+                if drag_active() {
+                    DRAG.with(|drag| {
+                        if let Some(state) = drag.borrow().as_ref() {
+                            state.borrow().pointer_meet(pointer_x);
+                        }
+                    });
+                    if menu_debug() {
+                        eprintln!(
+                            "oxide-panel: drag {app:?} lifted at ({pointer_x:.1}, row start {row_start:.1})"
+                        );
+                    }
+                    if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                        tasks.queue_allocate();
+                    }
+                }
+            }
+        });
+    }
+    {
+        let pressed = pressed.clone();
+        gesture.connect_drag_end(move |_, _, _| {
+            let taken = pressed.borrow_mut().take();
+            if drag_active() {
+                let moved = drag_end();
+                if moved {
+                    glib::idle_add_local_once(|| rebuild_bar());
+                }
+                if menu_debug() {
+                    eprintln!("oxide-panel: drag {:?} ended (moved: {moved})", taken);
+                }
+            }
+        });
+    }
+    // A cancelled gesture is a release that never came: the square is still
+    // lifted, and nothing else would put it back. It is dropped where it sits,
+    // exactly as a release would have dropped it.
+    gesture.connect_cancel(move |_, _| {
+        pressed.borrow_mut().take();
+        if drag_active() {
+            let moved = drag_end();
+            if moved {
+                glib::idle_add_local_once(|| rebuild_bar());
+            }
+        }
+    });
+    tasks.add_controller(gesture);
+}
+
+/// The app whose square is under this point in the row, if any.
+///
+/// Hit-tested the way a click off the bar is told apart from one on a square,
+/// so the two cannot disagree about what counts as one. Placeholders are not
+/// squares, and neither is the gap between them.
+fn square_at(tasks: &GtkBox, x: f64, y: f64) -> Option<String> {
+    let mut cursor = tasks.first_child();
+    while let Some(widget) = cursor {
+        cursor = widget.next_sibling();
+        let square = widget.upcast::<gtk4::Widget>();
+        if square.downcast_ref::<Button>().is_none() {
+            continue;
+        }
+        if let Some((left, top)) = square.translate_coordinates(tasks, 0.0, 0.0)
+            && x >= left
+            && x <= left + f64::from(square.width())
+            && y >= top
+            && y <= top + f64::from(square.height())
+            && let Some(app) = app_of(&square)
+        {
+            return Some(app);
+        }
+    }
+    None
 }
 
 /// Close the right-click menu when a click lands on the bar but off its squares.
@@ -5019,8 +5046,10 @@ fn row_geometry(tasks: &GtkBox) -> RowGeometry {
     while let Some(widget) = child {
         let square = widget.upcast::<gtk4::Widget>();
         // A square that has not been allocated yet has no position, and contributes
-        // nothing to the row either. The hole is skipped: it is not a square.
-        if square.widget_name() != GAP_NAME
+        // nothing to the row either. The hole is skipped: it is not a square. Matched
+        // the same way `app_of` recognises it, so the two cannot disagree about what
+        // counts.
+        if !square.widget_name().starts_with(GAP_NAME)
             && let Some((left, _)) = square.translate_coordinates(tasks, 0.0, 0.0)
         {
             middles.push(left + f64::from(square.width()) / 2.0);
@@ -5314,11 +5343,23 @@ fn carried_square_count() -> usize {
 
 /// Put the square down where it was dropped, and remember it.
 ///
-/// Returns whether it actually moved, which is what tells a press that picked a square up
-/// and put it straight back from one that rearranged the bar.
+/// Returns whether the remembered order changed, which is what decides a rebuild:
+/// a press that picked a square up and put it straight back is not a change, and
+/// neither is trading with a synthetic square the saved order never lists — the row
+/// already shows both, so there is nothing for a rebuild to do.
 fn drag_end() -> bool {
     let state = DRAG.with(|drag| drag.borrow_mut().take());
-    let (Some(state), Some(tasks), Some(overlay)) = (state, tasks_box(), carried_layer()) else {
+    let (Some(state), Some(tasks)) = (state, tasks_box()) else {
+        return false;
+    };
+    // A look, not a build: this runs on the way down, and building a carried layer
+    // here would leave a widget over the bar with nothing in it. If the layer is
+    // already gone there is nothing carried, but a leftover placeholder must still
+    // come out, or the row keeps a hole nothing will ever fill.
+    let Some(overlay) = existing_carried_layer() else {
+        if let Some(placeholder) = placeholder_for(&tasks) {
+            tasks.remove(&placeholder);
+        }
         return false;
     };
     let app = state.borrow().app.clone();
@@ -5359,8 +5400,7 @@ fn drag_end() -> bool {
     if menu_debug() {
         eprintln!("oxide-panel: {app:?} moved to {index}");
     }
-    persist_row_order(&tasks);
-    true
+    persist_row_order(&tasks)
 }
 
 /// Move an app's square to a place in the bar, and remember it.
@@ -5381,7 +5421,11 @@ fn place_at(id: &str, index: usize) {
 /// apps, while the row also holds synthetic squares that the order never lists, so an
 /// index into one is not an index into the other. Apps the row does not show keep
 /// their places after the visible ones.
-fn persist_row_order(tasks: &GtkBox) {
+///
+/// Returns whether the remembered order changed: trading places with a synthetic
+/// square leaves the saved order untouched, and the caller uses that to skip a
+/// rebuild the row does not need.
+fn persist_row_order(tasks: &GtkBox) -> bool {
     let mut visible: Vec<String> = Vec::new();
     let mut cursor = tasks.first_child();
     while let Some(widget) = cursor {
@@ -5407,6 +5451,7 @@ fn persist_row_order(tasks: &GtkBox) {
     if changed {
         save_layout();
     }
+    changed
 }
 
 /// The box the squares are in, while there is a bar.
@@ -7128,11 +7173,14 @@ mod tests {
     }
 
     #[test]
-    fn the_gap_under_the_pointer_is_measured_against_the_row_with_the_placeholder_in_it() {
-        // The placeholder is a child of the row like any other, so it contributes a
-        // middle of its own. That is deliberate: the hole the carried square leaves is
-        // exactly as wide as the square, and the pointer has to cross it to move the gap
-        // on by one place.
+    fn the_gap_under_the_pointer_is_measured_against_the_squares_around_the_hole() {
+        // The placeholder is a child of the row but contributes no middle: its middle
+        // is where the hole is, not a square the pointer can have passed. Counting it
+        // made every rightward crossing trade one slot too far, so `row_geometry`
+        // measures squares only and the cases below are middles with the hole's slot
+        // missing. The hole the carried square leaves is still exactly as wide as the
+        // square, and the pointer still has to cross a neighbour's middle to move the
+        // gap on by one place.
         let row = four_squares();
         // Before the first square, after the last, and either side of each middle.
         assert_eq!(row.gap_at(4.0), 0);
@@ -7265,6 +7313,68 @@ mod tests {
         let middles = [18.0, 58.0, 138.0];
         assert_eq!(gap_at(&middles, 120.0), 2, "passed slot 1 only: still the hole's slot");
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
+    }
+
+    #[test]
+    fn a_live_row_trades_neighbours_as_the_pointer_crosses_them() {
+        // The arithmetic above proves the mapping; this proves the machinery it
+        // drives: real squares, a real layout, the real `row_geometry` and the
+        // real `swap_row_slots`. Needs a display — without one there is nothing
+        // to lay out and nothing to measure, so it passes silently instead of
+        // failing loudly.
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        for app in ["a", "b", "c", "d"] {
+            let square = Button::new();
+            square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+            tasks.append(&square);
+        }
+        let window = gtk4::Window::new();
+        window.set_child(Some(&tasks));
+        window.present();
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        let order = || {
+            let mut apps = Vec::new();
+            let mut cursor = tasks.first_child();
+            while let Some(widget) = cursor {
+                apps.push(app_of(&widget).unwrap_or_default());
+                cursor = widget.next_sibling();
+            }
+            apps
+        };
+        // No allocation, no measurement: a headless run that initialised GTK
+        // against nothing real. Skip rather than assert the harness.
+        if order() != ["a", "b", "c", "d"] {
+            return;
+        }
+        let geo = row_geometry(&tasks);
+        if geo.middles.len() != 4 || geo.middles.iter().any(|m| *m <= 0.0) {
+            return;
+        }
+        // The pointer just past the second square's middle names slot 2, and
+        // trading the hole there leaves every other square where it stood.
+        assert_eq!(geo.gap_at(geo.middles[1] + 1.0), 2);
+        swap_row_slots(&tasks, 0, 1);
+        swap_row_slots(&tasks, 1, 2);
+        assert_eq!(order(), ["b", "c", "a", "d"]);
+        // The placeholder reads as a hole, not a square: four middles still,
+        // with the hole's slot missing from them.
+        let hole = GtkBox::new(Orientation::Horizontal, 0);
+        hole.set_widget_name(GAP_NAME);
+        hole.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        put_child(&tasks, hole.upcast_ref(), 0);
+        for _ in 0..100 {
+            glib::MainContext::default().iteration(false);
+        }
+        let geo = row_geometry(&tasks);
+        assert_eq!(geo.middles.len(), 4, "the hole counted as a square");
+        assert_eq!(order().len(), 5);
+        window.close();
     }
 
     #[test]
