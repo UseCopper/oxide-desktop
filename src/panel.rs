@@ -5357,11 +5357,38 @@ fn drag_update(pointer_x: f64) -> bool {
     // trade that fires while another square is still flying lands it first, so
     // a fling chains pixel-correctly — and slides that are merely overtaken by
     // pointer motion, with no trade behind it, keep flying.
+    //
+    // The slots' own geometry is read ONCE, before any of it: a chained trade
+    // re-parents the placeholder to a slot the previous frame never laid out,
+    // and coordinates measured through a freshly re-parented widget are its
+    // last allocation — a whole slot off, which is where a chained flight's
+    // target used to drift sideways. Widths are uniform, so a slot's x holds
+    // across every relist in the chain and the snapshot stays honest.
+    let slots: Vec<Option<(f64, f64)>> = {
+        let mut slots = Vec::new();
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            slots.push(widget.translate_coordinates(&tasks, 0.0, 0.0));
+            cursor = widget.next_sibling();
+        }
+        slots
+    };
     let direction = if target > hole { 1 } else { -1 };
     let mut relisted = false;
     while hole != target {
         let next = (hole as isize + direction) as usize;
-        trade_slots(&tasks, &overlay, hole, next);
+        let (Some(from), Some(to)) = (
+            slots.get(next).copied().flatten(),
+            slots.get(hole).copied().flatten(),
+        ) else {
+            // A slot with no allocation yet has no honest geometry: relist it
+            // plainly rather than fly it somewhere made up.
+            swap_row_slots(&tasks, hole, next);
+            hole = next;
+            relisted = true;
+            continue;
+        };
+        trade_slots_with(&tasks, &overlay, hole, next, from, to);
         hole = next;
         relisted = true;
     }
@@ -5481,6 +5508,49 @@ fn raise_carried(layer: &gtk4::Fixed) {
 
 /// Trade two neighbouring slots, flying the square home.
 ///
+/// Production trades come only from [`drag_update`], which chains them, snaps
+/// the row's geometry once and drives [`trade_slots_with`] itself. This wrapper
+/// is for the widget tests: both children are still where they were allocated,
+/// so it reads fresh and delegates.
+#[cfg(test)]
+fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) {
+    // A single trade reads fresh and exactly: both children are still where
+    // they were allocated, so this reads and delegates. The chain in
+    // `drag_update` uses [`trade_slots_with`] instead, with geometry it snapped
+    // once — re-parented widgets answer with their last allocation, and a
+    // chained read would be a whole slot off.
+    let layer = overlay.clone().upcast::<gtk4::Widget>();
+    let (Some(hole_w), Some(sq_w)) = (children_at(tasks, hole), children_at(tasks, next)) else {
+        return;
+    };
+    let (Some(from), Some(to)) = (
+        sq_w.translate_coordinates(&layer, 0.0, 0.0),
+        hole_w.translate_coordinates(&layer, 0.0, 0.0),
+    ) else {
+        swap_row_slots(tasks, hole, next);
+        return;
+    };
+    trade_slots_with(tasks, overlay, hole, next, from, to);
+}
+
+/// The widget at a slot in the row.
+#[cfg(test)]
+fn children_at(tasks: &GtkBox, slot: usize) -> Option<gtk4::Widget> {
+    let mut cursor = tasks.first_child();
+    let mut index = 0usize;
+    while let Some(widget) = cursor {
+        if index == slot {
+            return Some(widget);
+        }
+        index += 1;
+        cursor = widget.next_sibling();
+    }
+    None
+}
+
+/// Trade two neighbouring slots, flying the square home, on geometry the caller
+/// already snapped.
+///
 /// The hole moves instantly — it is invisible either way — while the square it
 /// trades with slides across the overlay from its old slot to its new one on
 /// an ease-out curve. The row itself keeps its width the whole way: a stand-in
@@ -5489,8 +5559,17 @@ fn raise_carried(layer: &gtk4::Fixed) {
 ///
 /// `hole` is the placeholder's slot and `next` the square's, as in
 /// [`swap_row_slots`], which this falls back to whenever the row is not the
-/// shape a trade needs.
-fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) {
+/// shape a trade needs. `from_content` and `to_content` are the two slots'
+/// positions as content-origin reads in the row — this is what turns them into
+/// the carried layer's border-box coordinates.
+fn trade_slots_with(
+    tasks: &GtkBox,
+    overlay: &gtk4::Fixed,
+    hole: usize,
+    next: usize,
+    from_content: (f64, f64),
+    to_content: (f64, f64),
+) {
     let children: Vec<gtk4::Widget> = {
         let mut children = Vec::new();
         let mut cursor = tasks.first_child();
@@ -5510,21 +5589,13 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
         swap_row_slots(tasks, hole, next);
         return;
     }
-    let layer = overlay.clone().upcast::<gtk4::Widget>();
-    let (Some(from), Some(to)) = (
-        sq_w.translate_coordinates(&layer, 0.0, 0.0),
-        hole_w.translate_coordinates(&layer, 0.0, 0.0),
-    ) else {
-        swap_row_slots(tasks, hole, next);
-        return;
-    };
     // Reads are content origins (every translate takes the border inset
     // through); GtkFixed positions children by their border box, so the border
     // comes off once here. Without it the flying square lands one border-box
     // out on every axis — the padding the pointer used to see.
     let inset: f64 = f64::from(SQUARE_BORDER);
-    let from = (from.0 - inset, from.1 - inset);
-    let to = (to.0 - inset, to.1 - inset);
+    let from = (from_content.0 - inset, from_content.1 - inset);
+    let to = (to_content.0 - inset, to_content.1 - inset);
     // Whatever is still flying lands first, so there is ever one hole in the
     // row and the gap mapping keeps counting squares only.
     land_flight();
@@ -7665,7 +7736,29 @@ mod tests {
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
     }
 
+    /// The widget behaviour, tested against a real GTK on the main thread.
+    ///
+    /// GTK owns one thread per process, so every display-backed check lives in
+    /// this one test, run strictly in order: a parallel suite would hand each
+    /// its own libtest thread, and the second `gtk4::init` would assert. Each
+    /// section skips silently without a display.
     #[test]
+    fn the_widget_suite_dances_in_one_process() {
+        // The display check comes first: half-initialising GTK with no X
+        // server is a crash waiting to happen, and `gtk4::init` alone is not
+        // enough of a guard.
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        if gtk4::init().is_err() {
+            return;
+        }
+        a_square_in_the_layer_sits_exactly_where_it_sat_in_the_row();
+        a_traded_square_slides_home_across_the_overlay();
+        a_live_row_trades_neighbours_as_the_pointer_crosses_them();
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_square_in_the_layer_sits_exactly_where_it_sat_in_the_row() {
         // The user saw extra padding above a carried square and below a flying
         // one. Both live in the carried layer, and the layer's own geometry —
@@ -7676,12 +7769,6 @@ mod tests {
         // display check comes first: GTK half-initialising with no X server is
         // a crash waiting to happen, and `gtk4::init` alone is not enough of a
         // guard.
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return;
-        }
-        if gtk4::init().is_err() {
-            return;
-        }
         let provider = gtk4::CssProvider::new();
         provider.load_from_data(&style_sheet((80, 160, 240)));
         if let Some(display) = gdk::Display::default() {
@@ -7839,14 +7926,11 @@ mod tests {
         assert!(x < 29.0, "the mirror eases the same way: {x}");
     }
 
-    #[test]
+    /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_traded_square_slides_home_across_the_overlay() {
         // The trade commits instantly in the row while the square itself flies
         // the overlay from its old slot to its new one. Needs a display, like
         // the live row test above, and passes silently without one.
-        if gtk4::init().is_err() {
-            return;
-        }
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
         let hole = GtkBox::new(Orientation::Horizontal, 0);
         hole.set_widget_name(GAP_NAME);
@@ -7917,19 +8001,76 @@ mod tests {
         assert!(!flight_active(), "the flight never landed");
         assert_eq!(order(), ["b", "", "c"], "the square landed anywhere but home");
         assert_eq!(layered(), 0, "the layer kept the square after landing");
+        // A chain, as drag_update drives it: the row's geometry is snapped ONCE
+        // and every trade in the walk reads its start and finish from that
+        // snapshot. Re-parenting a widget between trades leaves its allocation
+        // stale, and a chained read would target a slot off — the sideways
+        // padding a two-slot fling showed. trade_slots_with takes the snapshot
+        // the way the production chain does.
+        let tasks2 = GtkBox::new(Orientation::Horizontal, 2);
+        tasks2.append(&ghost(GAP_NAME));
+        for app in ["b", "c", "d"] {
+            let square = Button::new();
+            square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+            tasks2.append(&square);
+        }
+        let layer2 = gtk4::Fixed::new();
+        layer2.set_halign(gtk4::Align::Fill);
+        layer2.set_valign(gtk4::Align::Fill);
+        let column2 = GtkBox::new(Orientation::Vertical, 0);
+        column2.append(&tasks2);
+        column2.append(&layer2);
+        let window2 = gtk4::Window::new();
+        window2.set_child(Some(&column2));
+        window2.present();
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        let order2 = || {
+            let mut apps = Vec::new();
+            let mut cursor = tasks2.first_child();
+            while let Some(widget) = cursor {
+                apps.push(app_of(&widget).unwrap_or_default());
+                cursor = widget.next_sibling();
+            }
+            apps
+        };
+        if order2() == ["", "b", "c", "d"] {
+            let layer_widget = layer2.clone().upcast::<gtk4::Widget>();
+            let mut slots = Vec::new();
+            let mut cursor = tasks2.first_child();
+            while let Some(widget) = cursor {
+                slots.push(widget.translate_coordinates(&layer_widget, 0.0, 0.0));
+                cursor = widget.next_sibling();
+            }
+            let (Some(hole_x), Some(slots_b), Some(slots_c)) = (slots[0], slots[1], slots[2]) else {
+                // No honest geometry in this frame: skip rather than trust it.
+                window2.close();
+                window.close();
+                return;
+            };
+            // Two-slot fling of the hole: b trades out of slot 1, then c.
+            trade_slots_with(&tasks2, &layer2, 0, 1, slots_b, hole_x);
+            trade_slots_with(&tasks2, &layer2, 1, 2, slots_c, slots_b);
+            let start = std::time::Instant::now();
+            while flight_active() && start.elapsed() < Duration::from_secs(4) {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(order2(), ["b", "c", "", "d"], "the chained fling mislaid a slot");
+            window2.close();
+        }
         window.close();
     }
 
-    #[test]
+        /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_live_row_trades_neighbours_as_the_pointer_crosses_them() {
         // The arithmetic above proves the mapping; this proves the machinery it
         // drives: real squares, a real layout, the real `row_geometry` and the
         // real `swap_row_slots`. Needs a display — without one there is nothing
         // to lay out and nothing to measure, so it passes silently instead of
         // failing loudly.
-        if gtk4::init().is_err() {
-            return;
-        }
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
         for app in ["a", "b", "c", "d"] {
             let square = Button::new();
@@ -7982,7 +8123,7 @@ mod tests {
         window.close();
     }
 
-    #[test]
+        #[test]
     fn a_moving_menu_slides_from_where_it_was_to_where_it_is_going() {
         // A move eases the left margin, which `animate_surface` cannot do because an
         // open and a close have nowhere to slide to.
