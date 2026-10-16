@@ -5112,6 +5112,11 @@ struct DragState {
     /// Where its top left corner is in the carried layer, which is what the pointer's
     /// travel is added to.
     carried_at: (f64, f64),
+    /// Where the carried square stands *now*, in the same corner coordinates as
+    /// `carried_at`. A trade that puts a flyer into the layer re-stacks the
+    /// carried square on top of it, and that re-put needs the position the
+    /// pointer had already moved it to.
+    position: Cell<(f64, f64)>,
     /// The pointer position at the moment the gap last moved, for hysteresis: a
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
@@ -5235,11 +5240,8 @@ fn drag_begin(app: &str) {
     // its *border* box, so the read has the border subtracted once here, or the
     // carried square lands one border-box out on every axis the moment it is
     // lifted — the padding the pointer used to see.
-    overlay.put(
-        &square,
-        left - f64::from(SQUARE_BORDER),
-        top - f64::from(SQUARE_BORDER),
-    );
+    let put = (left - f64::from(SQUARE_BORDER), top - f64::from(SQUARE_BORDER));
+    overlay.put(&square, put.0, put.1);
 
     if menu_debug() {
         eprintln!(
@@ -5252,7 +5254,13 @@ fn drag_begin(app: &str) {
             app: app.to_string(),
             gap: index,
             original: index,
-            carried_at: (left, top),
+            // The same border-box corner the square was just put at — NOT the
+            // content read above. The first pointer motion adds the travel to
+            // these and repositions with it, and a mismatched corner would
+            // teleport the glyph a pixel down, exactly where the drag felt
+            // padded.
+            carried_at: put,
+            position: Cell::new(put),
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
             meet_x: Cell::new(f64::NAN),
         })));
@@ -5317,6 +5325,7 @@ fn drag_update(pointer_x: f64) -> bool {
     // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no
     // parent, and this square has been in the fixed since the drag began.
     overlay.move_(&square, x, y);
+    state.borrow().position.set((x, y));
 
     // The gap is measured against the row as it is *now*, with the
     // placeholder in it and every landing slot standing where its flying
@@ -5444,6 +5453,32 @@ fn flight_active() -> bool {
     TRADE_FLIGHT.with(|flight| flight.borrow().is_some())
 }
 
+/// Lift the carried square above whatever the layer has collected since.
+///
+/// A trade inserts its flyer as the layer's last child, and a GtkFixed paints
+/// children in order — the flyer would slide over the square the pointer owns.
+/// This takes the carried square out and puts it straight back in at the
+/// position the drag had already moved it to, which both restores it as the
+/// last child and leaves it exactly where the pointer left it.
+fn raise_carried(layer: &gtk4::Fixed) {
+    let Some((app, pos)) = DRAG.with(|drag| {
+        let running = drag.borrow();
+        let state = running.as_ref()?;
+        let state = state.borrow();
+        Some((state.app.clone(), state.position.get()))
+    }) else {
+        return;
+    };
+    let Some(square) = carried_square(&app) else {
+        return;
+    };
+    // Another widget's child: the put only works on an unparented one.
+    if square.parent().is_some() {
+        square.unparent();
+    }
+    layer.put(&square, pos.0, pos.1);
+}
+
 /// Trade two neighbouring slots, flying the square home.
 ///
 /// The hole moves instantly — it is invisible either way — while the square it
@@ -5500,6 +5535,12 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
     tasks.remove(&sq_w);
     // `put`, not `move`: the square has no parent again from here on.
     overlay.put(&sq_w, from.0, from.1);
+    // The flyer just became the layer's last child, and a GtkFixed draws its
+    // children in child order: it would paint over the square under the
+    // pointer, which is the one that should always be on top. Re-stacking is a
+    // re-put at the position the pointer had reached — unparent, put again, and
+    // the carried square is the last child again.
+    raise_carried(overlay);
     // A stand-in holds the landing slot — the hole's old slot, which is where
     // the square is headed — so the row never narrows and nothing downstream
     // moves. It is a ghost: the same widget machinery as a square, so its
@@ -7656,17 +7697,28 @@ mod tests {
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
         tasks.add_css_class("tasks");
         let mut squares = Vec::new();
+        let mut icons = Vec::new();
         for app in ["a", "b", "c"] {
             let square = Button::new();
             square.add_css_class("task");
             square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            let icon = gtk4::Image::from_icon_name("dialog-information");
+            icon.set_pixel_size(ICON_SIZE);
+            let dots = DrawingArea::new();
+            dots.set_content_width(SQUARE_SIZE - 2 * SQUARE_BORDER);
+            dots.set_content_height(INDICATOR_HEIGHT);
+            dots.set_size_request(SQUARE_SIZE - 2 * SQUARE_BORDER, INDICATOR_HEIGHT);
+            dots.set_valign(gtk4::Align::End);
             let column = GtkBox::new(Orientation::Vertical, 0);
+            column.append(&icon);
+            column.append(&dots);
             square.set_child(Some(&column));
             square.set_valign(gtk4::Align::Center);
             square.set_halign(gtk4::Align::Center);
             square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
             tasks.append(&square);
             squares.push(square);
+            icons.push(icon);
         }
         row.append(&tasks);
         // The carried layer exactly as carried_layer builds it.
@@ -7730,6 +7782,12 @@ mod tests {
         let (left, top) = squares[0]
             .translate_coordinates(&overlay, 0.0, 0.0)
             .unwrap_or((0.0, 0.0));
+        let icon_at_rest = in_overlay(icons[0].upcast_ref());
+        eprintln!(
+            "oxide-test: row button w{} h{} at {left:.1},{top:.1}; icon inside the row at {icon_at_rest:?}",
+            squares[0].width(),
+            squares[0].height(),
+        );
         tasks.remove(&squares[0]);
         layer.put(
             &squares[0],
@@ -7738,15 +7796,18 @@ mod tests {
         );
         settle(&overlay, 320, PANEL_HEIGHT);
         let (dx, dy) = in_overlay(squares[0].upcast_ref());
+        let icon_carried = in_overlay(icons[0].upcast_ref());
         eprintln!(
-            "oxide-test: carried at overlay {dx:.1},{dy:.1} w{} h{} (measured {left:.1},{top:.1})",
+            "oxide-test: carried at overlay {dx:.1},{dy:.1} w{} h{} (measured {left:.1},{top:.1}); \
+             icon carried at {icon_carried:?} (was {icon_at_rest:?})",
             squares[0].width(),
             squares[0].height(),
         );
-        // The read the lift made is the same read the placed square yields:
-        // overlay coordinates are the round trip, border box and all.
+        // The button reads identically, and the icon inside it must neither
+        // move nor jump: the user's remaining 1px was felt on the glyph.
         assert_eq!(dx, left, "carried square x drifted from its measurement");
         assert_eq!(dy, top, "carried square y drifted from its measurement");
+        assert_eq!(icon_carried, icon_at_rest, "the icon moved when the button was lifted");
         assert_eq!(dy, top, "carried square y is exactly what was measured");
         // The flight's target, as trade_slots measures it: a held slot, which is
         // a ghost, so its y is a square's y.
