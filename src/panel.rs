@@ -211,6 +211,10 @@ fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
 /// rather than staying a click. Twice GTK's own double-click radius, so a
 /// jittered click cannot read as a drag.
 const DRAG_LOG_THRESHOLD: f64 = 16.0;
+/// How long a displaced square takes to slide into its new home when a trade
+/// makes a spot for another. A fixed length, so even a fast sweep shows the
+/// slide rather than snapping; a new trade lands whatever is still flying.
+const TRADE_SLIDE: Duration = Duration::from_millis(250);
 /// How long a window takes to fade in or out, separately from the width, because
 /// the two run one after the other rather than together.
 const CELL_FADE: Duration = Duration::from_millis(140);
@@ -5203,8 +5207,9 @@ fn drag_begin(app: &str) {
 /// The carried square rides the pointer; the slot it would land in is the
 /// placeholder's slot, and every time the pointer passes the *middle* of a
 /// neighbouring slot, that slot's square and the placeholder trade places:
-/// the one square moves into the hole, and the hole moves on. Nothing else in
-/// the row shifts, which is the whole point of swaps over a sliding gap.
+/// the one square slides into the hole on an ease-out curve, and the hole
+/// moves on. Nothing else in the row shifts, which is the whole point of swaps
+/// over a sliding gap.
 ///
 /// A fast fling across several slots is applied one swap at a time, so the
 /// squares the pointer swept past end up where a slow sweep would have left
@@ -5238,6 +5243,10 @@ fn drag_update(pointer_x: f64) -> bool {
     // parent, and this square has been in the fixed since the drag began.
     overlay.move_(&square, x, y);
 
+    // Whatever is still flying lands first: the gap is measured against the
+    // row as it is *now*, and a row with two holes in it is not a row the
+    // mapping knows how to count.
+    land_flight();
     // The gap is measured against the row as it is *now*, with the
     // placeholder in it, so the hole and the squares swap on the same rails.
     let mut hole = state.borrow().gap;
@@ -5251,12 +5260,21 @@ fn drag_update(pointer_x: f64) -> bool {
         return false;
     }
     // Swaps run one slot at a time towards the pointer, so a fling across
-    // several squares leaves them exactly as a slow sweep would have.
+    // several squares leaves them exactly as a slow sweep would have. Each
+    // trade flies its square home; a trade that starts while the last is still
+    // flying lands it first, so intermediate snaps are pixel-correct and only
+    // the last trade animates.
+    // With short flights every trade slides, so crossing several slots in
+    // one motion flies each square in turn and they land one after another
+    // rather than all at once. That reads as a chain. For a slower hand to
+    // see each slide, every trade keeps its full 250ms.
+    // With a 250ms slide each trade stays on screen long enough to read; new
+    // trades land whatever is still flying, so fast sweeps never queue.
     let direction = if target > hole { 1 } else { -1 };
     let mut relisted = false;
     while hole != target {
         let next = (hole as isize + direction) as usize;
-        swap_row_slots(&tasks, hole, next);
+        trade_slots(&tasks, &overlay, hole, next);
         hole = next;
         relisted = true;
     }
@@ -5300,6 +5318,183 @@ fn swap_row_slots(tasks: &GtkBox, a: usize, b: usize) {
     }
 }
 
+/// One displaced square on its way home: the trade has committed, and the
+/// square is sliding across the overlay from the slot it left to the one it
+/// was given, on [`TRADE_SLIDE`]'s clock.
+struct TradeFlight {
+    /// The square itself, flying. The real widget, not a copy: it stays live
+    /// the whole way, and landing it is putting it back in the row.
+    square: gtk4::Widget,
+    /// The stand-in holding the landing slot open. The same size as a square,
+    /// so the row keeps its width and nothing downstream shifts by a pixel.
+    stand_in: gtk4::Widget,
+    /// The row the flight belongs to, held so landing never depends on global
+    /// bar state that a test — or a teardown — may not have.
+    tasks: GtkBox,
+    /// Which flight this tick belongs to. A new trade lands whatever is still
+    /// flying first, and the old flight's ticks must then stop, not drive the
+    /// new one. The flight's own clock and rails live in its tick closure;
+    /// this is only the generation that lets a stale tick recognise itself.
+    flight_id: u64,
+}
+
+thread_local! {
+    // At most one square is ever flying: a new trade lands the old flight
+    // before it starts, so the row never holds two holes and the gap mapping
+    // never has to count them.
+    static TRADE_FLIGHT: RefCell<Option<TradeFlight>> = const { RefCell::new(None) };
+    static FLIGHT_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Where a trade flight is at this point of its slide.
+///
+/// Eased with the same curve the widths use, so arrivals commit and settle —
+/// and exactly on the ends, so landing needs no correction. Separated from the
+/// widget flying so the arithmetic is testable without a display.
+fn flight_xy(from: (f64, f64), to: (f64, f64), t: f64) -> (f64, f64) {
+    let eased = phase_value(ease_out, t.clamp(0.0, 1.0)).0;
+    (
+        from.0 + (to.0 - from.0) * eased,
+        from.1 + (to.1 - from.1) * eased,
+    )
+}
+
+/// Whether a square is mid-slide. The row already shows the trade; this is only
+/// ever about the picture catching up.
+#[cfg(test)]
+fn flight_active() -> bool {
+    TRADE_FLIGHT.with(|flight| flight.borrow().is_some())
+}
+
+/// Trade two neighbouring slots, flying the square home.
+///
+/// The hole moves instantly — it is invisible either way — while the square it
+/// trades with slides across the overlay from its old slot to its new one on
+/// an ease-out curve. The row itself keeps its width the whole way: a stand-in
+/// holds the landing slot open, so no other square shifts by a pixel and the
+/// slide reads as one square moving, not the row shuffling.
+///
+/// `hole` is the placeholder's slot and `next` the square's, as in
+/// [`swap_row_slots`], which this falls back to whenever the row is not the
+/// shape a trade needs.
+fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) {
+    let children: Vec<gtk4::Widget> = {
+        let mut children = Vec::new();
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            children.push(widget.clone());
+            cursor = widget.next_sibling();
+        }
+        children
+    };
+    let (Some(hole_w), Some(sq_w)) = (children.get(hole).cloned(), children.get(next).cloned())
+    else {
+        return;
+    };
+    if app_of(&hole_w).is_some() || app_of(&sq_w).is_none() {
+        // Not a hole and a square. Relist rather than fly: the row ends up
+        // right either way.
+        swap_row_slots(tasks, hole, next);
+        return;
+    }
+    let layer = overlay.clone().upcast::<gtk4::Widget>();
+    let (Some(from), Some(to)) = (
+        sq_w.translate_coordinates(&layer, 0.0, 0.0),
+        hole_w.translate_coordinates(&layer, 0.0, 0.0),
+    ) else {
+        swap_row_slots(tasks, hole, next);
+        return;
+    };
+    // Whatever is still flying lands first, so there is ever one hole in the
+    // row and the gap mapping keeps counting squares only.
+    land_flight();
+    // The hole takes the square's slot, instantly and invisibly.
+    put_child(tasks, &hole_w, next);
+    // The square leaves the row for the layer, riding from where it stood to
+    // where the hole stood.
+    tasks.remove(&sq_w);
+    // `put`, not `move`: the square has no parent again from here on.
+    overlay.put(&sq_w, from.0, from.1);
+    // A stand-in holds the landing slot — the hole's old slot, which is where
+    // the square is headed — so the row never narrows and nothing downstream
+    // moves.
+    let stand_in = GtkBox::new(Orientation::Horizontal, 0);
+    stand_in.set_widget_name(GAP_NAME);
+    stand_in.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+    put_child(tasks, stand_in.upcast_ref(), hole);
+    if menu_debug() {
+        if let Some(app) = app_of(&sq_w) {
+            eprintln!("oxide-panel: {app:?} sliding home ({from:.0?} to {to:.0?})");
+        }
+    }
+    let flight_id = FLIGHT_GEN.with(|id| {
+        id.set(id.get().wrapping_add(1));
+        id.get()
+    });
+    let start = glib::monotonic_time();
+    TRADE_FLIGHT.with(|flight| {
+        *flight.borrow_mut() = Some(TradeFlight {
+            square: sq_w.clone(),
+            stand_in: stand_in.upcast(),
+            tasks: tasks.clone(),
+            flight_id,
+        });
+    });
+    let square = sq_w;
+    let layer_box = overlay.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let alive = TRADE_FLIGHT.with(|flight| {
+            flight.borrow().as_ref().is_some_and(|fl| fl.flight_id == flight_id)
+        });
+        if !alive {
+            return glib::ControlFlow::Break;
+        }
+        let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+        let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
+        let (x, y) = flight_xy(from, to, t);
+        // `move`, not `put`: the square has been in the layer since the trade.
+        layer_box.move_(&square, x.round(), y.round());
+        if t >= 1.0 {
+            land_flight();
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Put a flying square back in the row, exactly where the row shows it.
+///
+/// The flight carries its own row, so landing works wherever the trade ran —
+/// the bar, or a test harness with no bar at all. The stand-in marks the
+/// landing slot; it never moves while a flight is active, but it is read live
+/// rather than trusted from the trade, so a rebuild between the trade and the
+/// landing cannot strand the square. Returns whether there was a flight to
+/// land.
+fn land_flight() -> bool {
+    let flight = TRADE_FLIGHT.with(|flight| flight.borrow_mut().take());
+    let Some(fl) = flight else {
+        return false;
+    };
+    let tasks = fl.tasks.clone();
+    let index = child_index(&tasks, &fl.stand_in).unwrap_or_else(|| {
+        // The stand-in is gone — a rebuild took the row apart mid-flight. The
+        // square still has to go somewhere sane: after everything, where a
+        // newcomer would go.
+        let mut count = 0usize;
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            count += 1;
+            cursor = widget.next_sibling();
+        }
+        count
+    });
+    put_child(&tasks, &fl.square, index);
+    if fl.stand_in.parent().is_some() {
+        tasks.remove(&fl.stand_in);
+    }
+    true
+}
+
 /// Abandon a drag without moving anything.
 ///
 /// Called before the row is rebuilt. A carried square lives outside the row, so a rebuild
@@ -5307,6 +5502,10 @@ fn swap_row_slots(tasks: &GtkBox, a: usize, b: usize) {
 /// pointer input, over a bar position that no longer means anything. Every button in the
 /// row is about to be discarded anyway, so the square is simply let go of.
 fn drag_cancel() {
+    // A square still sliding home lands first: the row below is about to be
+    // taken apart, and the flight's stand-in would otherwise read as a hole
+    // nothing will ever fill.
+    land_flight();
     let running = DRAG.with(|drag| drag.borrow_mut().take());
     if running.is_none() && carried_square_count() == 0 {
         return;
@@ -5348,6 +5547,9 @@ fn carried_square_count() -> usize {
 /// neither is trading with a synthetic square the saved order never lists — the row
 /// already shows both, so there is nothing for a rebuild to do.
 fn drag_end() -> bool {
+    // A square still sliding home lands first: the drop is read off the row,
+    // and the row is not finished until the flight has landed in it.
+    land_flight();
     let state = DRAG.with(|drag| drag.borrow_mut().take());
     let (Some(state), Some(tasks)) = (state, tasks_box()) else {
         return false;
@@ -7313,6 +7515,101 @@ mod tests {
         let middles = [18.0, 58.0, 138.0];
         assert_eq!(gap_at(&middles, 120.0), 2, "passed slot 1 only: still the hole's slot");
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
+    }
+
+    #[test]
+    fn a_trade_flight_eases_out_and_lands_exactly() {
+        // The slide commits and settles, like the widths: most of the distance
+        // gone early, then onto the target. No display needed — this is the
+        // arithmetic the overlay flight ticks.
+        let (from, to) = ((10.0, 20.0), (48.0, 20.0));
+        assert_eq!(flight_xy(from, to, 0.0), from);
+        assert_eq!(flight_xy(from, to, 1.0), to);
+        assert_eq!(flight_xy(from, to, 1.5), to, "overtime still lands");
+        assert_eq!(flight_xy(from, to, -0.5), from, "undertime still starts");
+        // Past the linear halfway long before half the clock: the ease-out
+        // front-loads the travel.
+        let (x, y) = flight_xy(from, to, 0.5);
+        assert!(x > 29.0, "half the clock is past half the distance: {x}");
+        assert_eq!(y, 20.0, "the slide never leaves the bar");
+        // Backwards too, for a trade that goes left.
+        let (x, _) = flight_xy(to, from, 0.5);
+        assert!(x < 29.0, "the mirror eases the same way: {x}");
+    }
+
+    #[test]
+    fn a_traded_square_slides_home_across_the_overlay() {
+        // The trade commits instantly in the row while the square itself flies
+        // the overlay from its old slot to its new one. Needs a display, like
+        // the live row test above, and passes silently without one.
+        if gtk4::init().is_err() {
+            return;
+        }
+        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        let hole = GtkBox::new(Orientation::Horizontal, 0);
+        hole.set_widget_name(GAP_NAME);
+        hole.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        tasks.append(&hole);
+        for app in ["b", "c"] {
+            let square = Button::new();
+            square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+            tasks.append(&square);
+        }
+        let layer = gtk4::Fixed::new();
+        let column = GtkBox::new(Orientation::Vertical, 0);
+        column.append(&tasks);
+        column.append(&layer);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&column));
+        window.present();
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        let order = || {
+            let mut apps = Vec::new();
+            let mut cursor = tasks.first_child();
+            while let Some(widget) = cursor {
+                apps.push(app_of(&widget).unwrap_or_default());
+                cursor = widget.next_sibling();
+            }
+            apps
+        };
+        let layered = || {
+            let mut count = 0usize;
+            let mut cursor = layer.first_child();
+            while let Some(widget) = cursor {
+                count += 1;
+                cursor = widget.next_sibling();
+            }
+            count
+        };
+        if order() != ["", "b", "c"] {
+            return;
+        }
+        // Trade the hole right: "b" goes left into it, sliding home.
+        trade_slots(&tasks, &layer, 0, 1);
+        if !flight_active() {
+            // No measurable geometry — the trade fell back to a plain relist,
+            // which still ends up right.
+            assert_eq!(order(), ["b", "", "c"]);
+            window.close();
+            return;
+        }
+        // Mid-flight the square is out of the row and riding the layer, with
+        // the row holding its width so nothing downstream moved.
+        assert_eq!(layered(), 1, "the square never left for the layer");
+        assert_eq!(order(), ["", "", "c"], "the row lost its width mid-flight");
+        // Real time, not pumped frames: the flight lands on its own clock.
+        let start = std::time::Instant::now();
+        while flight_active() && start.elapsed() < Duration::from_secs(3) {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!flight_active(), "the flight never landed");
+        assert_eq!(order(), ["b", "", "c"], "the square landed anywhere but home");
+        assert_eq!(layered(), 0, "the layer kept the square after landing");
+        window.close();
     }
 
     #[test]
