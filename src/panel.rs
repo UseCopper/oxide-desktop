@@ -5195,7 +5195,7 @@ struct DragState {
     original: usize,
     /// The corner the carried square was lifted to, in the layer's coordinates.
     /// Only the height is still read: the square rides the bar, and its x comes
-    /// from the hole it is drawn in — see [`carry_to`].
+    /// from the hole it is drawn in — see [`aim_carry`].
     carried_at: (f64, f64),
     /// The pointer position at the moment the gap last moved, for hysteresis: a
     /// pointer resting on the seam between two slots would flip the gap forever
@@ -5458,8 +5458,9 @@ fn drag_update(pointer_x: f64) -> bool {
     // its seam: it leans toward the drag like something stuck, and only commits
     // once the pointer is STICK_GIVE past where the hole last moved. The lean is
     // a fraction of that travel, capped, so it pulls toward the neighbour
-    // without landing on it.
-    let mut lean = 0.0;
+    // without landing on it. It is applied *outside* the glide — see CARRY_LEAN —
+    // so it follows the pointer at once instead of easing along behind it.
+    let mut lean = stick_lean(pointer_x - state.borrow().stick_ref);
     let mut relisted = false;
     if target != hole && (pointer_x - state.borrow().last_gap_x).abs() >= STICK_GIVE {
         // Swaps run one slot at a time towards the pointer, so a fling across
@@ -5490,29 +5491,24 @@ fn drag_update(pointer_x: f64) -> bool {
         // The give-way is the new resting place, so the lean starts over from
         // here: the square is drawn in the slot it just won.
         state.borrow_mut().stick_ref = pointer_x;
+        lean = 0.0;
         if menu_debug() {
             eprintln!(
                 "oxide-panel: {app:?} traded through to slot {hole} (pointer {pointer_x:.0})"
             );
         }
-    } else {
-        // The square has not given way — either the pointer never left the slot
-        // or it has not pushed STICK_GIVE past the seam — so it is drawn where
-        // it belongs, leaning toward the pointer by the travel since the hole
-        // last moved.
-        lean = stick_lean(pointer_x - state.borrow().stick_ref);
     }
 
     // The carried square follows the hole, not the pointer: it is drawn in the
     // slot it would land in, gliding after the hole on the same clock the
-    // traded squares slide on, so the whole row moves as one piece. The target
-    // is the slot the hole now stands in — already snapped from the pre-trade
-    // snapshot, because the placeholder was re-listed this instant and would
-    // answer with its last allocation.
-    if let Some((slot_x, _)) = slots.get(hole).copied().flatten() {
-        let y = state.borrow().carried_at.1;
-        carry_to(&square, &overlay, (slot_x - inset + lean, y));
+    // traded squares slide on, and leaning out of that slot by the sticky
+    // offset. Only the glide is animated; the lean is applied where it is.
+    let y = state.borrow().carried_at.1;
+    if relisted && let Some((slot_x, _)) = slots.get(hole).copied().flatten() {
+        aim_carry(&square, &overlay, (slot_x - inset, y));
     }
+    CARRY_LEAN.with(|cell| cell.set(lean));
+    draw_carried(&square, &overlay);
     relisted
 }
 
@@ -5592,6 +5588,12 @@ struct CarryGlide {
 thread_local! {
     static CARRY_GLIDE: RefCell<Option<CarryGlide>> = const { RefCell::new(None) };
     static GLIDE_GEN: Cell<u64> = const { Cell::new(0) };
+    /// The sticky lean, in pixels, applied on top of where the glide has the
+    /// square. Kept apart from the glide on purpose: the lean follows the
+    /// pointer at once, and only the slot change is animated. Folding the two
+    /// together made the lean itself a 250ms ease, which trailed the pointer —
+    /// the drag felt laggy while it was stuck.
+    static CARRY_LEAN: Cell<f64> = const { Cell::new(0.0) };
 }
 
 /// Where a glide is at `now`.
@@ -5601,18 +5603,42 @@ fn glide_at(glide: &CarryGlide, now: i64) -> (f64, f64) {
     flight_xy(glide.from, glide.to, t)
 }
 
-/// Aim the carried square at a slot and let it glide there.
+/// Where the carried square is drawn right now: the slot the glide has reached,
+/// with the sticky lean added.
+fn carry_drawn(now: i64) -> Option<(f64, f64)> {
+    let lean = CARRY_LEAN.with(|lean| lean.get());
+    CARRY_GLIDE.with(|glide| {
+        glide
+            .borrow()
+            .as_ref()
+            .map(|glide| glide_at(glide, now))
+            .map(|(x, y)| (x + lean, y))
+    })
+}
+
+/// Draw the carried square where the glide and the lean put it.
+fn draw_carried(square: &Button, layer: &gtk4::Fixed) {
+    let Some((x, y)) = carry_drawn(glib::monotonic_time()) else {
+        return;
+    };
+    layer.move_(square, x.round(), y.round());
+}
+
+/// Give the carried square a new slot to glide to, from wherever it is drawn.
 ///
 /// The square is not pinned under the pointer: it is drawn in the hole it would
 /// land in, and this is how it gets from the hole's old slot to its new one.
 /// Aiming again mid-glide picks up from wherever the glide had reached, so a
 /// fling across several slots reads as one continuous move rather than a series
 /// of restarts.
-fn carry_to(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
+///
+/// The lean is consumed here — it is folded into the starting point, so the
+/// square carries on from exactly where it was drawn instead of snapping back
+/// to the old slot while the glide starts.
+fn aim_carry(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
     let now = glib::monotonic_time();
-    let from = CARRY_GLIDE
-        .with(|glide| glide.borrow().as_ref().map(|glide| glide_at(glide, now)))
-        .unwrap_or(to);
+    let from = carry_drawn(now).unwrap_or(to);
+    CARRY_LEAN.with(|lean| lean.set(0.0));
     if (from.0 - to.0).abs() < 0.5 && (from.1 - to.1).abs() < 0.5 {
         // Already drawn there, or close enough that a glide would be a no-op.
         return;
@@ -5621,11 +5647,12 @@ fn carry_to(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
         id.set(id.get().wrapping_add(1));
         id.get()
     });
+    let start = now;
     CARRY_GLIDE.with(|glide| {
         *glide.borrow_mut() = Some(CarryGlide {
             from,
             to,
-            start: now,
+            start,
             id,
         });
     });
@@ -5638,15 +5665,20 @@ fn carry_to(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
         if !alive || !drag_active() {
             return glib::ControlFlow::Break;
         }
-        let (x, y) = flight_xy(from, to, {
-            let elapsed = (glib::monotonic_time() - now) as f64 / 1_000_000.0;
-            (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0)
-        });
-        layer.move_(&square, x.round(), y.round());
+        // Drawn from the glide's *current* position, not the ones captured
+        // above: the lean rides on top and follows the pointer between frames.
+        draw_carried(&square, &layer);
+        let glide = CarryGlide {
+            from,
+            to,
+            start,
+            id,
+        };
+        let (x, y) = glide_at(&glide, glib::monotonic_time());
         if (x - to.0).abs() < 0.5 && (y - to.1).abs() < 0.5 {
             // Land exactly, so no rounding residue is left for the next aim to
-            // start a glide from.
-            layer.move_(&square, to.0.round(), to.1.round());
+            // start a glide from. The lean is already on screen from the draw
+            // above, and the next pointer motion redraws with it.
             return glib::ControlFlow::Break;
         }
         glib::ControlFlow::Continue
@@ -5657,6 +5689,7 @@ fn carry_to(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
 /// going back into the row, and there is nothing left to glide.
 fn drop_carry_glide() {
     CARRY_GLIDE.with(|glide| *glide.borrow_mut() = None);
+    CARRY_LEAN.with(|lean| lean.set(0.0));
 }
 
 /// Where a trade flight is at this point of its slide.
