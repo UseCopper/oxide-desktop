@@ -4746,10 +4746,10 @@ fn watch_bar_drag(tasks: &GtkBox) {
             press_token.set(press_token.get().wrapping_add(1));
             let taken = pressed.borrow_mut().take();
             if drag_active() {
+                // The drop schedules its own rebuild: a square that is still
+                // leaning eases home first, and the row must not be relisted
+                // out from under it until it has landed.
                 let moved = drag_end();
-                if moved {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
                 if menu_debug() {
                     eprintln!("oxide-panel: drag {:?} ended (moved: {moved})", taken);
                 }
@@ -4765,10 +4765,9 @@ fn watch_bar_drag(tasks: &GtkBox) {
             press_token.set(press_token.get().wrapping_add(1));
             pressed.borrow_mut().take();
             if drag_active() {
-                let moved = drag_end();
-                if moved {
-                    glib::idle_add_local_once(|| rebuild_bar());
-                }
+                // A cancelled gesture is dropped like a release, and the drop
+                // handles its own rebuild once the square is home.
+                let _ = drag_end();
             }
         });
     }
@@ -5279,6 +5278,13 @@ fn ghost(name: &str) -> Button {
 /// as it would if the square were still there and had moved. Nothing in the row is asked
 /// for a negative size.
 fn drag_begin(app: &str, pointer_x: f64) {
+    if SETTLING.with(|settling| settling.get()) {
+        // The last release is still easing its square home. Leaving this press
+        // alone is better than fighting it for the layer; a click on the button
+        // still works, and a press that really means to drag picks up on the
+        // next motion.
+        return;
+    }
     if drag_active() {
         // A second square cannot join the first. Ignoring it is better than ending the
         // drag in progress, which would leave the carried square stranded in the overlay.
@@ -5690,6 +5696,14 @@ fn aim_carry(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
 fn drop_carry_glide() {
     CARRY_GLIDE.with(|glide| *glide.borrow_mut() = None);
     CARRY_LEAN.with(|lean| lean.set(0.0));
+    SETTLING.with(|settling| settling.set(false));
+}
+
+thread_local! {
+    /// Whether a released square is still easing home. A snapshot arriving in
+    /// that window must not treat the carried layer as stale: the settle owns
+    /// it until the square lands.
+    static SETTLING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Where a trade flight is at this point of its slide.
@@ -5981,6 +5995,13 @@ fn land_flight() -> bool {
 /// pointer input, over a bar position that no longer means anything. Every button in the
 /// row is about to be discarded anyway, so the square is simply let go of.
 fn drag_cancel() {
+    // A released square easing home owns the carried layer until it lands. A
+    // snapshot can arrive in that window (the release's own focus change is
+    // one), and tearing the layer down mid-glide would take the square with
+    // it: the settle lands it and cleans up itself.
+    if SETTLING.with(|settling| settling.get()) {
+        return;
+    }
     // A square still sliding home lands first: the row below is about to be
     // taken apart, and the flight's stand-in would otherwise read as a hole
     // nothing will ever fill.
@@ -6032,11 +6053,9 @@ fn drag_end() -> bool {
     // A square still sliding home lands first: the drop is read off the row,
     // and the row is not finished until the flight has landed in it.
     land_flight();
-    // The carried square is going back into the row, so its glide has nothing
-    // left to move.
-    drop_carry_glide();
     let state = DRAG.with(|drag| drag.borrow_mut().take());
     let (Some(state), Some(tasks)) = (state, tasks_box()) else {
+        drop_carry_glide();
         return false;
     };
     // A look, not a build: this runs on the way down, and building a carried layer
@@ -6044,6 +6063,7 @@ fn drag_end() -> bool {
     // already gone there is nothing carried, but a leftover placeholder must still
     // come out, or the row keeps a hole nothing will ever fill.
     let Some(overlay) = existing_carried_layer() else {
+        drop_carry_glide();
         if let Some(placeholder) = placeholder_for(&tasks) {
             tasks.remove(&placeholder);
         }
@@ -6052,42 +6072,164 @@ fn drag_end() -> bool {
     let app = state.borrow().app.clone();
     let gap = state.borrow().gap;
 
-    // The square goes back in the row, in the placeholder's place, and the placeholder
-    // goes away. Whatever the row was showing before the drag began is restored by the
-    // rebuild below, so this only has to be *correct*, not pretty.
-    let square = carried_square(&app);
-    if square.is_none() {
+    // The square goes back in the row, in the placeholder's place.
+    let Some(square) = carried_square(&app) else {
         // The square has gone missing from the layer, which means something went wrong
         // mid-drag. Put everything back rather than leaving a half-finished one.
         drag_cancel();
         return false;
-    }
-    let landed = placeholder_for(&tasks);
-    let index = landed
+    };
+    let placeholder = placeholder_for(&tasks);
+    let index = placeholder
         .as_ref()
         .and_then(|placeholder| child_index(&tasks, placeholder))
         .unwrap_or(gap);
-    if let Some(placeholder) = landed {
+    let stayed = index == state.borrow().original;
+    let moved = !stayed;
+
+    // Where the square has to be drawn for the drop to be invisible: the slot it
+    // is standing in, in the layer's own coordinates.
+    let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
+    let target = placeholder
+        .as_ref()
+        .and_then(|placeholder| placeholder.translate_coordinates(&layer_frame, 0.0, 0.0))
+        .map(|(x, y)| (x - f64::from(SQUARE_BORDER), y - f64::from(SQUARE_BORDER)));
+
+    // Already drawn there — no lean left, no glide still running: land at once.
+    let drawn = carry_drawn(glib::monotonic_time());
+    let settled = match (drawn, target) {
+        (Some(drawn), Some(target)) => {
+            (drawn.0 - target.0).abs() < 0.5 && (drawn.1 - target.1).abs() < 0.5
+        }
+        // Nothing drawn (no carry at all?): nothing to ease, so drop it.
+        _ => true,
+    };
+    if settled {
+        finish_drop(&tasks, &overlay, &square, placeholder, index);
+        drop_carry_glide();
+        if menu_debug() {
+            if stayed {
+                eprintln!("oxide-panel: {app:?} put down where it started");
+            } else {
+                eprintln!("oxide-panel: {app:?} moved to {index}");
+            }
+        }
+        if moved {
+            persist_row_order(&tasks);
+            glib::idle_add_local_once(|| rebuild_bar());
+        }
+        return moved;
+    }
+
+    // The square is leaning out of its slot, or still gliding into it. It glides
+    // home first and lands when it gets there, on the same ease-out the slides
+    // use — so letting go of a stuck square eases it back rather than snapping
+    // the lean away.
+    let Some(to) = target else {
+        finish_drop(&tasks, &overlay, &square, placeholder, index);
+        drop_carry_glide();
+        if moved {
+            persist_row_order(&tasks);
+            glib::idle_add_local_once(|| rebuild_bar());
+        }
+        return moved;
+    };
+    if menu_debug() {
+        eprintln!("oxide-panel: {app:?} easing home to slot {index}");
+    }
+    settle_carry(square, &overlay, tasks, placeholder, index, to, moved);
+    moved
+}
+
+/// Put the carried square back in the row, and take the carried layer away.
+///
+/// Shared by the drop that happens the instant a drag ends and by the landing at
+/// the end of a settle glide, so there is one way a carried square goes home.
+fn finish_drop(
+    tasks: &GtkBox,
+    layer: &gtk4::Fixed,
+    square: &Button,
+    placeholder: Option<gtk4::Widget>,
+    index: usize,
+) {
+    if let Some(placeholder) = placeholder {
         tasks.remove(&placeholder);
     }
-    let stayed = index == state.borrow().original;
-    if let Some(square) = square {
-        square.remove_css_class(DRAG_CARRYING);
-        overlay.remove(&square);
-        put_child(&tasks, square.upcast_ref(), index);
+    square.remove_css_class(DRAG_CARRYING);
+    if square.parent().is_some() {
+        layer.remove(square);
     }
+    put_child(tasks, square.upcast_ref(), index);
     // The square is back in the row, so the layer has nothing left to be for.
     drop_carried_layer();
-    if stayed {
-        if menu_debug() {
-            eprintln!("oxide-panel: {app:?} put down where it started");
+}
+
+/// Ease a released square from where it is drawn back into its slot, then land
+/// it.
+///
+/// The drag is over, so this is not the carry glide — that one is driven by the
+/// pointer and stops when it does. This is the last few pixels: the sticky lean
+/// unwinding onto the slot, on [`TRADE_SLIDE`]'s ease-out, with the row left
+/// alone until the square is home. The row still holds the placeholder for the
+/// whole glide, so nothing shifts underneath it.
+fn settle_carry(
+    square: Button,
+    layer: &gtk4::Fixed,
+    tasks: GtkBox,
+    placeholder: Option<gtk4::Widget>,
+    index: usize,
+    to: (f64, f64),
+    moved: bool,
+) {
+    let now = glib::monotonic_time();
+    let from = carry_drawn(now).unwrap_or(to);
+    CARRY_LEAN.with(|lean| lean.set(0.0));
+    SETTLING.with(|settling| settling.set(true));
+    let id = GLIDE_GEN.with(|id| {
+        id.set(id.get().wrapping_add(1));
+        id.get()
+    });
+    CARRY_GLIDE.with(|glide| {
+        *glide.borrow_mut() = Some(CarryGlide {
+            from,
+            to,
+            start: now,
+            id,
+        });
+    });
+    let layer = layer.clone();
+    // Held so the ticking closure can take it when the square lands: a `move`
+    // closure cannot lift the placeholder out of its own environment otherwise.
+    let placeholder = Rc::new(RefCell::new(placeholder));
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let alive = CARRY_GLIDE.with(|glide| {
+            glide.borrow().as_ref().is_some_and(|glide| glide.id == id)
+        });
+        if !alive {
+            return glib::ControlFlow::Break;
         }
-        return false;
-    }
-    if menu_debug() {
-        eprintln!("oxide-panel: {app:?} moved to {index}");
-    }
-    persist_row_order(&tasks)
+        let glide = CarryGlide {
+            from,
+            to,
+            start: now,
+            id,
+        };
+        let (x, y) = glide_at(&glide, glib::monotonic_time());
+        layer.move_(&square, x.round(), y.round());
+        if (x - to.0).abs() < 0.5 && (y - to.1).abs() < 0.5 {
+            // Land exactly, then put the square back in the row.
+            layer.move_(&square, to.0.round(), to.1.round());
+            let placeholder = placeholder.borrow_mut().take();
+            finish_drop(&tasks, &layer, &square, placeholder, index);
+            drop_carry_glide();
+            if moved {
+                persist_row_order(&tasks);
+                glib::idle_add_local_once(|| rebuild_bar());
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Move an app's square to a place in the bar, and remember it.
