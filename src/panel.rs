@@ -5660,7 +5660,6 @@ fn trade_slots_with(
         id.set(id.get().wrapping_add(1));
         id.get()
     });
-    let start = glib::monotonic_time();
     TRADE_FLIGHT.with(|flight| {
         *flight.borrow_mut() = Some(TradeFlight {
             square: sq_w.clone(),
@@ -5672,6 +5671,14 @@ fn trade_slots_with(
     let square = sq_w;
     let layer_box = overlay.clone();
     let stand_in = stand_in.upcast::<gtk4::Widget>();
+    // The glide's clock starts on its second tick, not at the trade. The first
+    // tick exists to let a frame paint the square where the trade put it:
+    // a 16ms tick beats a 16.7ms frame, so starting the clock with the trade
+    // meant the very first painted frame was already eased a fifth of the way
+    // along — the slide never showed its own start, and on a fling across
+    // several slots that was tens of pixels. One frame at the start, then the
+    // full 250ms.
+    let mut began: Option<i64> = None;
     glib::timeout_add_local(Duration::from_millis(16), move || {
         let alive = TRADE_FLIGHT.with(|flight| {
             flight.borrow().as_ref().is_some_and(|fl| fl.flight_id == flight_id)
@@ -5698,6 +5705,12 @@ fn trade_slots_with(
                 .unwrap_or(to)
         } else {
             to
+        };
+        let Some(start) = began else {
+            // First tick: the frame that paints the start. Hold the square
+            // where the trade left it and begin the clock.
+            began = Some(glib::monotonic_time());
+            return glib::ControlFlow::Continue;
         };
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
