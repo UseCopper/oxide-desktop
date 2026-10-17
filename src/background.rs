@@ -38,7 +38,7 @@ use smithay::{
 /// How long the wallpaper takes to settle in: coming up from nothing while
 /// growing to fill the output. Long enough to be a desktop arriving, short
 /// enough not to be a wait.
-const BACKGROUND_FADE: Duration = Duration::from_millis(700);
+const BACKGROUND_FADE: Duration = Duration::from_millis(250);
 /// Where the wallpaper starts, as a fraction of the output it fills. Small
 /// enough to read as growing, large enough that the picture is recognisable
 /// from the first frame.

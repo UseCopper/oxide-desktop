@@ -287,22 +287,32 @@ where
         // back, so everything above is already in place. It is built after the
         // rest only because of that — the image itself is decoded once, on its
         // own thread, and only the element is per-frame.
-        if let Some(mode) = output.current_mode() {
-            let scale = output.current_scale().fractional_scale();
-            let physical = output.current_transform().transform_size(mode.size);
-            // Sized in logical units, so it is stretched to the output's own
-            // logical size and the renderer multiplies it back up by the scale.
-            let logical = physical.to_f64().to_logical(scale);
-            let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
-            if let Some(element) =
-                crate::background::element(renderer, output_size, scale, physical)
-            {
-                output_render_elements.push(OutputRenderElements::Background(element));
-            }
+        if let Some(element) = background_element(renderer, output) {
+            output_render_elements.push(element);
         }
 
         (output_render_elements, CLEAR_COLOR)
     }
+}
+
+/// The wallpaper, under everything.
+fn background_element<R>(
+    renderer: &mut R,
+    output: &Output,
+) -> Option<OutputRenderElements<R, WindowRenderElement<R>>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Send + 'static,
+{
+    let mode = output.current_mode()?;
+    let scale = output.current_scale().fractional_scale();
+    let physical = output.current_transform().transform_size(mode.size);
+    // Sized in logical units, so it is stretched to the output's own logical
+    // size and the renderer multiplies it back up by the scale.
+    let logical = physical.to_f64().to_logical(scale);
+    let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
+    crate::background::element(renderer, output_size, scale, physical)
+        .map(OutputRenderElements::Background)
 }
 
 #[allow(clippy::too_many_arguments)]
