@@ -4173,10 +4173,12 @@ button.task {{
     min-height: {square}px;
 }}
 /* An invisible stand-in that holds a slot while its square is away: the same
-   widget machinery as a square, so the row measures it identically — but it
-   takes neither clicks nor focus. */
+   widget machinery as a square — the same border, painted transparent — so the
+   row measures it identically. A hole with no border at all is a pixel narrower
+   than the square that left it, which shifts every slot after it and puts each
+   flight's target one pixel off the slot it is aiming for. */
 button.task.ghost {{
-    border: none;
+    border-color: transparent;
     background: none;
 }}
 button.task:hover {{
@@ -5336,17 +5338,26 @@ fn drag_begin(app: &str, pointer_x: f64) {
 
     tasks.remove(&square);
     square.add_css_class(DRAG_CARRYING);
-    // The measurement read above is the square's *content* origin: every
-    // translate reads the border inset through. A GtkFixed positions a child by
-    // its *border* box, so the read has the border subtracted once here, or the
-    // carried square lands one border-box out on every axis the moment it is
-    // lifted — the padding the pointer used to see.
-    let put = (left - f64::from(SQUARE_BORDER), top - f64::from(SQUARE_BORDER));
-    overlay.put(&square, put.0, put.1);
+    // The measurement read above is the square's position as the translation
+    // machinery reports it. A GtkFixed positions a child by its own box, and the
+    // two differ by the widget's border — a constant, but one that depends on
+    // the theme and the box model, and guessing it is exactly how a drag ends up
+    // a pixel or two off. So it is measured rather than guessed: put the square
+    // down where it reads, see where it reads after a layout, and keep the
+    // difference. Every placement this drag makes is then corrected by it, so a
+    // square always *measures* where the row said it should be.
+    overlay.put(&square, left, top);
     // The lift's own re-parent gets its layout now: without it the carried
-    // square's first frames painted blank, and the carry appeared to start
-    // from wherever the pointer had already moved it to.
+    // square's first frames painted blank, and the place-measuring below would
+    // read the position before it moved.
     flush_layout();
+    let offset = square
+        .translate_coordinates(overlay.upcast_ref::<gtk4::Widget>(), 0.0, 0.0)
+        .map(|(got_x, got_y)| (left - got_x, top - got_y))
+        .unwrap_or((-f64::from(SQUARE_BORDER), -f64::from(SQUARE_BORDER)));
+    PLACE_OFFSET.with(|cell| cell.set(offset));
+    let put = want_to_put((left, top));
+    overlay.move_(&square, put.0, put.1);
 
     if menu_debug() {
         eprintln!(
@@ -5359,10 +5370,12 @@ fn drag_begin(app: &str, pointer_x: f64) {
             app: app.to_string(),
             gap: index,
             original: index,
-            // The border-box corner the square was just put at — NOT the
-            // content read above. Its height is what the ride keeps; the
-            // square's x comes from the hole it is drawn in.
-            carried_at: put,
+            // Where the square reads in the layer, which is the row's own
+            // measurement of the slot it came from. Every position this drag
+            // deals in is in this space; `want_to_put` turns one into a
+            // GtkFixed move. Its height is what the ride keeps; the square's x
+            // comes from the hole it is drawn in.
+            carried_at: (left, top),
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
             stick_ref: pointer_x,
         })));
@@ -5371,8 +5384,8 @@ fn drag_begin(app: &str, pointer_x: f64) {
     // glides from there rather than from nowhere.
     CARRY_GLIDE.with(|glide| {
         *glide.borrow_mut() = Some(CarryGlide {
-            from: put,
-            to: put,
+            from: (left, top),
+            to: (left, top),
             start: glib::monotonic_time(),
             id: 0,
         });
@@ -5449,7 +5462,6 @@ fn drag_update(pointer_x: f64) -> bool {
     // the square actually was. The layer is the overlay's own frame, so a
     // snapshot through it is directly usable as a put coordinate.
     let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
-    let inset = f64::from(SQUARE_BORDER);
     let slots: Vec<Option<(f64, f64)>> = {
         let mut slots = Vec::new();
         let mut cursor = tasks.first_child();
@@ -5511,7 +5523,7 @@ fn drag_update(pointer_x: f64) -> bool {
     // offset. Only the glide is animated; the lean is applied where it is.
     let y = state.borrow().carried_at.1;
     if relisted && let Some((slot_x, _)) = slots.get(hole).copied().flatten() {
-        aim_carry(&square, &overlay, (slot_x - inset, y));
+        aim_carry(&square, &overlay, (slot_x, y));
     }
     CARRY_LEAN.with(|cell| cell.set(lean));
     draw_carried(&square, &overlay);
@@ -5624,10 +5636,11 @@ fn carry_drawn(now: i64) -> Option<(f64, f64)> {
 
 /// Draw the carried square where the glide and the lean put it.
 fn draw_carried(square: &Button, layer: &gtk4::Fixed) {
-    let Some((x, y)) = carry_drawn(glib::monotonic_time()) else {
+    let Some(want) = carry_drawn(glib::monotonic_time()) else {
         return;
     };
-    layer.move_(square, x.round(), y.round());
+    let (x, y) = want_to_put(want);
+    layer.move_(square, x, y);
 }
 
 /// Give the carried square a new slot to glide to, from wherever it is drawn.
@@ -5705,6 +5718,30 @@ thread_local! {
     /// it until the square lands.
     static SETTLING: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Where a widget measures, turned into where a `GtkFixed` has to put it.
+///
+/// The two differ by the widget's border and by whatever the toolkit's box
+/// model decides. That difference is a constant for the bar's squares, so it is
+/// measured once per drag (see `drag_begin`) rather than guessed, and every
+/// placement applies it here — one place, so a position can never be corrected
+/// twice or forgotten once.
+fn want_to_put(want: (f64, f64)) -> (f64, f64) {
+    let (dx, dy) = PLACE_OFFSET.with(|offset| offset.get());
+    // Not rounded: every position in a drag is absolute (a glide interpolates
+    // between two positions rather than accumulating steps), so a fractional
+    // placement cannot drift, and rounding it here would be up to half a pixel
+    // away from what the row itself renders at.
+    (want.0 + dx, want.1 + dy)
+}
+
+thread_local! {
+    /// The measured difference between where a square measures and where it has
+    /// to be put. Set by every lift; (0, 0) until one has happened, so a
+    /// harness that places widgets itself is unaffected.
+    static PLACE_OFFSET: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+}
+
 
 /// Where a trade flight is at this point of its slide.
 ///
@@ -5843,13 +5880,10 @@ fn trade_slots_with(
         swap_row_slots(tasks, hole, next);
         return;
     }
-    // Reads are content origins (every translate takes the border inset
-    // through); GtkFixed positions children by their border box, so the border
-    // comes off once here. Without it the flying square lands one border-box
-    // out on every axis — the padding the pointer used to see.
-    let inset: f64 = f64::from(SQUARE_BORDER);
-    let from = (from_content.0 - inset, from_content.1 - inset);
-    let to = (to_content.0 - inset, to_content.1 - inset);
+    // Positions here are measurements, the space the row reports in; the
+    // measured offset turns one into a GtkFixed move at the point of placing.
+    let from = from_content;
+    let to = to_content;
     // Whatever is still flying lands first, so there is ever one hole in the
     // row and the gap mapping keeps counting squares only.
     land_flight();
@@ -5927,7 +5961,6 @@ fn trade_slots_with(
         let to = if stand_in.width() > 0 {
             stand_in
                 .translate_coordinates(&layer_box, 0.0, 0.0)
-                .map(|(x, y)| (x - inset, y - inset))
                 .unwrap_or(to)
         } else {
             to
@@ -5940,9 +5973,9 @@ fn trade_slots_with(
         };
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
-        let (x, y) = flight_xy(from, to, t);
+        let (x, y) = want_to_put(flight_xy(from, to, t));
         // `move`, not `put`: the square has been in the layer since the trade.
-        layer_box.move_(&square, x.round(), y.round());
+        layer_box.move_(&square, x, y);
         if t >= 1.0 {
             land_flight();
             return glib::ControlFlow::Break;
@@ -6088,12 +6121,12 @@ fn drag_end() -> bool {
     let moved = !stayed;
 
     // Where the square has to be drawn for the drop to be invisible: the slot it
-    // is standing in, in the layer's own coordinates.
+    // is standing in, in the layer's own coordinates. A measurement, like every
+    // other position in a drag; `want_to_put` places it.
     let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
     let target = placeholder
         .as_ref()
-        .and_then(|placeholder| placeholder.translate_coordinates(&layer_frame, 0.0, 0.0))
-        .map(|(x, y)| (x - f64::from(SQUARE_BORDER), y - f64::from(SQUARE_BORDER)));
+        .and_then(|placeholder| placeholder.translate_coordinates(&layer_frame, 0.0, 0.0));
 
     // Already drawn there — no lean left, no glide still running: land at once.
     let drawn = carry_drawn(glib::monotonic_time());
@@ -6215,10 +6248,12 @@ fn settle_carry(
             id,
         };
         let (x, y) = glide_at(&glide, glib::monotonic_time());
-        layer.move_(&square, x.round(), y.round());
+        let (px, py) = want_to_put((x, y));
+        layer.move_(&square, px, py);
         if (x - to.0).abs() < 0.5 && (y - to.1).abs() < 0.5 {
             // Land exactly, then put the square back in the row.
-            layer.move_(&square, to.0.round(), to.1.round());
+            let (px, py) = want_to_put(to);
+            layer.move_(&square, px, py);
             let placeholder = placeholder.borrow_mut().take();
             finish_drop(&tasks, &layer, &square, placeholder, index);
             drop_carry_glide();
@@ -8354,9 +8389,12 @@ mod tests {
         assert_eq!(ph_y, rest_y, "ghost sits where a square sits");
         tasks.remove(&placeholder);
         settle(&overlay, 320, PANEL_HEIGHT);
-        // The lift, as drag_begin does it: measured through the always-
-        // allocated overlay (a content-origin read), then placed into the
-        // layer with the border subtracted — GtkFixed positions by border box.
+        // The lift, exactly as drag_begin does it: put the square where it
+        // reads, let a layout run, and keep the difference between the two as
+        // the placement correction. The assertion below is the point: a square
+        // in the layer has to *measure* what the row measured for that slot, on
+        // any theme and any box model — a guess at the border is how a drag ends
+        // up a pixel or two off.
         let (left, top) = squares[0]
             .translate_coordinates(&overlay, 0.0, 0.0)
             .unwrap_or((0.0, 0.0));
@@ -8367,11 +8405,14 @@ mod tests {
             squares[0].height(),
         );
         tasks.remove(&squares[0]);
-        layer.put(
-            &squares[0],
-            left - f64::from(SQUARE_BORDER),
-            top - f64::from(SQUARE_BORDER),
-        );
+        layer.put(&squares[0], left, top);
+        settle(&overlay, 320, PANEL_HEIGHT);
+        let offset = squares[0]
+            .translate_coordinates(&overlay, 0.0, 0.0)
+            .map(|(got_x, got_y)| (left - got_x, top - got_y))
+            .unwrap_or((0.0, 0.0));
+        let placed = (left + offset.0, top + offset.1);
+        layer.move_(&squares[0], placed.0, placed.1);
         settle(&overlay, 320, PANEL_HEIGHT);
         let (dx, dy) = in_overlay(squares[0].upcast_ref());
         let icon_carried = in_overlay(icons[0].upcast_ref());
@@ -8585,8 +8626,7 @@ mod tests {
             }
             aimed = stand
                 .translate_coordinates(&layer, 0.0, 0.0)
-                .filter(|_| stand.width() > 0)
-                .map(|(x, y)| (x - f64::from(SQUARE_BORDER), y - f64::from(SQUARE_BORDER)));
+                .filter(|_| stand.width() > 0);
             if aimed.is_some() || start.elapsed() > Duration::from_secs(2) {
                 break;
             }
