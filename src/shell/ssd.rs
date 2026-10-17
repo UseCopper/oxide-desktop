@@ -76,6 +76,15 @@ pub struct WindowState {
     /// doing for a window whose contents actually changed. This counter is what
     /// makes that check cheap.
     pub content_generation: u64,
+    /// Whether this window still owes us its size, and is to be centred once it
+    /// arrives.
+    ///
+    /// A Wayland client picks its own size and only says what it is when it
+    /// first commits, so at map time there is nothing to centre by. The window
+    /// goes up at the middle and is moved to the middle of its real size on the
+    /// commit that finally has one. X11 clients have their geometry before they
+    /// map and never see this.
+    pub center_when_sized: bool,
     /// The [`content_generation`](Self::content_generation) the panel's current
     /// preview was rendered from, if any. A request matching it is answered with
     /// nothing, leaving the panel to keep showing the image it has.
@@ -1075,6 +1084,7 @@ impl WindowElement {
                 last_frame: None,
                 panel_id: None,
                 content_generation: 0,
+                center_when_sized: false,
                 previewed_generation: None,
                 header_bar: HeaderBar {
                     pointer_loc: None,
