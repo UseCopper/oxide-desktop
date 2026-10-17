@@ -5146,6 +5146,25 @@ fn drag_active() -> bool {
     DRAG.with(|drag| drag.borrow().is_some())
 }
 
+/// Lay the bar out right now, not on the next frame.
+///
+/// Every re-parent in a trade — the lift, a flyer's put into the layer, a
+/// landing's re-list — leaves its widget waiting for the next layout pass. GTK
+/// paints a laid-out-late widget cold: the first frames of a flight were a
+/// blank shell, so the slide appeared to start from wherever it had already
+/// got to, a few ticks in — the "wrong start". Allocating the bar here, at its
+/// own current size, lays every child in the same pass, so the next frame
+/// paints each square exactly where the geometry placed it.
+fn flush_layout() {
+    let Some(bar) = OVERLAY.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let (width, height) = (bar.width(), bar.height());
+    if width > 0 && height > 0 {
+        bar.allocate(width, height, -1, None);
+    }
+}
+
 /// An invisible stand-in that holds a slot while its square is away.
 ///
 /// A button with the square's own CSS, minus the paint — so the row measures it
@@ -5237,6 +5256,10 @@ fn drag_begin(app: &str) {
     // lifted — the padding the pointer used to see.
     let put = (left - f64::from(SQUARE_BORDER), top - f64::from(SQUARE_BORDER));
     overlay.put(&square, put.0, put.1);
+    // The lift's own re-parent gets its layout now: without it the carried
+    // square's first frames painted blank, and the carry appeared to start
+    // from wherever the pointer had already moved it to.
+    flush_layout();
 
     if menu_debug() {
         eprintln!(
@@ -5607,6 +5630,9 @@ fn trade_slots_with(
     tasks.remove(&sq_w);
     // `put`, not `move`: the square has no parent again from here on.
     overlay.put(&sq_w, from.0, from.1);
+    // And the flyer's put gets its layout now: its first frames painted blank
+    // otherwise, and the slide read as starting a few ticks in.
+    flush_layout();
     // The flyer just became the layer's last child, and a GtkFixed draws its
     // children in child order: it would paint over the square under the
     // pointer, which is the one that should always be on top. The carried
@@ -5712,6 +5738,10 @@ fn land_flight() -> bool {
     if fl.stand_in.parent().is_some() {
         tasks.remove(&fl.stand_in);
     }
+    // The landing's re-list gets its layout now, so the settle paints where
+    // the glide's last frame put it — no blank beat between the tween's end
+    // and the row's own first paint.
+    flush_layout();
     true
 }
 
