@@ -39,6 +39,14 @@ use smithay::{
 /// growing to fill the output. Long enough to be a desktop arriving, short
 /// enough not to be a wait.
 const BACKGROUND_FADE: Duration = Duration::from_millis(250);
+/// How long the wallpaper stays away after it first has an image to show.
+///
+/// The compositor's opening frames are spent bringing the outputs up, and they
+/// are drawn before anyone can see them — a fade that runs then is a fade no
+/// one watches. A beat, and the desktop is on screen when the picture arrives.
+/// Nothing is drawn until it ends: the wallpaper simply is not there, which is
+/// also what tells the damage tracker there is something new to show.
+const BACKGROUND_DELAY: Duration = Duration::from_millis(500);
 /// Where the wallpaper starts, as a fraction of the output it fills. Small
 /// enough to read as growing, large enough that the picture is recognisable
 /// from the first frame.
@@ -85,15 +93,11 @@ where
     let wallpaper = wallpaper(max_physical)?;
     let (src, full) = cover(wallpaper.size, output);
 
-    // The appearance, timed from the first frame that has an image to draw. A
+    // The appearance, timed from the first frame that has an image to draw: a
     // wallpaper that takes a second to decode should not have spent its fade
-    // waiting for itself — and the frame that starts it is the beginning of the
-    // animation, not its end.
+    // waiting for itself.
     let appeared = *APPEARED.get_or_init(Instant::now);
-    let elapsed = appeared.elapsed().as_secs_f64();
-    let t = (elapsed / BACKGROUND_FADE.as_secs_f64()).clamp(0.0, 1.0);
-    let ease = crate::shell::animation::ease_out_cubic(t);
-    let grow = BACKGROUND_START_SCALE + (1.0 - BACKGROUND_START_SCALE) * ease;
+    let (ease, grow) = appearance(appeared.elapsed())?;
 
     // The crop is the whole output's, drawn smaller and centred: the picture
     // grows into the screen rather than being re-cropped as it goes, so nothing
@@ -140,6 +144,20 @@ fn wallpaper(cap: Size<i32, Physical>) -> Option<Wallpaper> {
         });
     });
     cell.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The wallpaper's arrival, as an opacity and a size, at this point of its life.
+///
+/// `None` until the beat is over and there is nothing to draw; after that a
+/// fraction of the way in, so the picture comes up from nothing while growing
+/// from [`BACKGROUND_START_SCALE`] of the output to all of it. Separated from
+/// the drawing so the shape of the arrival can be asserted without a display.
+fn appearance(elapsed: Duration) -> Option<(f64, f64)> {
+    let since = elapsed.checked_sub(BACKGROUND_DELAY)?;
+    let t = (since.as_secs_f64() / BACKGROUND_FADE.as_secs_f64()).clamp(0.0, 1.0);
+    let ease = crate::shell::animation::ease_out_cubic(t);
+    let grow = BACKGROUND_START_SCALE + (1.0 - BACKGROUND_START_SCALE) * ease;
+    Some((ease, grow))
 }
 
 fn load(cap: Size<u32, Physical>) -> Option<Wallpaper> {
@@ -291,6 +309,27 @@ mod tests {
         assert_eq!(size, output);
         assert_eq!(src.size, Size::from((1920.0, 1080.0)));
         assert_eq!(src.loc, (0.0, 0.0).into());
+    }
+
+    #[test]
+    fn a_wallpaper_arrives_rather_than_appearing() {
+        // Nothing at all until the beat is over.
+        assert!(appearance(Duration::ZERO).is_none());
+        assert!(appearance(BACKGROUND_DELAY - Duration::from_millis(1)).is_none());
+        // Then it starts from nothing, at less than the output's size...
+        let (alpha, grow) = appearance(BACKGROUND_DELAY).expect("the arrival starts here");
+        assert_eq!(alpha, 0.0, "the wallpaper was not transparent to begin with");
+        assert_eq!(grow, BACKGROUND_START_SCALE);
+        assert!(grow < 1.0, "the wallpaper did not start smaller than the output");
+        // ...and comes up on the ease-out, reaching all of it.
+        let (half, grow_half) = appearance(BACKGROUND_DELAY + BACKGROUND_FADE / 2).unwrap();
+        assert!(half > 0.5, "the fade front-loads: {half} at half the clock");
+        assert!(grow_half > BACKGROUND_START_SCALE && grow_half < 1.0);
+        let (done, grow_done) = appearance(BACKGROUND_DELAY + BACKGROUND_FADE).unwrap();
+        assert_eq!((done, grow_done), (1.0, 1.0));
+        // And stays there, however long the desktop is up.
+        let (later, _) = appearance(BACKGROUND_DELAY + BACKGROUND_FADE * 10).unwrap();
+        assert_eq!(later, 1.0);
     }
 
     #[test]
