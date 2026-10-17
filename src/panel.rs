@@ -4633,6 +4633,7 @@ fn watch_bar_drag(tasks: &GtkBox) {
             let Some(app) = app else {
                 return;
             };
+            let anchor = start_x;
             let pressed = pressed.clone();
             let pointer = pointer.clone();
             let press_token = press_token.clone();
@@ -4650,13 +4651,23 @@ fn watch_bar_drag(tasks: &GtkBox) {
                 let pointer_x = pointer.get();
                 drag_begin(&app);
                 if drag_active() {
+                    // The travel is measured from the *press*, not from the
+                    // lift. A hand that wandered while holding is telling the
+                    // square to be under the pointer: anchored at the press,
+                    // the pick-up catches up by exactly that travel, keeping
+                    // the point of the square the finger went down on under
+                    // the finger. Anchored at the lift instead, the square
+                    // would come up where it stood and stay that far behind
+                    // the pointer for the rest of the drag.
                     DRAG.with(|drag| {
                         if let Some(state) = drag.borrow().as_ref() {
-                            state.borrow().pointer_meet(pointer_x);
+                            state.borrow().pointer_meet(anchor);
                         }
                     });
                     if menu_debug() {
-                        eprintln!("oxide-panel: drag {app:?} lifted by hold at {pointer_x:.1}");
+                        eprintln!(
+                            "oxide-panel: drag {app:?} lifted by hold (pointer {pointer_x:.1}, press {anchor:.1})"
+                        );
                     }
                     if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
                         tasks.queue_allocate();
@@ -5158,15 +5169,16 @@ struct DragState {
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
     last_gap_x: f64,
-    /// The pointer position the lift happened at, which is what the carried
-    /// square's travel is measured from: the drag starts wherever along the
-    /// press the threshold was crossed, not at the press itself.
+    /// The pointer position the carried square's travel is measured from. It is
+    /// where the press went down, not where the hold lifted: a pointer that
+    /// travelled while the square was still waiting comes up under it, with the
+    /// point pressed kept under the pointer.
     meet_x: Cell<f64>,
 }
 
 impl DragState {
-    /// Note where the pointer met the threshold, so the carried square's
-    /// travel starts from there.
+    /// Anchor the carried square's travel at the press, so the pick-up catches
+    /// up by however far the pointer travelled while the hold was arming.
     fn pointer_meet(&self, x: f64) {
         self.meet_x.set(x);
     }
