@@ -36,7 +36,7 @@ use crate::{
 use super::{
     FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge,
     ResizeGrabState, ResizeState, SurfaceData, WindowElement, advance_resize_configure,
-    place_new_window,
+    centered_in, place_new_window, work_area_under,
 };
 use super::ssd::{Decoration, DragAnchor, Restore, RestoreTarget};
 
@@ -1132,6 +1132,39 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
     // their declared geometry.
     let geometry = window.committed_content_size();
 
+    // A window that went up before the client had said how big it is gets
+    // moved into the middle now that it has. This is the only moment the
+    // information exists: a Wayland client picks its own size, and the first
+    // commit carrying one is what tells us. The window is centered by the same
+    // measure it was mapped with — the decorated geometry — so the frame's
+    // middle is the area's middle.
+    // `with_state` rather than a held `decoration_state()` borrow: the flag is
+    // read and cleared on its own, and `geometry` below is called with no
+    // borrow alive. Reading it inside a held borrow re-enters the same
+    // `RefCell` — the panic `with_state`'s own comment warns about.
+    let wants_center = window.with_state(|state| {
+        let wanted = state.center_when_sized;
+        if wanted {
+            state.center_when_sized = false;
+        }
+        wanted
+    });
+    if wants_center {
+        let size = window.geometry().size;
+        if size.w > 0 && size.h > 0 {
+            let at = (window_loc + window.bbox().loc).to_f64()
+                + Point::from((size.w as f64 / 2.0, size.h as f64 / 2.0));
+            let area = work_area_under(space, at);
+            let location = centered_in(area, size);
+            space.relocate_element(&window, location);
+            window_loc = location;
+        } else {
+            // Still no size to center by: the next commit carrying one tries
+            // again.
+            window.with_state(|state| state.center_when_sized = true);
+        }
+    }
+
     // A client-decorated unmaximize is waiting for the size the client chose;
     // start the transition for real as soon as it commits a different size.
     if let Some(animation) = window.decoration_state().animation.as_mut()
@@ -1217,6 +1250,41 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_window_lands_in_the_middle_of_its_area() {
+        // An even split, both axes.
+        let area = Rectangle::new(Point::from((0, 0)), Size::from((1280, 720)));
+        assert_eq!(
+            centered_in(area, Size::from((800, 600))),
+            Point::from((240, 60))
+        );
+        // Odd leftover pixels go to the right and bottom, not the left and top:
+        // the window stays wholly inside, one pixel off-centre at worst.
+        assert_eq!(
+            centered_in(area, Size::from((801, 601))),
+            Point::from((239, 59))
+        );
+        // A work area offset by the panel and any dock still centers into its
+        // own middle, not the output's.
+        let offset = Rectangle::new(Point::from((100, 50)), Size::from((1000, 800)));
+        assert_eq!(
+            centered_in(offset, Size::from((400, 300))),
+            Point::from((400, 300))
+        );
+        // Larger than its area: the top-left is the area's corner rather than a
+        // negative offset, so the titlebar cannot be centred off the top edge
+        // where it can be neither read nor grabbed.
+        assert_eq!(
+            centered_in(area, Size::from((1400, 900))),
+            Point::from((0, 0))
+        );
+        let offset = Rectangle::new(Point::from((100, 50)), Size::from((1000, 800)));
+        assert_eq!(
+            centered_in(offset, Size::from((1400, 900))),
+            Point::from((100, 50))
+        );
+    }
 
     #[test]
     fn restore_drag_keeps_relative_grab() {

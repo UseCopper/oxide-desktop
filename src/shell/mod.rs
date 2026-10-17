@@ -1212,6 +1212,33 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
     };
 }
 
+/// The work area the output a pointer is on offers, falling back to the first
+/// output and then a fixed area.
+fn work_area_under(space: &Space<WindowElement>, at: Point<f64, Logical>) -> Rectangle<i32, Logical> {
+    let output = space
+        .output_under(at)
+        .next()
+        .or_else(|| space.outputs().next())
+        .cloned();
+    output
+        .as_ref()
+        .and_then(|output| output_work_area(space, output))
+        .unwrap_or_else(|| Rectangle::from_size((800, 800).into()))
+}
+
+/// Where a window of this size goes so that it sits in the middle of the area.
+///
+/// A window larger than its area keeps its top-left on the area's corner
+/// instead of being centred: centring something taller than the screen would
+/// put its titlebar above the top edge, where it can be neither read nor
+/// grabbed.
+fn centered_in(area: Rectangle<i32, Logical>, size: Size<i32, Logical>) -> Point<i32, Logical> {
+    Point::from((
+        area.loc.x + (area.size.w - size.w).max(0) / 2,
+        area.loc.y + (area.size.h - size.h).max(0) / 2,
+    ))
+}
+
 fn place_new_window(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
@@ -1220,15 +1247,7 @@ fn place_new_window(
 ) {
     // Center the window on the output under the pointer (the monitor the mouse
     // is on), falling back to the first output, then a fixed area.
-    let output = space
-        .output_under(pointer_location)
-        .next()
-        .or_else(|| space.outputs().next())
-        .cloned();
-    let area = output
-        .as_ref()
-        .and_then(|output| output_work_area(space, output))
-        .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
+    let area = work_area_under(space, pointer_location);
 
     // Set the initial toplevel bounds.
     #[allow(irrefutable_let_patterns)]
@@ -1238,12 +1257,14 @@ fn place_new_window(
         });
     }
 
-    // `geometry()` is the decorated size, so the whole frame ends up centered.
+    // `geometry()` is the decorated size, so the whole frame ends up centered —
+    // but a Wayland client only tells us that size in its first commit. Until
+    // then there is nothing to center *by*: the window goes up at the middle of
+    // the area and is moved to the middle of its real size on that commit.
     let size = window.geometry().size;
-    let location = Point::from((
-        area.loc.x + (area.size.w - size.w).max(0) / 2,
-        area.loc.y + (area.size.h - size.h).max(0) / 2,
-    ));
+    let sized = size.w > 0 && size.h > 0;
+    window.with_state(|state| state.center_when_sized = !sized);
+    let location = centered_in(area, size);
     space.map_element(window.clone(), location, activate);
 
     // `map_element(.., true)` gives the window the xdg activated state, which
