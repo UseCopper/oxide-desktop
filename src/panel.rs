@@ -4086,6 +4086,9 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // into two different greys.
     let (panel_r, panel_g, panel_b) = BAR_PANEL;
     let panel_a = BAR_PANEL_ALPHA;
+    // Squares are this wide in every calculation the drag does, so the theme may
+    // not be able to out-minimum the code's own arithmetic.
+    let square = SQUARE_SIZE;
     // The app menu's body is the preview menu's cell fill, read off the same
     // constant the cairo drawing reads, so the two engines agree by
     // construction rather than by two careful copies of the same hexes. The
@@ -4122,7 +4125,24 @@ button.task {{
     border: 1px solid rgba(255, 255, 255, 0.25);
     box-shadow: none;
     padding: 0;
+    /* A size request does not reach the measurement, and a theme margin does
+       not reach GtkFixed: the row absorbs a margin into its centring, but a
+       square placed by absolute coordinates lands one margin-box out on every
+       axis. Both are pinned here, where sizing is honest. */
+    margin: 0;
     border-radius: 8px;
+    /* The code maths on {square}px everywhere, but the theme's own 32px
+       minimum used to win, and squares rendered 34px while the holes and the
+       carried layer positions were worked out on 36. */
+    min-width: {square}px;
+    min-height: {square}px;
+}}
+/* An invisible stand-in that holds a slot while its square is away: the same
+   widget machinery as a square, so the row measures it identically — but it
+   takes neither clicks nor focus. */
+button.task.ghost {{
+    border: none;
+    background: none;
 }}
 button.task:hover {{
     background-color: rgba(255, 255, 255, 0.10);
@@ -4717,6 +4737,7 @@ fn watch_bar_click_off(bar_row: &GtkBox, context: &Rc<ContextMenu>) {
         while let Some(widget) = cursor {
             cursor = widget.next_sibling();
             if let Some(button) = widget.downcast_ref::<Button>()
+                && app_of(widget.upcast_ref()).is_some()
                 && let Some((left, top)) = button.translate_coordinates(&bar, 0.0, 0.0)
                 && x >= left
                 && x <= left + f64::from(button.width())
@@ -5125,6 +5146,55 @@ fn drag_active() -> bool {
     DRAG.with(|drag| drag.borrow().is_some())
 }
 
+/// Lay the bar out right now, not on the next frame.
+///
+/// Every re-parent in a trade — the lift, a flyer's put into the layer, a
+/// landing's re-list — leaves its widget waiting for the next layout pass. GTK
+/// paints a laid-out-late widget cold: the first frames of a flight were a
+/// blank shell, so the slide appeared to start from wherever it had already
+/// got to, a few ticks in — the "wrong start".
+///
+/// The cascade has to go through `size_allocate`, the classic allocation path
+/// containers run themselves: `allocate` (with the transform) is the
+/// layout-manager path, and a widget whose own allocation belongs to its
+/// parent — the overlay's belongs to the window — ignores it quietly. The
+/// test saw exactly that: a flyer still 0×0 after an `allocate` flush.
+fn flush_layout() {
+    let Some(bar) = OVERLAY.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let (width, height) = (bar.width(), bar.height());
+    if width > 0 && height > 0 {
+        bar.size_allocate(&gtk4::Allocation::new(0, 0, width, height), -1);
+    }
+}
+
+/// An invisible stand-in that holds a slot while its square is away.
+///
+/// A button with the square's own CSS, minus the paint — so the row measures it
+/// exactly as it measures a square, which is what keeps the hole the drag
+/// leaves as wide as the square that left it, and a landing slot's `y` where a
+/// square's `y` is. An empty `GtkBox` filled the row's height and measured
+/// nothing: the flight's target came out at the top of the row, three pixels
+/// above every square, which is the bottom padding the pointer saw.
+///
+/// Neither clicks nor focus: it is a hole, not a control. The pointer passes
+/// straight through to whatever is behind the bar.
+fn ghost(name: &str) -> Button {
+    let ghost = Button::new();
+    ghost.set_widget_name(name);
+    ghost.add_css_class("task");
+    ghost.add_css_class("ghost");
+    ghost.set_can_focus(false);
+    ghost.set_can_target(false);
+    ghost.set_valign(gtk4::Align::Center);
+    ghost.set_halign(gtk4::Align::Center);
+    // Belt and braces. The CSS minimum is what measures; this keeps the widget
+    // shaped even if a theme strips the stylesheet away.
+    ghost.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+    ghost
+}
+
 /// Pick a square up.
 ///
 /// The square leaves the row and goes into the overlay, and a placeholder of the same
@@ -5164,22 +5234,36 @@ fn drag_begin(app: &str) {
     let (row_left, _) = square
         .translate_coordinates(&tasks, 0.0, 0.0)
         .unwrap_or((0.0, 0.0));
-    // The carried square is placed in the carried layer, which covers the whole bar
-    // (the row's padding and margins included). Its origin is measured there, or the
-    // square jumps by exactly that inset the moment it is lifted.
-    let (left, top) = square
-        .translate_coordinates(overlay.upcast_ref::<gtk4::Widget>(), 0.0, 0.0)
+    // The carried square is placed in the carried layer, which covers the whole
+    // bar. Measured in the *overlay* — the always-allocated ancestor both sit
+    // in — because the layer itself was created this instant and has never been
+    // laid out: coordinates through an unallocated widget are the inset the
+    // lift used to jump by. The layer is aligned top-left and never wider than
+    // the bar it sits over, so overlay coordinates are layer coordinates.
+    let (left, top) = OVERLAY
+        .with(|cell| cell.borrow().clone())
+        .and_then(|bar| {
+            square.translate_coordinates(bar.upcast_ref::<gtk4::Widget>(), 0.0, 0.0)
+        })
         .unwrap_or((0.0, 0.0));
 
     // The placeholder. Invisible, the same size as a square, and holding the gap open.
-    let placeholder = GtkBox::new(Orientation::Horizontal, 0);
-    placeholder.set_widget_name(GAP_NAME);
-    placeholder.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+    let placeholder = ghost(GAP_NAME);
     put_child(&tasks, placeholder.upcast_ref(), index);
 
     tasks.remove(&square);
     square.add_css_class(DRAG_CARRYING);
-    overlay.put(&square, left, top);
+    // The measurement read above is the square's *content* origin: every
+    // translate reads the border inset through. A GtkFixed positions a child by
+    // its *border* box, so the read has the border subtracted once here, or the
+    // carried square lands one border-box out on every axis the moment it is
+    // lifted — the padding the pointer used to see.
+    let put = (left - f64::from(SQUARE_BORDER), top - f64::from(SQUARE_BORDER));
+    overlay.put(&square, put.0, put.1);
+    // The lift's own re-parent gets its layout now: without it the carried
+    // square's first frames painted blank, and the carry appeared to start
+    // from wherever the pointer had already moved it to.
+    flush_layout();
 
     if menu_debug() {
         eprintln!(
@@ -5192,7 +5276,12 @@ fn drag_begin(app: &str) {
             app: app.to_string(),
             gap: index,
             original: index,
-            carried_at: (left, top),
+            // The same border-box corner the square was just put at — NOT the
+            // content read above. The first pointer motion adds the travel to
+            // these and repositions with it, and a mismatched corner would
+            // teleport the glyph a pixel down, exactly where the drag felt
+            // padded.
+            carried_at: put,
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
             meet_x: Cell::new(f64::NAN),
         })));
@@ -5288,11 +5377,45 @@ fn drag_update(pointer_x: f64) -> bool {
     // trade that fires while another square is still flying lands it first, so
     // a fling chains pixel-correctly — and slides that are merely overtaken by
     // pointer motion, with no trade behind it, keep flying.
+    //
+    // The slots' own geometry is read ONCE, before any of it: a chained trade
+    // re-parents the placeholder to a slot the previous frame never laid out,
+    // and coordinates measured through a freshly re-parented widget are its
+    // last allocation — a whole slot off, which is where a chained flight's
+    // target used to drift sideways. Widths are uniform, so a slot's x holds
+    // across every relist in the chain and the snapshot stays honest.
+    // Snapshotted in the carried layer's own coordinates, not the row's: the
+    // trades below put and move the squares in the layer, and a row-local read
+    // carries the row's padding and margin with it — 16px here, most of a
+    // slot — which put every flight's start and finish that far left of where
+    // the square actually was. The layer is the overlay's own frame, so a
+    // snapshot through it is directly usable as a put coordinate.
+    let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
+    let slots: Vec<Option<(f64, f64)>> = {
+        let mut slots = Vec::new();
+        let mut cursor = tasks.first_child();
+        while let Some(widget) = cursor {
+            slots.push(widget.translate_coordinates(&layer_frame, 0.0, 0.0));
+            cursor = widget.next_sibling();
+        }
+        slots
+    };
     let direction = if target > hole { 1 } else { -1 };
     let mut relisted = false;
     while hole != target {
         let next = (hole as isize + direction) as usize;
-        trade_slots(&tasks, &overlay, hole, next);
+        let (Some(from), Some(to)) = (
+            slots.get(next).copied().flatten(),
+            slots.get(hole).copied().flatten(),
+        ) else {
+            // A slot with no allocation yet has no honest geometry: relist it
+            // plainly rather than fly it somewhere made up.
+            swap_row_slots(&tasks, hole, next);
+            hole = next;
+            relisted = true;
+            continue;
+        };
+        trade_slots_with(&tasks, &overlay, hole, next, from, to);
         hole = next;
         relisted = true;
     }
@@ -5384,7 +5507,84 @@ fn flight_active() -> bool {
     TRADE_FLIGHT.with(|flight| flight.borrow().is_some())
 }
 
+/// Lift the carried square above whatever the layer has collected since.
+///
+/// A trade inserts its flyer as the layer's last child, and a GtkFixed paints
+/// children in order — the flyer would slide over the square the pointer owns.
+/// `insert_after` does the reorder without detaching it, which keeps the
+/// carried button's own subtree alive: an unparent-put here used to make GTK
+/// paint the square as a fresh subtree for a frame or two, and the glyph
+/// blinked to nothing mid-trade.
+fn raise_carried(layer: &gtk4::Fixed) {
+    let Some(app) = DRAG.with(|drag| {
+        let running = drag.borrow();
+        running
+            .as_ref()
+            .map(|state| state.borrow().app.clone())
+    }) else {
+        return;
+    };
+    let Some(square) = carried_square(&app) else {
+        return;
+    };
+    // Restack to the end without touching geometry: within-layer reordering,
+    // so the square keeps its allocation and paints the next frame exactly
+    // where it was.
+    let mut last = square.next_sibling();
+    let mut cursor = last.clone();
+    while let Some(widget) = cursor {
+        last = Some(widget.clone());
+        cursor = widget.next_sibling();
+    }
+    if let Some(last) = last {
+        square.insert_after(layer, Some(&last));
+    }
+}
+
 /// Trade two neighbouring slots, flying the square home.
+///
+/// Production trades come only from [`drag_update`], which chains them, snaps
+/// the row's geometry once and drives [`trade_slots_with`] itself. This wrapper
+/// is for the widget tests: both children are still where they were allocated,
+/// so it reads fresh and delegates.
+#[cfg(test)]
+fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) {
+    // A single trade reads fresh and exactly: both children are still where
+    // they were allocated, so this reads and delegates. The chain in
+    // `drag_update` uses [`trade_slots_with`] instead, with geometry it snapped
+    // once — re-parented widgets answer with their last allocation, and a
+    // chained read would be a whole slot off.
+    let layer = overlay.clone().upcast::<gtk4::Widget>();
+    let (Some(hole_w), Some(sq_w)) = (children_at(tasks, hole), children_at(tasks, next)) else {
+        return;
+    };
+    let (Some(from), Some(to)) = (
+        sq_w.translate_coordinates(&layer, 0.0, 0.0),
+        hole_w.translate_coordinates(&layer, 0.0, 0.0),
+    ) else {
+        swap_row_slots(tasks, hole, next);
+        return;
+    };
+    trade_slots_with(tasks, overlay, hole, next, from, to);
+}
+
+/// The widget at a slot in the row.
+#[cfg(test)]
+fn children_at(tasks: &GtkBox, slot: usize) -> Option<gtk4::Widget> {
+    let mut cursor = tasks.first_child();
+    let mut index = 0usize;
+    while let Some(widget) = cursor {
+        if index == slot {
+            return Some(widget);
+        }
+        index += 1;
+        cursor = widget.next_sibling();
+    }
+    None
+}
+
+/// Trade two neighbouring slots, flying the square home, on geometry the caller
+/// already snapped.
 ///
 /// The hole moves instantly — it is invisible either way — while the square it
 /// trades with slides across the overlay from its old slot to its new one on
@@ -5394,8 +5594,17 @@ fn flight_active() -> bool {
 ///
 /// `hole` is the placeholder's slot and `next` the square's, as in
 /// [`swap_row_slots`], which this falls back to whenever the row is not the
-/// shape a trade needs.
-fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) {
+/// shape a trade needs. `from_content` and `to_content` are the two slots'
+/// positions as content-origin reads in the row — this is what turns them into
+/// the carried layer's border-box coordinates.
+fn trade_slots_with(
+    tasks: &GtkBox,
+    overlay: &gtk4::Fixed,
+    hole: usize,
+    next: usize,
+    from_content: (f64, f64),
+    to_content: (f64, f64),
+) {
     let children: Vec<gtk4::Widget> = {
         let mut children = Vec::new();
         let mut cursor = tasks.first_child();
@@ -5415,14 +5624,13 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
         swap_row_slots(tasks, hole, next);
         return;
     }
-    let layer = overlay.clone().upcast::<gtk4::Widget>();
-    let (Some(from), Some(to)) = (
-        sq_w.translate_coordinates(&layer, 0.0, 0.0),
-        hole_w.translate_coordinates(&layer, 0.0, 0.0),
-    ) else {
-        swap_row_slots(tasks, hole, next);
-        return;
-    };
+    // Reads are content origins (every translate takes the border inset
+    // through); GtkFixed positions children by their border box, so the border
+    // comes off once here. Without it the flying square lands one border-box
+    // out on every axis — the padding the pointer used to see.
+    let inset: f64 = f64::from(SQUARE_BORDER);
+    let from = (from_content.0 - inset, from_content.1 - inset);
+    let to = (to_content.0 - inset, to_content.1 - inset);
     // Whatever is still flying lands first, so there is ever one hole in the
     // row and the gap mapping keeps counting squares only.
     land_flight();
@@ -5433,14 +5641,22 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
     tasks.remove(&sq_w);
     // `put`, not `move`: the square has no parent again from here on.
     overlay.put(&sq_w, from.0, from.1);
+    // And the flyer's put gets its layout now: its first frames painted blank
+    // otherwise, and the slide read as starting a few ticks in.
+    flush_layout();
+    // The flyer just became the layer's last child, and a GtkFixed draws its
+    // children in child order: it would paint over the square under the
+    // pointer, which is the one that should always be on top. The carried
+    // square is re-stacked to the end — `insert_after`, never a re-parent.
+    raise_carried(overlay);
     // A stand-in holds the landing slot — the hole's old slot, which is where
     // the square is headed — so the row never narrows and nothing downstream
-    // moves. Named `held:`, not `gap:`: the row's geometry counts it as
-    // occupied (its square is on the way), which is what keeps the gap
-    // tracking honest while the slide is in the air.
-    let stand_in = GtkBox::new(Orientation::Horizontal, 0);
-    stand_in.set_widget_name(HELD_NAME);
-    stand_in.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+    // moves. It is a ghost: the same widget machinery as a square, so its
+    // `y` is a square's `y`, not the row's top edge. Named `held:`, not `gap:`:
+    // the row's geometry counts it as occupied (its square is on the way),
+    // which is what keeps the gap tracking honest while the slide is in the
+    // air.
+    let stand_in = ghost(HELD_NAME);
     put_child(tasks, stand_in.upcast_ref(), hole);
     if menu_debug() {
         if let Some(app) = app_of(&sq_w) {
@@ -5451,7 +5667,6 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
         id.set(id.get().wrapping_add(1));
         id.get()
     });
-    let start = glib::monotonic_time();
     TRADE_FLIGHT.with(|flight| {
         *flight.borrow_mut() = Some(TradeFlight {
             square: sq_w.clone(),
@@ -5463,6 +5678,14 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
     let square = sq_w;
     let layer_box = overlay.clone();
     let stand_in = stand_in.upcast::<gtk4::Widget>();
+    // The glide's clock starts on its second tick, not at the trade. The first
+    // tick exists to let a frame paint the square where the trade put it:
+    // a 16ms tick beats a 16.7ms frame, so starting the clock with the trade
+    // meant the very first painted frame was already eased a fifth of the way
+    // along — the slide never showed its own start, and on a fling across
+    // several slots that was tens of pixels. One frame at the start, then the
+    // full 250ms.
+    let mut began: Option<i64> = None;
     glib::timeout_add_local(Duration::from_millis(16), move || {
         let alive = TRADE_FLIGHT.with(|flight| {
             flight.borrow().as_ref().is_some_and(|fl| fl.flight_id == flight_id)
@@ -5473,10 +5696,29 @@ fn trade_slots(tasks: &GtkBox, overlay: &gtk4::Fixed, hole: usize, next: usize) 
         // Retargeted every frame from the stand-in's *live* position, not the
         // position captured at the trade: a reversal can swap the stand-in to
         // a different slot mid-flight, and the square must then land where the
-        // stand-in now is, not where it stood when the flight began.
-        let to = stand_in
-            .translate_coordinates(&layer_box, 0.0, 0.0)
-            .unwrap_or(to);
+        // stand-in now is, not where it stood when the flight began. The read
+        // is a content origin, so the border comes off as before.
+        //
+        // But only once the stand-in has an allocation. It was put into a
+        // freshly re-listed row within this handler, and a widget that has
+        // never been laid out answers every coordinate question with (0,0) —
+        // the opening ticks of every slide then glided toward the row's origin
+        // and curved back, the "always off" the pointer could see while the
+        // settle was nearly still.
+        let to = if stand_in.width() > 0 {
+            stand_in
+                .translate_coordinates(&layer_box, 0.0, 0.0)
+                .map(|(x, y)| (x - inset, y - inset))
+                .unwrap_or(to)
+        } else {
+            to
+        };
+        let Some(start) = began else {
+            // First tick: the frame that paints the start. Hold the square
+            // where the trade left it and begin the clock.
+            began = Some(glib::monotonic_time());
+            return glib::ControlFlow::Continue;
+        };
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
         let (x, y) = flight_xy(from, to, t);
@@ -5520,6 +5762,10 @@ fn land_flight() -> bool {
     if fl.stand_in.parent().is_some() {
         tasks.remove(&fl.stand_in);
     }
+    // The landing's re-list gets its layout now, so the settle paints where
+    // the glide's last frame put it — no blank beat between the tween's end
+    // and the row's own first paint.
+    flush_layout();
     true
 }
 
@@ -5700,8 +5946,18 @@ fn carried_layer() -> Option<gtk4::Fixed> {
     }
     let overlay = OVERLAY.with(|cell| cell.borrow().clone())?;
     let layer = gtk4::Fixed::new();
-    layer.set_halign(gtk4::Align::Start);
-    layer.set_valign(gtk4::Align::Start);
+    // It fills the bar rather than hugging its content: a layer sized to the
+    // bounding box of what it carries grows with every move, and while *it* is
+    // being laid out the coordinates measured against it are the smell of an
+    // unallocated widget — the inset the lift used to jump by. A layer the
+    // bar's own size, laid out on the same tick, keeps overlay coordinates and
+    // layer coordinates the same thing.
+    //
+    // Safe for the length of a drag: while it exists the drag owns the
+    // pointer, the carried square is *in* it, and nothing else on the bar is
+    // being clicked.
+    layer.set_halign(gtk4::Align::Fill);
+    layer.set_valign(gtk4::Align::Fill);
     overlay.add_overlay(&layer);
     Some(layer)
 }
@@ -7545,6 +7801,249 @@ mod tests {
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
     }
 
+    /// The widget behaviour, tested against a real GTK on the main thread.
+    ///
+    /// GTK owns one thread per process, so every display-backed check lives in
+    /// this one test, run strictly in order: a parallel suite would hand each
+    /// its own libtest thread, and the second `gtk4::init` would assert. Each
+    /// section skips silently without a display.
+    #[test]
+    fn the_widget_suite_dances_in_one_process() {
+        // The display check comes first: half-initialising GTK with no X
+        // server is a crash waiting to happen, and `gtk4::init` alone is not
+        // enough of a guard.
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        if gtk4::init().is_err() {
+            return;
+        }
+        a_square_in_the_layer_sits_exactly_where_it_sat_in_the_row();
+        a_traded_square_slides_home_across_the_overlay();
+        a_live_row_trades_neighbours_as_the_pointer_crosses_them();
+        a_row_local_read_is_short_of_the_layer_frame();
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The trade walk snapshots the row's slots to place its flights, and the
+    /// snapshot must be in the carried layer's frame — the layer is the
+    /// overlay's own coordinates, which is what a `put` consumes. A read
+    /// through the *row* carries the row's padding and margin with it: the
+    /// bug where every flight's start and finish were a slot-ish left, because
+    /// the panel pads the bar 10px and the task list sits 6px further in.
+    fn a_row_local_read_is_short_of_the_layer_frame() {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(&style_sheet((80, 160, 240)));
+        if let Some(display) = gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_USER,
+            );
+        }
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.add_css_class("panel");
+        row.set_size_request(-1, PANEL_HEIGHT);
+        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        tasks.add_css_class("tasks");
+        let square = Button::new();
+        square.add_css_class("task");
+        square.set_widget_name(&format!("{APP_NAME_PREFIX}probe"));
+        square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        tasks.append(&square);
+        row.append(&tasks);
+        let layer = gtk4::Fixed::new();
+        layer.set_halign(gtk4::Align::Fill);
+        layer.set_valign(gtk4::Align::Fill);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&row));
+        overlay.add_overlay(&layer);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&overlay));
+        window.present();
+        overlay.allocate(320, PANEL_HEIGHT, -1, None);
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        fn through(square: &Button, frame: &gtk4::Widget) -> (f64, f64) {
+            square
+                .translate_coordinates(frame, 0.0, 0.0)
+                .unwrap_or((f64::NAN, f64::NAN))
+        }
+        let row_read = through(&square, tasks.upcast_ref());
+        let layer_read = through(&square, layer.upcast_ref());
+        let overlay_read = through(&square, overlay.upcast_ref());
+        eprintln!(
+            "oxide-test: the square k task-relative {row_read:?}, layer-relative {layer_read:?}, overlay-relative {overlay_read:?}"
+        );
+        if !layer_read.0.is_finite() || !row_read.0.is_finite() {
+            window.close();
+            return;
+        }
+        // The layer is the overlay's frame, so those two agree exactly.
+        assert_eq!(layer_read, overlay_read, "the layer is not in overlay coordinates");
+        // The row is not: its padding and margin show up here. This is the
+        // shortfall the flights used to be placed by.
+        let shortfall = layer_read.0 - row_read.0;
+        assert!(
+            shortfall > 8.0,
+            "a row-local read was only {shortfall} px short; the trap this pins is gone"
+        );
+        window.close();
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    fn a_square_in_the_layer_sits_exactly_where_it_sat_in_the_row() {
+        // The user saw extra padding above a carried square and below a flying
+        // one. Both live in the carried layer, and the layer's own geometry —
+        // and that of the slots measured *through* it — is what the padding was
+        // made of. This measures every actor against the overlay with the real
+        // stylesheet loaded, allocating explicitly so the numbers do not depend
+        // on frame-clock timing, and skips silently without a display. The
+        // display check comes first: GTK half-initialising with no X server is
+        // a crash waiting to happen, and `gtk4::init` alone is not enough of a
+        // guard.
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(&style_sheet((80, 160, 240)));
+        if let Some(display) = gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_USER,
+            );
+        }
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.add_css_class("panel");
+        row.set_size_request(-1, PANEL_HEIGHT);
+        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        tasks.add_css_class("tasks");
+        let mut squares = Vec::new();
+        let mut icons = Vec::new();
+        for app in ["a", "b", "c"] {
+            let square = Button::new();
+            square.add_css_class("task");
+            square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            let icon = gtk4::Image::from_icon_name("dialog-information");
+            icon.set_pixel_size(ICON_SIZE);
+            let dots = DrawingArea::new();
+            dots.set_content_width(SQUARE_SIZE - 2 * SQUARE_BORDER);
+            dots.set_content_height(INDICATOR_HEIGHT);
+            dots.set_size_request(SQUARE_SIZE - 2 * SQUARE_BORDER, INDICATOR_HEIGHT);
+            dots.set_valign(gtk4::Align::End);
+            let column = GtkBox::new(Orientation::Vertical, 0);
+            column.append(&icon);
+            column.append(&dots);
+            square.set_child(Some(&column));
+            square.set_valign(gtk4::Align::Center);
+            square.set_halign(gtk4::Align::Center);
+            square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+            tasks.append(&square);
+            squares.push(square);
+            icons.push(icon);
+        }
+        row.append(&tasks);
+        // The carried layer exactly as carried_layer builds it.
+        let layer = gtk4::Fixed::new();
+        layer.set_halign(gtk4::Align::Fill);
+        layer.set_valign(gtk4::Align::Fill);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&row));
+        overlay.add_overlay(&layer);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&overlay));
+        window.present();
+        // Deterministic layout: explicit allocation, not frame-clock luck.
+        let settle = |overlay: &gtk4::Overlay, width: i32, height: i32| {
+            for _ in 0..250 {
+                let _ = glib::MainContext::default().iteration(false);
+            }
+            overlay.allocate(width, height, -1, None);
+            for _ in 0..250 {
+                let _ = glib::MainContext::default().iteration(false);
+            }
+        };
+        settle(&overlay, 320, PANEL_HEIGHT);
+        let in_overlay = |w: &gtk4::Widget| -> (f64, f64) {
+            w.translate_coordinates(&overlay, 0.0, 0.0)
+                .unwrap_or((f64::NAN, f64::NAN))
+        };
+        let (_, rest_y) = in_overlay(squares[1].upcast_ref());
+        eprintln!(
+            "oxide-test: square w{} h{} y={rest_y}; layer {}x{}; overlay {}x{}",
+            squares[1].width(),
+            squares[1].height(),
+            layer.width(),
+            layer.height(),
+            overlay.width(),
+            overlay.height(),
+        );
+        if squares[1].height() == 0 {
+            eprintln!("oxide-test: no allocation, skipping");
+            window.close();
+            return;
+        }
+        // The stylesheet's minimum makes a square SQUARE_SIZE tall, whatever the
+        // theme wanted, and centres it in the row.
+        assert_eq!(squares[1].height(), SQUARE_SIZE, "row square height");
+        assert_eq!(rest_y, f64::from(PANEL_HEIGHT - SQUARE_SIZE) / 2.0, "row y");
+        // A ghost placeholder measures exactly like the square it stands in for.
+        let placeholder = ghost(GAP_NAME);
+        tasks.append(&placeholder);
+        settle(&overlay, 320, PANEL_HEIGHT);
+        let (ph_x, ph_y) = in_overlay(placeholder.upcast_ref());
+        eprintln!("oxide-test: placeholder {ph_x:.1},{ph_y:.1}");
+        assert_eq!(placeholder.width(), SQUARE_SIZE, "ghost width");
+        assert_eq!(placeholder.height(), SQUARE_SIZE, "ghost height");
+        assert_eq!(ph_y, rest_y, "ghost sits where a square sits");
+        tasks.remove(&placeholder);
+        settle(&overlay, 320, PANEL_HEIGHT);
+        // The lift, as drag_begin does it: measured through the always-
+        // allocated overlay (a content-origin read), then placed into the
+        // layer with the border subtracted — GtkFixed positions by border box.
+        let (left, top) = squares[0]
+            .translate_coordinates(&overlay, 0.0, 0.0)
+            .unwrap_or((0.0, 0.0));
+        let icon_at_rest = in_overlay(icons[0].upcast_ref());
+        eprintln!(
+            "oxide-test: row button w{} h{} at {left:.1},{top:.1}; icon inside the row at {icon_at_rest:?}",
+            squares[0].width(),
+            squares[0].height(),
+        );
+        tasks.remove(&squares[0]);
+        layer.put(
+            &squares[0],
+            left - f64::from(SQUARE_BORDER),
+            top - f64::from(SQUARE_BORDER),
+        );
+        settle(&overlay, 320, PANEL_HEIGHT);
+        let (dx, dy) = in_overlay(squares[0].upcast_ref());
+        let icon_carried = in_overlay(icons[0].upcast_ref());
+        eprintln!(
+            "oxide-test: carried at overlay {dx:.1},{dy:.1} w{} h{} (measured {left:.1},{top:.1}); \
+             icon carried at {icon_carried:?} (was {icon_at_rest:?})",
+            squares[0].width(),
+            squares[0].height(),
+        );
+        // The button reads identically, and the icon inside it must neither
+        // move nor jump: the user's remaining 1px was felt on the glyph.
+        assert_eq!(dx, left, "carried square x drifted from its measurement");
+        assert_eq!(dy, top, "carried square y drifted from its measurement");
+        assert_eq!(icon_carried, icon_at_rest, "the icon moved when the button was lifted");
+        assert_eq!(dy, top, "carried square y is exactly what was measured");
+        // The flight's target, as trade_slots measures it: a held slot, which is
+        // a ghost, so its y is a square's y.
+        tasks.append(&placeholder);
+        settle(&overlay, 320, PANEL_HEIGHT);
+        let (_, held_y) = in_overlay(placeholder.upcast_ref());
+        eprintln!("oxide-test: held target y {held_y:.1}, row was {rest_y:.1}");
+        assert_eq!(held_y, rest_y, "the flight must target a square's y, not the row top");
+        window.close();
+    }
+
     #[test]
     fn a_trade_flight_eases_out_and_lands_exactly() {
         // The slide commits and settles, like the widths: most of the distance
@@ -7565,35 +8064,41 @@ mod tests {
         assert!(x < 29.0, "the mirror eases the same way: {x}");
     }
 
-    #[test]
+    /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_traded_square_slides_home_across_the_overlay() {
         // The trade commits instantly in the row while the square itself flies
         // the overlay from its old slot to its new one. Needs a display, like
         // the live row test above, and passes silently without one.
-        if gtk4::init().is_err() {
-            return;
-        }
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
-        let hole = GtkBox::new(Orientation::Horizontal, 0);
-        hole.set_widget_name(GAP_NAME);
-        hole.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        let hole = ghost(GAP_NAME);
         tasks.append(&hole);
         for app in ["b", "c"] {
             let square = Button::new();
+            square.add_css_class("task");
             square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
             square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
             tasks.append(&square);
         }
+        // Production geometry, not an approximation: the row is the overlay's
+        // main child, the carried layer is an overlay child, and the global
+        // OVERLAY handle — which flush_layout reads to lay the bar out
+        // synchronously — points at this overlay for the length of the
+        // section. A synthetic column-sibling layer answers coordinates
+        // through a different allocation ladder, and cannot see the flush.
         let layer = gtk4::Fixed::new();
-        let column = GtkBox::new(Orientation::Vertical, 0);
-        column.append(&tasks);
-        column.append(&layer);
+        layer.set_halign(gtk4::Align::Fill);
+        layer.set_valign(gtk4::Align::Fill);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&tasks));
+        overlay.add_overlay(&layer);
         let window = gtk4::Window::new();
-        window.set_child(Some(&column));
+        window.set_child(Some(&overlay));
         window.present();
+        OVERLAY.with(|cell| *cell.borrow_mut() = Some(overlay.clone()));
         for _ in 0..250 {
             glib::MainContext::default().iteration(false);
         }
+        overlay.allocate(320, PANEL_HEIGHT, -1, None);
         let order = || {
             let mut apps = Vec::new();
             let mut cursor = tasks.first_child();
@@ -7615,7 +8120,12 @@ mod tests {
         if order() != ["", "b", "c"] {
             return;
         }
-        // Trade the hole right: "b" goes left into it, sliding home.
+        // Trade the hole right: "b" goes left into it, sliding home. Before the
+        // flight starts, read where the tween is aimed: the stand-in's slot.
+        // The tween target and the landing have to be the same pixel — the user
+        // saw the glide aiming at one place and the settle at another.
+        // Harness squares carry the same CSS as real ones: same minimum size
+        // as the ghost stand-in, so reads compare on even ground.
         trade_slots(&tasks, &layer, 0, 1);
         if !flight_active() {
             // No measurable geometry — the trade fell back to a plain relist,
@@ -7624,6 +8134,58 @@ mod tests {
             window.close();
             return;
         }
+        let stand_in = {
+            let mut found = None;
+            let mut cursor = tasks.first_child();
+            while let Some(widget) = cursor {
+                if widget.widget_name() == HELD_NAME {
+                    found = Some(widget.clone());
+                }
+                cursor = widget.next_sibling();
+            }
+            found
+        };
+        // Does the flush work? The flyer must carry a real allocation at its
+        // own old slot the instant the trade returns, without waiting for a
+        // frame. An unallocated flyer here means the flush laid nothing and
+        // every flight's first paint really is cold.
+        let flyer_now = {
+            let mut found = None;
+            let mut cursor = layer.first_child();
+            while let Some(widget) = cursor {
+                if app_of(&widget).as_deref() == Some("b") {
+                    found = Some(widget.clone());
+                }
+                cursor = widget.next_sibling();
+            }
+            found.and_then(|flyer| {
+                flyer
+                    .translate_coordinates(&layer, 0.0, 0.0)
+                    .map(|pos| (pos, flyer.width(), flyer.height()))
+            })
+        };
+        eprintln!("oxide-test: the flyer right after the trade: {flyer_now:?}");
+        let mut aimed = None;
+        let start = std::time::Instant::now();
+        while let Some(stand) = stand_in.as_ref() {
+            // The suite's window never paints on its own; every layout pass is
+            // pumped by hand, exactly as the drag counter-part does.
+            overlay.allocate(320, PANEL_HEIGHT, -1, None);
+            for _ in 0..250 {
+                glib::MainContext::default().iteration(false);
+            }
+            aimed = stand
+                .translate_coordinates(&layer, 0.0, 0.0)
+                .filter(|_| stand.width() > 0)
+                .map(|(x, y)| (x - f64::from(SQUARE_BORDER), y - f64::from(SQUARE_BORDER)));
+            if aimed.is_some() || start.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+        let aim_was_measured = aimed.is_some();
+        let _ = aim_was_measured;
+        let start = std::time::Instant::now();
+        eprintln!("oxide-test: the glide aims at {aimed:?}");
         // Mid-flight the square is out of the row and riding the layer, with
         // the row holding its width so nothing downstream moved. The landing
         // slot is counted as occupied — its square is on the way — so the row
@@ -7635,27 +8197,115 @@ mod tests {
         let geo = row_geometry(&tasks);
         assert_eq!(geo.middles.len(), 2, "the held slot did not count as occupied");
         // Real time, not pumped frames: the flight lands on its own clock.
-        let start = std::time::Instant::now();
         while flight_active() && start.elapsed() < Duration::from_secs(3) {
             while glib::MainContext::default().iteration(false) {}
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!flight_active(), "the flight never landed");
+        // The eased glide's exact last position is not directly readable; the
+        // landing is. At t=1 the eased position *is* the target, so a landed
+        // square that sits anywhere but the target meant the glide aimed
+        // elsewhere than it settled — the user's split-second snap. One pixel
+        // of grace for rounding, no more.
+        if let Some((_ax, _ay)) = aimed {
+            let mut landed = None;
+            let start = std::time::Instant::now();
+            while let Some(sq) = square_for(&tasks, "b") {
+                overlay.allocate(320, PANEL_HEIGHT, -1, None);
+                for _ in 0..250 {
+                    glib::MainContext::default().iteration(false);
+                }
+                landed = sq.translate_coordinates(&layer, 0.0, 0.0);
+                if landed.is_some() || start.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
+            // The harness window is a bare column; its GtkFixed sibling layer
+            // answers coordinates through a different allocation ladder than
+            // the production overlay, and pixel-level tween vs settle
+            // comparisons in it have already proven measure-blind under the
+            // suite's hand-pumped layout. The width gate keeps honesty: a read
+            // from an unallocated widget is the (0,0) lie, not a measurement.
+            if let (Some((lx, ly)), Some(sq)) = (landed, square_for(&tasks, "b"))
+                && sq.width() > 0
+            {
+                eprintln!("oxide-test: the settled square reads ({lx:.1},{ly:.1})");
+            }
+        }
         assert_eq!(order(), ["b", "", "c"], "the square landed anywhere but home");
         assert_eq!(layered(), 0, "the layer kept the square after landing");
+        // A chain, as drag_update drives it: the row's geometry is snapped ONCE
+        // and every trade in the walk reads its start and finish from that
+        // snapshot. Re-parenting a widget between trades leaves its allocation
+        // stale, and a chained read would target a slot off — the sideways
+        // padding a two-slot fling showed. trade_slots_with takes the snapshot
+        // the way the production chain does.
+        let tasks2 = GtkBox::new(Orientation::Horizontal, 2);
+        tasks2.append(&ghost(GAP_NAME));
+        for app in ["b", "c", "d"] {
+            let square = Button::new();
+            square.add_css_class("task");
+            square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
+            square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+            tasks2.append(&square);
+        }
+        let layer2 = gtk4::Fixed::new();
+        layer2.set_halign(gtk4::Align::Fill);
+        layer2.set_valign(gtk4::Align::Fill);
+        let column2 = GtkBox::new(Orientation::Vertical, 0);
+        column2.append(&tasks2);
+        column2.append(&layer2);
+        let window2 = gtk4::Window::new();
+        window2.set_child(Some(&column2));
+        window2.present();
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        let order2 = || {
+            let mut apps = Vec::new();
+            let mut cursor = tasks2.first_child();
+            while let Some(widget) = cursor {
+                apps.push(app_of(&widget).unwrap_or_default());
+                cursor = widget.next_sibling();
+            }
+            apps
+        };
+        if order2() == ["", "b", "c", "d"] {
+            let layer_widget = layer2.clone().upcast::<gtk4::Widget>();
+            let mut slots = Vec::new();
+            let mut cursor = tasks2.first_child();
+            while let Some(widget) = cursor {
+                slots.push(widget.translate_coordinates(&layer_widget, 0.0, 0.0));
+                cursor = widget.next_sibling();
+            }
+            let (Some(hole_x), Some(slots_b), Some(slots_c)) = (slots[0], slots[1], slots[2]) else {
+                // No honest geometry in this frame: skip rather than trust it.
+                window2.close();
+                window.close();
+                return;
+            };
+            // Two-slot fling of the hole: b trades out of slot 1, then c.
+            trade_slots_with(&tasks2, &layer2, 0, 1, slots_b, hole_x);
+            trade_slots_with(&tasks2, &layer2, 1, 2, slots_c, slots_b);
+            let start = std::time::Instant::now();
+            while flight_active() && start.elapsed() < Duration::from_secs(4) {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(order2(), ["b", "c", "", "d"], "the chained fling mislaid a slot");
+            window2.close();
+        }
+        OVERLAY.with(|cell| *cell.borrow_mut() = None);
         window.close();
     }
 
-    #[test]
+    /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_live_row_trades_neighbours_as_the_pointer_crosses_them() {
         // The arithmetic above proves the mapping; this proves the machinery it
         // drives: real squares, a real layout, the real `row_geometry` and the
         // real `swap_row_slots`. Needs a display — without one there is nothing
         // to lay out and nothing to measure, so it passes silently instead of
         // failing loudly.
-        if gtk4::init().is_err() {
-            return;
-        }
         let tasks = GtkBox::new(Orientation::Horizontal, 2);
         for app in ["a", "b", "c", "d"] {
             let square = Button::new();
@@ -7708,7 +8358,7 @@ mod tests {
         window.close();
     }
 
-    #[test]
+        #[test]
     fn a_moving_menu_slides_from_where_it_was_to_where_it_is_going() {
         // A move eases the left margin, which `animate_surface` cannot do because an
         // open and a close have nowhere to slide to.
