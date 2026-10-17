@@ -294,7 +294,9 @@ where
             // logical size and the renderer multiplies it back up by the scale.
             let logical = physical.to_f64().to_logical(scale);
             let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
-            if let Some(element) = crate::background::element(renderer, output_size, physical) {
+            if let Some(element) =
+                crate::background::element(renderer, output_size, scale, physical)
+            {
                 output_render_elements.push(OutputRenderElements::Background(element));
             }
         }

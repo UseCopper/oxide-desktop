@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use smithay::{
     backend::{
@@ -33,6 +34,17 @@ use smithay::{
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Size, Transform},
 };
+
+/// How long the wallpaper takes to settle in: coming up from nothing while
+/// growing to fill the output. Long enough to be a desktop arriving, short
+/// enough not to be a wait.
+const BACKGROUND_FADE: Duration = Duration::from_millis(700);
+/// Where the wallpaper starts, as a fraction of the output it fills. Small
+/// enough to read as growing, large enough that the picture is recognisable
+/// from the first frame.
+const BACKGROUND_START_SCALE: f64 = 0.85;
+/// When the wallpaper was first drawn, which is when its arrival starts.
+static APPEARED: OnceLock<Instant> = OnceLock::new();
 
 /// The image, decoded at most once, off the compositor's thread.
 static WALLPAPER: OnceLock<Mutex<Option<Wallpaper>>> = OnceLock::new();
@@ -50,12 +62,20 @@ struct Wallpaper {
 /// The wallpaper element for one output, cover-scaled to fill it.
 ///
 /// `output` is the output's logical size — what the element is measured in —
-/// and `max_physical` the most pixels it will ever be drawn at, which is what
-/// the image is decoded down to. The image is cropped to the output's shape and
-/// stretched over it, so the picture fills the screen without distortion.
+/// `scale` its fractional scale, and `max_physical` the most pixels it will ever
+/// be drawn at, which is what the image is decoded down to. The image is
+/// cropped to the output's shape and stretched over it, so the picture fills the
+/// screen without distortion.
+///
+/// For the first [`BACKGROUND_FADE`] after the image first appears it comes up
+/// from nothing while growing from [`BACKGROUND_START_SCALE`] of the output to
+/// all of it, centred — the desktop arriving rather than blinking on. Both run
+/// on the same ease-out, and both are finished inside the animation's clock, so
+/// a frame that arrives late is simply further along.
 pub fn element<R>(
     renderer: &mut R,
     output: Size<i32, Logical>,
+    scale: f64,
     max_physical: Size<i32, Physical>,
 ) -> Option<MemoryRenderBufferRenderElement<R>>
 where
@@ -63,12 +83,39 @@ where
     R::TextureId: Send + Clone + 'static,
 {
     let wallpaper = wallpaper(max_physical)?;
-    let (src, size) = cover(wallpaper.size, output);
+    let (src, full) = cover(wallpaper.size, output);
+
+    // The appearance, timed from the first frame that has an image to draw. A
+    // wallpaper that takes a second to decode should not have spent its fade
+    // waiting for itself — and the frame that starts it is the beginning of the
+    // animation, not its end.
+    let appeared = *APPEARED.get_or_init(Instant::now);
+    let elapsed = appeared.elapsed().as_secs_f64();
+    let t = (elapsed / BACKGROUND_FADE.as_secs_f64()).clamp(0.0, 1.0);
+    let ease = crate::shell::animation::ease_out_cubic(t);
+    let grow = BACKGROUND_START_SCALE + (1.0 - BACKGROUND_START_SCALE) * ease;
+
+    // The crop is the whole output's, drawn smaller and centred: the picture
+    // grows into the screen rather than being re-cropped as it goes, so nothing
+    // inside it shifts while it arrives.
+    let size = Size::from((
+        (full.w as f64 * grow).round() as i32,
+        (full.h as f64 * grow).round() as i32,
+    ));
+    let drawn: Size<i32, Physical> = Size::from((
+        (size.w as f64 * scale).round() as i32,
+        (size.h as f64 * scale).round() as i32,
+    ));
+    let location = Point::from((
+        (max_physical.w - drawn.w) as f64 / 2.0,
+        (max_physical.h - drawn.h) as f64 / 2.0,
+    ));
+
     MemoryRenderBufferRenderElement::from_buffer(
         renderer,
-        Point::from((0.0, 0.0)),
+        location,
         &wallpaper.buffer,
-        None,
+        Some(ease as f32),
         Some(src),
         Some(size),
         Kind::Unspecified,

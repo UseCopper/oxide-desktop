@@ -4563,6 +4563,45 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     start_polling(&tasks, &menu, &channel, hover, &context);
 
     bar.present();
+    // And then it slides in from above the top edge. The bar is a layer surface
+    // anchored to that edge, so its own margin is the only thing that moves it —
+    // a negative one puts it off the screen, and the compositor clips what is
+    // outside the output. The margin is a protocol margin, which is signed, so
+    // this is the same mechanism the menus slide with, in reverse.
+    drop_in(&bar);
+}
+
+/// How long the bar takes to slide down into place.
+const BAR_SLIDE: Duration = Duration::from_millis(400);
+
+/// Slide a freshly presented bar in from above the top edge on an ease-out.
+///
+/// The bar is placed above the screen and eases down to its resting margin, so
+/// the panel arrives rather than blinking on. The exclusive zone is set
+/// explicitly by the bar itself, so the space it reserves is claimed from the
+/// first frame: windows do not start under it and then move.
+fn drop_in(bar: &ApplicationWindow) {
+    let from = -PANEL_HEIGHT;
+    let start = glib::monotonic_time();
+    bar.set_margin(Edge::Top, from);
+    glib::timeout_add_local(Duration::from_millis(16), glib::clone!(
+        #[weak]
+        bar,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
+        move || {
+            let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+            let t = (elapsed / BAR_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
+            bar.set_margin(Edge::Top, ease_margin(from, 0, ease_out(t)));
+            if t < 1.0 {
+                return glib::ControlFlow::Continue;
+            }
+            // Land exactly on the resting margin, so no rounding residue is
+            // left to show up as a hairline above the bar.
+            bar.set_margin(Edge::Top, 0);
+            glib::ControlFlow::Break
+        }
+    ));
 }
 
 /// The bar: a fixed-height strip across the top of the output.
