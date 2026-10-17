@@ -4138,6 +4138,7 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // not be able to out-minimum the code's own arithmetic.
     let square = SQUARE_SIZE;
     let panel_height = PANEL_HEIGHT;
+    let bar_slide = BAR_SLIDE.as_millis() as i32;
     // How full a square looks, by how much of its app is on screen — see the
     // `running` and `minimized` rules below. Numbers rather than literals in the
     // sheet, so the ladder can be asserted instead of eyeballed.
@@ -4167,14 +4168,19 @@ window.panel-window {{
 .panel {{
     background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
     padding: 0 10px;
+    /* The bar slides in by *moving*: the whole row, its own fill included, is
+       translated up a bar's height and then released to nothing, and the
+       surface clips what hangs outside it. A transition on `transform` is the
+       only way to move a widget in GTK without also resizing it — a margin
+       stretches the box, and a revealer compensates for its own slide by
+       growing the child, which leaves a fill that covers the surface from the
+       first frame while only the contents move. */
+    transform: translate(0, 0);
+    transition: transform {bar_slide}ms ease-out;
 }}
-/* The bar's revealer, which slides the whole bar in at startup. Its minimum
-   height is the bar's own: a revealer measures a child it is hiding at a
-   fraction of its size, and a surface that shrinks and grows to meet it is a
-   resize the compositor has to follow — and an exclusive zone that moves with
-   it. Pinned here, what slides is a picture of a bar, not the bar's shape. */
-.bar-slide {{
-    min-height: {panel_height}px;
+/* Where the bar starts: a bar-height above its own top edge. */
+.panel.dropping {{
+    transform: translate(0, -{panel_height}px);
 }}
 .panel label {{
     color: #e8e8e8;
@@ -4299,7 +4305,6 @@ button.context-row:hover {{
 button.context-row label {{
     color: #e8e8e8;
     background: transparent;
-}}
 }}
 "
     )
@@ -4535,7 +4540,7 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // reconnect is a single assignment rather than something each holder has to be told
     // about — and cannot be missed by.
     let channel = Channel::new(socket.clone());
-    let (bar, bar_row, tasks, bar_slide) = build_bar_window(app, &monitor);
+    let (bar, bar_row, tasks) = build_bar_window(app, &monitor);
     // The same handle, not a copy of the socket: a reconnect is then a single assignment
     // and there is no second place where a menu can still be holding the connection that
     // just died. The context menu used to be given its own, and nothing ever set it, so
@@ -4572,9 +4577,13 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     start_polling(&tasks, &menu, &channel, hover, &context);
 
     bar.present();
-    // And then it slides down into place: the revealer draws the bar above its
-    // own top edge and lets it down over BAR_SLIDE, on GTK's ease-out cubic.
-    bar_slide.set_reveal_child(true);
+    // And then it slides down into place. A frame first, so the bar has been
+    // drawn where it starts: a transition needs a state to move from, and one
+    // that is never shown is not a state.
+    let row = bar_row.clone();
+    glib::timeout_add_local_once(Duration::from_millis(16), move || {
+        row.remove_css_class("dropping");
+    });
 }
 
 /// How long the bar takes to slide down into place.
@@ -4585,10 +4594,7 @@ const BAR_SLIDE: Duration = Duration::from_millis(250);
 /// Returns the window and the box the app squares go in, rather than having the
 /// caller dig the box back out of the widget tree — the row's first child is the
 /// title label, not the task list.
-fn build_bar_window(
-    app: &Application,
-    monitor: &gdk::Monitor,
-) -> (ApplicationWindow, GtkBox, GtkBox, gtk4::Revealer) {
+fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWindow, GtkBox, GtkBox) {
     let window = ApplicationWindow::builder().application(app).build();
     window.set_decorated(false);
     window.add_css_class("panel-window");
@@ -4651,21 +4657,13 @@ fn build_bar_window(
     // drag, a layer that was always there, doing nothing, eating every click.
     OVERLAY.with(|cell| *cell.borrow_mut() = Some(overlay.clone()));
 
-    // The whole bar, wrapped in a revealer so it can slide in at startup.
-    //
-    // A revealer is the one GTK widget that animates moving a child *within* its own
-    // space rather than resizing for it: it draws the child above its top edge and slides
-    // it down on an ease-out cubic — the curve the rest of this desktop moves on, which
-    // is why this is a revealer and not a margin. The minimum height keeps it exactly a
-    // bar tall while it slides, so the surface the compositor sees never changes size.
-    let revealer = gtk4::Revealer::new();
-    revealer.add_css_class("bar-slide");
-    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    revealer.set_transition_duration(BAR_SLIDE.as_millis() as u32);
-    revealer.set_child(Some(&overlay));
+    // Where the bar starts when it slides in: a bar-height above itself, which
+    // the surface clips. Removed a frame after the window is presented, and the
+    // transition in the stylesheet carries it down.
+    row.add_css_class("dropping");
 
-    window.set_child(Some(&revealer));
-    (window, row, tasks, revealer)
+    window.set_child(Some(&overlay));
+    (window, row, tasks)
 }
 
 /// Reorder the squares by dragging: a press that is held for [`DRAG_HOLD`] — or
@@ -8242,6 +8240,41 @@ mod tests {
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
     }
 
+    /// Everything GLib logged while `body` ran, complaints only.
+    ///
+    /// GTK's CSS engine reports a property it does not know by logging and
+    /// dropping it, so a stylesheet that is half-understood looks fine in the
+    /// file and does nothing on screen. The one way to know is to load it and
+    /// read what it said.
+    fn gtk_complaints(body: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Mutex, Once};
+        static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static ONCE: Once = Once::new();
+
+        ONCE.call_once(|| unsafe {
+            glib::log_set_writer_func(|level, fields| {
+                let line = fields
+                    .iter()
+                    .map(|field| format!("{}={}", field.key(), field.value_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let flag = if matches!(
+                    level,
+                    glib::LogLevel::Critical | glib::LogLevel::Warning | glib::LogLevel::Error
+                ) {
+                    "COMPLAINT"
+                } else {
+                    "info"
+                };
+                LOG.lock().unwrap().push(format!("{flag}: {line}"));
+                glib::LogWriterOutput::Handled
+            });
+        });
+        LOG.lock().unwrap().clear();
+        body();
+        std::mem::take(&mut *LOG.lock().unwrap())
+    }
+
     /// The widget behaviour, tested against a real GTK on the main thread.
     ///
     /// GTK owns one thread per process, so every display-backed check lives in
@@ -8863,87 +8896,68 @@ mod tests {
 
         /// Section of `the_widget_suite_dances_in_one_process`.
     ///
-    /// The bar slides in inside a revealer, which draws its child above its own
-    /// top edge and lets it down on GTK's ease-out cubic. What matters is what
-    /// the compositor sees: a revealer measures a child it is still hiding at a
-    /// fraction of its size, so without a minimum the bar's surface would grow
-    /// from nothing as it slid — a resize, with the exclusive zone moving with
-    /// it. The CSS minimum is what makes it a picture of a bar sliding, not the
-    /// bar's own shape changing.
+    /// The bar slides in by being translated: the row is placed a bar-height
+    /// above itself and released, and the transition on `transform` in the
+    /// stylesheet carries it down — the one way GTK moves a widget without also
+    /// resizing it. Everything about that lives in CSS, so what a test can hold
+    /// is that the stylesheet is one the CSS parser accepts: a property it does
+    /// not know is dropped with a warning, and the bar would simply never move.
     fn a_sliding_bar_keeps_its_shape() {
         if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return;
         }
-        let provider = gtk4::CssProvider::new();
-        provider.load_from_data(&style_sheet((80, 160, 240)));
-        if let Some(display) = gdk::Display::default() {
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        let sheet = style_sheet((80, 160, 240));
+        assert!(sheet.contains("transition: transform"), "no transform transition");
+        assert!(sheet.contains("transform: translate(0, -40px)"), "no off-screen start");
+        // The parser is the thing that decides, and it says so through the log.
+        let complaints = gtk_complaints(|| {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_data(&sheet);
+        });
+        for complaint in &complaints {
+            assert!(
+                !complaint.contains("Theme parser error") && !complaint.contains("not a valid property"),
+                "the stylesheet was refused in part: {complaint}"
             );
         }
+        // And the row itself: with the class on, CSS moves it — which also says
+        // the property is one this GTK applies, not just one it parses.
         let row = GtkBox::new(Orientation::Horizontal, 8);
         row.add_css_class("panel");
         row.set_size_request(-1, PANEL_HEIGHT);
-        let square = Button::new();
-        square.add_css_class("task");
-        square.set_widget_name(&format!("{APP_NAME_PREFIX}probe"));
-        square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
-        row.append(&square);
+        row.add_css_class("dropping");
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&row));
-        let revealer = gtk4::Revealer::new();
-        revealer.add_css_class("bar-slide");
-        revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-        revealer.set_transition_duration(BAR_SLIDE.as_millis() as u32);
-        revealer.set_child(Some(&overlay));
         let window = gtk4::Window::new();
-        window.set_child(Some(&revealer));
+        window.set_child(Some(&overlay));
         window.present();
         let settle = || {
-            revealer.allocate(320, PANEL_HEIGHT, -1, None);
+            overlay.allocate(320, PANEL_HEIGHT, -1, None);
             for _ in 0..100 {
                 glib::MainContext::default().iteration(false);
             }
         };
         settle();
-        if revealer.height() == 0 {
+        let offset = || row.translate_coordinates(&overlay, 0.0, 0.0).map(|at| at.1);
+        if offset() != Some(0.0) && offset().is_none() {
             // Nothing was laid out (no display): the harness proves nothing.
             window.close();
             return;
         }
-        // Hidden, the child measures at nothing — and the bar is still a bar
-        // tall, which is the whole point of the minimum.
         assert_eq!(
-            revealer.height(),
-            PANEL_HEIGHT,
-            "a hidden bar is not a bar tall: the surface would grow as it slid"
+            offset(),
+            Some(-40.0),
+            "the dropping class did not move the bar: the transform was dropped"
         );
-        revealer.set_reveal_child(true);
-        settle();
-        assert_eq!(
-            revealer.height(),
-            PANEL_HEIGHT,
-            "the bar's height moved with the slide"
-        );
-        // The slide itself runs on the frame clock, which a harness without a
-        // compositor may never tick. When it does, the bar ends where it should:
-        // a bar tall, at the top of its overlay. When it does not, the shape
-        // assertions above are the ones that mattered.
+
+        // Released, it travels back to nothing. The transition runs on the frame
+        // clock, which a harness without a compositor may never tick; when it
+        // does, the bar comes to rest exactly on its edge.
+        row.remove_css_class("dropping");
         let start = std::time::Instant::now();
-        while !revealer.is_child_revealed() && start.elapsed() < Duration::from_secs(2) {
+        while offset() != Some(0.0) && start.elapsed() < Duration::from_secs(2) {
             while glib::MainContext::default().iteration(false) {}
             std::thread::sleep(Duration::from_millis(10));
-        }
-        if revealer.is_child_revealed() {
-            assert_eq!(row.height(), PANEL_HEIGHT, "the revealed row is not a bar tall");
-            assert_eq!(revealer.height(), PANEL_HEIGHT, "the slide resized the bar");
-            assert_eq!(
-                row.translate_coordinates(&overlay, 0.0, 0.0).map(|at| at.1),
-                Some(0.0),
-                "the revealed bar is not at the top of its overlay"
-            );
         }
         window.close();
     }
@@ -9050,3 +9064,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
