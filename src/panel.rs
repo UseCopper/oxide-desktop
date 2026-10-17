@@ -5384,11 +5384,18 @@ fn drag_update(pointer_x: f64) -> bool {
     // last allocation — a whole slot off, which is where a chained flight's
     // target used to drift sideways. Widths are uniform, so a slot's x holds
     // across every relist in the chain and the snapshot stays honest.
+    // Snapshotted in the carried layer's own coordinates, not the row's: the
+    // trades below put and move the squares in the layer, and a row-local read
+    // carries the row's padding and margin with it — 16px here, most of a
+    // slot — which put every flight's start and finish that far left of where
+    // the square actually was. The layer is the overlay's own frame, so a
+    // snapshot through it is directly usable as a put coordinate.
+    let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
     let slots: Vec<Option<(f64, f64)>> = {
         let mut slots = Vec::new();
         let mut cursor = tasks.first_child();
         while let Some(widget) = cursor {
-            slots.push(widget.translate_coordinates(&tasks, 0.0, 0.0));
+            slots.push(widget.translate_coordinates(&layer_frame, 0.0, 0.0));
             cursor = widget.next_sibling();
         }
         slots
@@ -7814,6 +7821,79 @@ mod tests {
         a_square_in_the_layer_sits_exactly_where_it_sat_in_the_row();
         a_traded_square_slides_home_across_the_overlay();
         a_live_row_trades_neighbours_as_the_pointer_crosses_them();
+        a_row_local_read_is_short_of_the_layer_frame();
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The trade walk snapshots the row's slots to place its flights, and the
+    /// snapshot must be in the carried layer's frame — the layer is the
+    /// overlay's own coordinates, which is what a `put` consumes. A read
+    /// through the *row* carries the row's padding and margin with it: the
+    /// bug where every flight's start and finish were a slot-ish left, because
+    /// the panel pads the bar 10px and the task list sits 6px further in.
+    fn a_row_local_read_is_short_of_the_layer_frame() {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(&style_sheet((80, 160, 240)));
+        if let Some(display) = gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_USER,
+            );
+        }
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.add_css_class("panel");
+        row.set_size_request(-1, PANEL_HEIGHT);
+        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        tasks.add_css_class("tasks");
+        let square = Button::new();
+        square.add_css_class("task");
+        square.set_widget_name(&format!("{APP_NAME_PREFIX}probe"));
+        square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        tasks.append(&square);
+        row.append(&tasks);
+        let layer = gtk4::Fixed::new();
+        layer.set_halign(gtk4::Align::Fill);
+        layer.set_valign(gtk4::Align::Fill);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&row));
+        overlay.add_overlay(&layer);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&overlay));
+        window.present();
+        overlay.allocate(320, PANEL_HEIGHT, -1, None);
+        for _ in 0..250 {
+            glib::MainContext::default().iteration(false);
+        }
+        fn through(square: &Button, frame: &gtk4::Widget) -> (f64, f64) {
+            square
+                .translate_coordinates(frame, 0.0, 0.0)
+                .unwrap_or((f64::NAN, f64::NAN))
+        }
+        let row_read = through(&square, tasks.upcast_ref());
+        let layer_read = through(&square, layer.upcast_ref());
+        let overlay_read = through(&square, overlay.upcast_ref());
+        eprintln!(
+            "oxide-test: the square k task-relative {row_read:?}, layer-relative {layer_read:?}, overlay-relative {overlay_read:?}"
+        );
+        if !layer_read.0.is_finite() || !row_read.0.is_finite() {
+            window.close();
+            return;
+        }
+        // The layer is the overlay's frame, so those two agree exactly.
+        assert_eq!(layer_read, overlay_read, "the layer is not in overlay coordinates");
+        // The row is not: its padding and margin show up here. This is the
+        // shortfall the flights used to be placed by.
+        let shortfall = layer_read.0 - row_read.0;
+        assert!(
+            shortfall > 8.0,
+            "a row-local read was only {shortfall} px short; the trap this pins is gone"
+        );
+        window.close();
     }
 
     /// Section of `the_widget_suite_dances_in_one_process`.
@@ -8127,7 +8207,7 @@ mod tests {
         // square that sits anywhere but the target meant the glide aimed
         // elsewhere than it settled — the user's split-second snap. One pixel
         // of grace for rounding, no more.
-        if let Some((ax, ay)) = aimed {
+        if let Some((_ax, _ay)) = aimed {
             let mut landed = None;
             let start = std::time::Instant::now();
             while let Some(sq) = square_for(&tasks, "b") {
