@@ -253,22 +253,6 @@ where
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
 
-        // The wallpaper, under everything. Drawn first in the list, which is
-        // what makes it the bottom of the output: the windows, the layers and
-        // the panel all go over it.
-        let scale = output.current_scale().fractional_scale();
-        if let Some(mode) = output.current_mode() {
-            // The element is sized in logical units, so the output's own logical
-            // size is what the crop is stretched to; the renderer multiplies it
-            // back up by the scale.
-            let physical = output.current_transform().transform_size(mode.size);
-            let logical = physical.to_f64().to_logical(scale);
-            let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
-            if let Some(element) = crate::background::element(renderer, output_size) {
-                output_render_elements.push(OutputRenderElements::Background(element));
-            }
-        }
-
         // The snap preview sits just behind the cursor and above the windows,
         // so it highlights the target area without being hidden by them.
         if let Some((rect, alpha)) = snap_preview(output, space) {
@@ -298,6 +282,22 @@ where
         )
         .expect("output without mode?");
         output_render_elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+        // The wallpaper, last, which is the back: these lists run front to
+        // back, so everything above is already in place. It is built after the
+        // rest only because of that — the image itself is decoded once, on its
+        // own thread, and only the element is per-frame.
+        if let Some(mode) = output.current_mode() {
+            let scale = output.current_scale().fractional_scale();
+            let physical = output.current_transform().transform_size(mode.size);
+            // Sized in logical units, so it is stretched to the output's own
+            // logical size and the renderer multiplies it back up by the scale.
+            let logical = physical.to_f64().to_logical(scale);
+            let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
+            if let Some(element) = crate::background::element(renderer, output_size, physical) {
+                output_render_elements.push(OutputRenderElements::Background(element));
+            }
+        }
 
         (output_render_elements, CLEAR_COLOR)
     }

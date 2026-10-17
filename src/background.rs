@@ -1,16 +1,24 @@
 //! The wallpaper: one image, drawn under everything, covering each output.
 //!
 //! There is no desktop surface to put a picture on, so the picture is the
-//! bottom of every output's element list: the compositor draws it first, in the
-//! output's own coordinates, and the windows go over it.
+//! bottom of every output's element list: the compositor draws it last, in the
+//! output's own coordinates, with the windows and layers over it. (Those lists
+//! are front-to-back — the cursor is first and topmost — so the back is the
+//! end.)
 //!
 //! Where the image comes from is a path, checked in the order a user would
 //! expect: an explicit `OXIDE_WALLPAPER`, then the compositor's config
 //! directory, then its data directory. Nothing found means nothing drawn, and
 //! the clear colour stays the black it has always been.
+//!
+//! Decoding happens on its own thread, at at most the size of the output it
+//! will be shown on. A wallpaper is a big image — a full decode plus two copies
+//! of the pixels is easily a second or two — and doing that inside a render
+//! pass stalls the whole desktop for it. Until it lands the desktop is black,
+//! which is no worse than it was before there was a wallpaper at all.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use smithay::{
     backend::{
@@ -23,37 +31,38 @@ use smithay::{
             },
         },
     },
-    utils::{Buffer, Logical, Point, Rectangle, Size, Transform},
+    utils::{Buffer, Logical, Physical, Point, Rectangle, Size, Transform},
 };
 
-/// The image, decoded once and kept for the life of the process.
-///
-/// Loading is lazy because it needs no renderer: the bytes are decoded on the
-/// CPU and handed to the GPU as a memory buffer on first draw. A wallpaper that
-/// is missing or unreadable is `None`, which is also the answer for the rest of
-/// the process — a file that was not there at startup is not going to be
-/// re-checked every frame.
-static WALLPAPER: OnceLock<Option<Wallpaper>> = OnceLock::new();
+/// The image, decoded at most once, off the compositor's thread.
+static WALLPAPER: OnceLock<Mutex<Option<Wallpaper>>> = OnceLock::new();
+/// Whether that thread has been started. Separate from the cell above so the
+/// thread is spawned exactly once, by whichever frame gets there first.
+static STARTED: Once = Once::new();
 
+/// The decoded image and its size. Cheap to clone: the pixels are shared.
+#[derive(Clone)]
 struct Wallpaper {
-    buffer: MemoryRenderBuffer,
+    buffer: Arc<MemoryRenderBuffer>,
     size: Size<i32, Buffer>,
 }
 
 /// The wallpaper element for one output, cover-scaled to fill it.
 ///
-/// `output` is the output's logical size — what the element is measured in. The
-/// image is cropped to the output's shape and stretched over it, so the picture
-/// fills the screen without distortion.
+/// `output` is the output's logical size — what the element is measured in —
+/// and `max_physical` the most pixels it will ever be drawn at, which is what
+/// the image is decoded down to. The image is cropped to the output's shape and
+/// stretched over it, so the picture fills the screen without distortion.
 pub fn element<R>(
     renderer: &mut R,
     output: Size<i32, Logical>,
+    max_physical: Size<i32, Physical>,
 ) -> Option<MemoryRenderBufferRenderElement<R>>
 where
     R: Renderer + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
-    let wallpaper = wallpaper()?;
+    let wallpaper = wallpaper(max_physical)?;
     let (src, size) = cover(wallpaper.size, output);
     MemoryRenderBufferRenderElement::from_buffer(
         renderer,
@@ -67,12 +76,26 @@ where
     .ok()
 }
 
-/// The wallpaper, decoded on first use.
-fn wallpaper() -> Option<&'static Wallpaper> {
-    WALLPAPER.get_or_init(load).as_ref()
+/// The wallpaper, if it has finished decoding. Starts the decode the first time
+/// it is asked.
+fn wallpaper(cap: Size<i32, Physical>) -> Option<Wallpaper> {
+    let cell = WALLPAPER.get_or_init(|| Mutex::new(None));
+    STARTED.call_once(|| {
+        // At least one pixel, so a not-yet-configured output cannot ask for a
+        // zero-sized image.
+        let cap = Size::from((cap.w.max(1) as u32, cap.h.max(1) as u32));
+        std::thread::spawn(move || {
+            let loaded = load(cap);
+            match cell.lock() {
+                Ok(mut slot) => *slot = loaded,
+                Err(_) => tracing::warn!("wallpaper lock was poisoned"),
+            }
+        });
+    });
+    cell.lock().ok().and_then(|slot| slot.clone())
 }
 
-fn load() -> Option<Wallpaper> {
+fn load(cap: Size<u32, Physical>) -> Option<Wallpaper> {
     let path = image_path()?;
     let image = match image::open(&path) {
         Ok(image) => image,
@@ -80,6 +103,14 @@ fn load() -> Option<Wallpaper> {
             tracing::warn!(?path, ?err, "wallpaper could not be read");
             return None;
         }
+    };
+    // Down to the size it is drawn at: a wallpaper is usually much larger than
+    // the screen, and the pixels that get cropped away were never going to be
+    // seen. `thumbnail` keeps the aspect, so the cover crop below still works.
+    let image = if image.width() > cap.w || image.height() > cap.h {
+        image.thumbnail(cap.w, cap.h)
+    } else {
+        image
     };
     let rgba = image.to_rgba8();
     let size = Size::from((rgba.width() as i32, rgba.height() as i32));
@@ -98,7 +129,10 @@ fn load() -> Option<Wallpaper> {
         None,
     );
     tracing::info!(?path, "wallpaper loaded");
-    Some(Wallpaper { buffer, size })
+    Some(Wallpaper {
+        buffer: Arc::new(buffer),
+        size,
+    })
 }
 
 /// Where the wallpaper is looked for, in order, ending at nothing.
