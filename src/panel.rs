@@ -4655,19 +4655,6 @@ fn watch_bar_drag(tasks: &GtkBox) {
                 let pointer_x = pointer.get();
                 drag_begin(&app);
                 if drag_active() {
-                    // The travel is measured from the *press*, not from the
-                    // lift. A hand that wandered while holding is telling the
-                    // square to be under the pointer: anchored at the press,
-                    // the pick-up catches up by exactly that travel, keeping
-                    // the point of the square the finger went down on under
-                    // the finger. Anchored at the lift instead, the square
-                    // would come up where it stood and stay that far behind
-                    // the pointer for the rest of the drag.
-                    DRAG.with(|drag| {
-                        if let Some(state) = drag.borrow().as_ref() {
-                            state.borrow().pointer_meet(anchor);
-                        }
-                    });
                     if menu_debug() {
                         eprintln!(
                             "oxide-panel: drag {app:?} lifted by hold (pointer {pointer_x:.1}, press {anchor:.1})"
@@ -4698,14 +4685,6 @@ fn watch_bar_drag(tasks: &GtkBox) {
                 if offset_x.abs() + offset_y.abs() >= DRAG_MOVE_THRESHOLD {
                     drag_begin(&app);
                     if drag_active() {
-                        // Anchored at the press, like the hold's lift: the
-                        // square comes up under the pointer rather than a
-                        // threshold's worth behind it.
-                        DRAG.with(|drag| {
-                            if let Some(state) = drag.borrow().as_ref() {
-                                state.borrow().pointer_meet(row_start);
-                            }
-                        });
                         if menu_debug() {
                             eprintln!(
                                 "oxide-panel: drag {app:?} lifted by travel (pointer {pointer_x:.1}, press {row_start:.1})"
@@ -5189,26 +5168,14 @@ struct DragState {
     gap: usize,
     /// Where it was picked up from, so putting it back where it started is not a change.
     original: usize,
-    /// Where its top left corner is in the carried layer, which is what the pointer's
-    /// travel is added to.
+    /// The corner the carried square was lifted to, in the layer's coordinates.
+    /// Only the height is still read: the square rides the bar, and its x comes
+    /// from the hole it is drawn in — see [`carry_to`].
     carried_at: (f64, f64),
     /// The pointer position at the moment the gap last moved, for hysteresis: a
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
     last_gap_x: f64,
-    /// The pointer position the carried square's travel is measured from. It is
-    /// where the press went down, not where the hold lifted: a pointer that
-    /// travelled while the square was still waiting comes up under it, with the
-    /// point pressed kept under the pointer.
-    meet_x: Cell<f64>,
-}
-
-impl DragState {
-    /// Anchor the carried square's travel at the press, so the pick-up catches
-    /// up by however far the pointer travelled while the hold was arming.
-    fn pointer_meet(&self, x: f64) {
-        self.meet_x.set(x);
-    }
 }
 
 thread_local! {
@@ -5357,15 +5324,22 @@ fn drag_begin(app: &str) {
             app: app.to_string(),
             gap: index,
             original: index,
-            // The same border-box corner the square was just put at — NOT the
-            // content read above. The first pointer motion adds the travel to
-            // these and repositions with it, and a mismatched corner would
-            // teleport the glyph a pixel down, exactly where the drag felt
-            // padded.
+            // The border-box corner the square was just put at — NOT the
+            // content read above. Its height is what the ride keeps; the
+            // square's x comes from the hole it is drawn in.
             carried_at: put,
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
-            meet_x: Cell::new(f64::NAN),
         })));
+    });
+    // The carry starts exactly where it was put, so the first aim to a slot
+    // glides from there rather than from nowhere.
+    CARRY_GLIDE.with(|glide| {
+        *glide.borrow_mut() = Some(CarryGlide {
+            from: put,
+            to: put,
+            start: glib::monotonic_time(),
+            id: 0,
+        });
     });
     // This press is a drag from here on: whatever its click signal says at
     // release, the square has been lifted, and activating it would fire the
@@ -5389,12 +5363,13 @@ fn drag_begin(app: &str) {
 /// Carry the square under the pointer, and make it trade slots with whatever
 /// it crosses.
 ///
-/// The carried square rides the pointer; the slot it would land in is the
-/// placeholder's slot, and every time the pointer passes the *middle* of a
-/// neighbouring slot, that slot's square and the placeholder trade places:
-/// the one square slides into the hole on an ease-out curve, and the hole
-/// moves on. Nothing else in the row shifts, which is the whole point of swaps
-/// over a sliding gap.
+/// The carried square *occupies the hole* — it is drawn in the slot it would
+/// land in — rather than being pinned under the pointer. The pointer decides
+/// when the hole moves: every time it passes the *middle* of a neighbouring
+/// slot, that slot's square and the hole trade places, the traded square slides
+/// into its new home on an ease-out curve, and the carried square glides after
+/// the hole on the same clock. Nothing else in the row shifts, which is the
+/// whole point of swaps over a sliding gap.
 ///
 /// A fast fling across several slots is applied one swap at a time, so the
 /// squares the pointer swept past end up where a slow sweep would have left
@@ -5416,18 +5391,6 @@ fn drag_update(pointer_x: f64) -> bool {
         return false;
     };
 
-    // From where the square was lifted, not from where it is now: adding the
-    // total travel to the current position compounds the rounding of every
-    // step, and the square drifts away from the cursor over a long drag.
-    // Vertical stays put: the square rides the bar.
-    let origin = state.borrow().carried_at;
-    let meet = state.borrow().meet_x.get();
-    let travel = pointer_x - meet;
-    let (x, y) = ((origin.0 + travel).round(), origin.1.round());
-    // `move`, not `put`. `gtk_fixed_put` asserts that the widget has no
-    // parent, and this square has been in the fixed since the drag began.
-    overlay.move_(&square, x, y);
-
     // The gap is measured against the row as it is *now*, with the
     // placeholder in it and every landing slot standing where its flying
     // square will sit — so the hole and the squares trade on the same rails
@@ -5438,6 +5401,8 @@ fn drag_update(pointer_x: f64) -> bool {
     let mut hole = state.borrow().gap;
     let target = row_geometry(&tasks).gap_at(pointer_x);
     if target == hole {
+        // No crossing: the hole is where it was, and the carried square is
+        // already drawn in it — possibly still gliding there.
         return false;
     }
     if (pointer_x - state.borrow().last_gap_x).abs() < 4.0 {
@@ -5472,6 +5437,7 @@ fn drag_update(pointer_x: f64) -> bool {
     // the square actually was. The layer is the overlay's own frame, so a
     // snapshot through it is directly usable as a put coordinate.
     let layer_frame = overlay.clone().upcast::<gtk4::Widget>();
+    let inset = f64::from(SQUARE_BORDER);
     let slots: Vec<Option<(f64, f64)>> = {
         let mut slots = Vec::new();
         let mut cursor = tasks.first_child();
@@ -5502,6 +5468,16 @@ fn drag_update(pointer_x: f64) -> bool {
     }
     state.borrow_mut().gap = hole;
     state.borrow_mut().last_gap_x = pointer_x;
+    // The carried square follows the hole, not the pointer: it is drawn in the
+    // slot it would land in, gliding after the hole on the same clock the
+    // traded squares slide on, so the whole row moves as one piece. The target
+    // is the slot the hole now stands in — already snapped from the pre-trade
+    // snapshot, because the placeholder was re-listed this instant and would
+    // answer with its last allocation.
+    if let Some((slot_x, _)) = slots.get(hole).copied().flatten() {
+        let y = state.borrow().carried_at.1;
+        carry_to(&square, &overlay, (slot_x - inset, y));
+    }
     if menu_debug() {
         eprintln!(
             "oxide-panel: {app:?} traded through to slot {hole} (pointer {pointer_x:.0})"
@@ -5566,6 +5542,91 @@ thread_local! {
     // never has to count them.
     static TRADE_FLIGHT: RefCell<Option<TradeFlight>> = const { RefCell::new(None) };
     static FLIGHT_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The carried square gliding from the slot it was drawn in to the hole's new
+/// one. The row's own moves are the flights; this is the one square that is not
+/// the row's to move.
+struct CarryGlide {
+    /// Where the glide was when it was last aimed, and where it is going, in
+    /// the layer's coordinates.
+    from: (f64, f64),
+    to: (f64, f64),
+    /// When it was aimed, so a retarget mid-glide takes over from wherever it
+    /// had got to rather than restarting from the old slot.
+    start: i64,
+    /// Which glide this tick belongs to, so a retarget stops the old one.
+    id: u64,
+}
+
+thread_local! {
+    static CARRY_GLIDE: RefCell<Option<CarryGlide>> = const { RefCell::new(None) };
+    static GLIDE_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Where a glide is at `now`.
+fn glide_at(glide: &CarryGlide, now: i64) -> (f64, f64) {
+    let elapsed = (now - glide.start) as f64 / 1_000_000.0;
+    let t = (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
+    flight_xy(glide.from, glide.to, t)
+}
+
+/// Aim the carried square at a slot and let it glide there.
+///
+/// The square is not pinned under the pointer: it is drawn in the hole it would
+/// land in, and this is how it gets from the hole's old slot to its new one.
+/// Aiming again mid-glide picks up from wherever the glide had reached, so a
+/// fling across several slots reads as one continuous move rather than a series
+/// of restarts.
+fn carry_to(square: &Button, layer: &gtk4::Fixed, to: (f64, f64)) {
+    let now = glib::monotonic_time();
+    let from = CARRY_GLIDE
+        .with(|glide| glide.borrow().as_ref().map(|glide| glide_at(glide, now)))
+        .unwrap_or(to);
+    if (from.0 - to.0).abs() < 0.5 && (from.1 - to.1).abs() < 0.5 {
+        // Already drawn there, or close enough that a glide would be a no-op.
+        return;
+    }
+    let id = GLIDE_GEN.with(|id| {
+        id.set(id.get().wrapping_add(1));
+        id.get()
+    });
+    CARRY_GLIDE.with(|glide| {
+        *glide.borrow_mut() = Some(CarryGlide {
+            from,
+            to,
+            start: now,
+            id,
+        });
+    });
+    let square = square.clone();
+    let layer = layer.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let alive = CARRY_GLIDE.with(|glide| {
+            glide.borrow().as_ref().is_some_and(|glide| glide.id == id)
+        });
+        if !alive || !drag_active() {
+            return glib::ControlFlow::Break;
+        }
+        let (x, y) = flight_xy(from, to, {
+            let elapsed = (glib::monotonic_time() - now) as f64 / 1_000_000.0;
+            (elapsed / TRADE_SLIDE.as_secs_f64()).clamp(0.0, 1.0)
+        });
+        layer.move_(&square, x.round(), y.round());
+        if (x - to.0).abs() < 0.5 && (y - to.1).abs() < 0.5 {
+            // Land exactly, so no rounding residue is left for the next aim to
+            // start a glide from.
+            layer.move_(&square, to.0.round(), to.1.round());
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Forget the carried square's glide. Called when the drag ends: the square is
+/// going back into the row, and there is nothing left to glide.
+fn drop_carry_glide() {
+    CARRY_GLIDE.with(|glide| *glide.borrow_mut() = None);
 }
 
 /// Where a trade flight is at this point of its slide.
@@ -5861,6 +5922,9 @@ fn drag_cancel() {
     // taken apart, and the flight's stand-in would otherwise read as a hole
     // nothing will ever fill.
     land_flight();
+    // And the carried square's glide is forgotten: it is going out with the
+    // layer.
+    drop_carry_glide();
     let running = DRAG.with(|drag| drag.borrow_mut().take());
     if running.is_none() && carried_square_count() == 0 {
         return;
@@ -5905,6 +5969,9 @@ fn drag_end() -> bool {
     // A square still sliding home lands first: the drop is read off the row,
     // and the row is not finished until the flight has landed in it.
     land_flight();
+    // The carried square is going back into the row, so its glide has nothing
+    // left to move.
+    drop_carry_glide();
     let state = DRAG.with(|drag| drag.borrow_mut().take());
     let (Some(state), Some(tasks)) = (state, tasks_box()) else {
         return false;
@@ -8123,6 +8190,38 @@ mod tests {
         eprintln!("oxide-test: held target y {held_y:.1}, row was {rest_y:.1}");
         assert_eq!(held_y, rest_y, "the flight must target a square's y, not the row top");
         window.close();
+    }
+
+    #[test]
+    fn a_carry_glide_lands_on_its_slot() {
+        // The carried square glides between slots on the flights' own clock,
+        // and lands exactly: a residue here would be the starting point of the
+        // next glide, and the square would creep a pixel per trade.
+        let glide = CarryGlide {
+            from: (50.0, 3.0),
+            to: (90.0, 3.0),
+            start: 1_000_000,
+            id: 0,
+        };
+        let at = |us: i64| glide_at(&glide, 1_000_000 + us);
+        assert_eq!(at(0), (50.0, 3.0));
+        assert_eq!(
+            at(TRADE_SLIDE.as_micros() as i64),
+            (90.0, 3.0),
+            "a glide that has run its clock is exactly at its slot"
+        );
+        assert_eq!(
+            at(TRADE_SLIDE.as_micros() as i64 * 3),
+            (90.0, 3.0),
+            "and stays there once it has"
+        );
+        // Ease-out: more than half the travel is done in half the clock.
+        let (x, _) = at(TRADE_SLIDE.as_micros() as i64 / 2);
+        assert!(x > 70.0, "the glide front-loads its travel: {x}");
+        // A retarget mid-glide starts from where the glide had reached, so a
+        // fling reads as one move rather than snapping back to the old slot.
+        let reached = glide_at(&glide, 1_000_000 + TRADE_SLIDE.as_micros() as i64 / 2);
+        assert!(reached.0 > 50.0 && reached.0 < 90.0);
     }
 
     #[test]
