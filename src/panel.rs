@@ -207,10 +207,14 @@ fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
     (ease(elapsed / PHASE_END), false)
 }
 
-/// How far a press has to travel before it lifts its square and becomes a drag
-/// rather than staying a click. Twice GTK's own double-click radius, so a
-/// jittered click cannot read as a drag.
-const DRAG_LOG_THRESHOLD: f64 = 16.0;
+/// How long a press on a square must be held before the square is picked up and
+/// becomes a drag rather than staying a click.
+///
+/// The pick-up is decided by the clock alone: moving no longer lifts anything,
+/// so a hurried drag starts from a deliberate place instead of wherever the
+/// hand had already wandered, and a click with a shaky pointer is still a
+/// click. A release beats the timer, so letting go early is an ordinary click.
+const DRAG_HOLD: Duration = Duration::from_millis(250);
 /// How long a displaced square takes to slide into its new home when a trade
 /// makes a spot for another. A fixed length, so even a fast sweep shows the
 /// slide rather than snapping; a new trade lands whatever is still flying.
@@ -237,11 +241,14 @@ const HOVER_GRACE: Duration = Duration::from_millis(60);
 /// that travelling along the bar does not open a menu for every square crossed.
 const HOVER_OPEN: Duration = Duration::from_millis(250);
 /// How the press on a square answers: press and let go quickly and it opens its
-/// windows, move past [`DRAG_LOG_THRESHOLD`] while held and the square is picked
-/// up instead. There is deliberately no hold-to-activate underneath this any more.
-/// There used to be one, firing at 180ms, and the two could not both be true:
-/// holding a square for a quarter of a second activated the app *and then* picked
-/// the square up.
+/// windows; hold it for [`DRAG_HOLD`] and the square is picked up instead. There
+/// is deliberately no separate hold-to-activate underneath: there used to be
+/// one, firing at 180ms, and the two could not both be true — holding a square
+/// for a quarter of a second activated the app *and then* picked the square up.
+///
+/// The window between a click and a hold is [`DRAG_HOLD`], and the two timers
+/// are tuned apart so a press cannot land in both: a click arrives on release,
+/// which disarms the hold.
 
 /// How long to wait for every preview before showing the menu anyway.
 ///
@@ -4578,10 +4585,10 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     (window, row, tasks)
 }
 
-/// Reorder the squares by dragging: past [`DRAG_LOG_THRESHOLD`] the pressed
-/// square leaves the row and rides the pointer, trading slots with every
-/// neighbour it crosses, and the drop is committed to the remembered order. A
-/// press that never travels that far stays a click, decided by [`square_click`].
+/// Reorder the squares by dragging: a press held for [`DRAG_HOLD`] picks the
+/// square up, and it then rides the pointer, trading slots with every
+/// neighbour it crosses, with the drop committed to the remembered order. A
+/// press released before the hold is a click, decided by [`square_click`].
 ///
 /// One gesture on the row, not one per square. A drag gesture reports its
 /// offsets in its own widget's coordinates, so a gesture owned by the square
@@ -4601,47 +4608,46 @@ fn watch_bar_drag(tasks: &GtkBox) {
     // space, so there is nothing to measure against a square that is about to
     // leave it.
     let pressed: Rc<RefCell<Option<(f64, String)>>> = Rc::new(RefCell::new(None));
+    // The pointer's latest row position, and a generation for the press. The
+    // hold timer below fires later than the press that armed it, and both are
+    // how it tells whether that press is still the live one.
+    let pointer = Rc::new(Cell::new(0.0f64));
+    let press_token = Rc::new(Cell::new(0u64));
     {
         let pressed = pressed.clone();
+        let pointer = pointer.clone();
+        let press_token = press_token.clone();
         let row = tasks.clone();
         gesture.connect_drag_begin(move |_, start_x, start_y| {
             // A fresh press: the last press's drag has no claim on its click.
             CLICK_IS_DRAG.set(false);
-            *pressed.borrow_mut() =
-                square_at(&row, start_x, start_y).map(|app| (start_x, app));
-        });
-    }
-    {
-        let pressed = pressed.clone();
-        gesture.connect_drag_update(move |_, offset_x, offset_y| {
-            let Some((row_start, app)) = pressed.borrow().clone() else {
+            let app = square_at(&row, start_x, start_y);
+            *pressed.borrow_mut() = app.clone().map(|app| (start_x, app));
+            pointer.set(start_x);
+            // A press becomes a drag by being held, not by moving: arm the hold.
+            // Moving first does not pick anything up — that is what made a
+            // deliberate drag start from the wrong place, and a hurried click
+            // read as one.
+            let ticket = press_token.get().wrapping_add(1);
+            press_token.set(ticket);
+            let Some(app) = app else {
                 return;
             };
-            if drag_active() {
-                // A second press landing mid-drag is not the drag: only the carried
-                // square's own press drives it.
-                let mine = DRAG.with(|drag| {
-                    drag.borrow()
-                        .as_ref()
-                        .map(|state| state.borrow().app.clone())
-                });
-                if mine.as_deref() != Some(app.as_str()) {
+            let pressed = pressed.clone();
+            let pointer = pointer.clone();
+            let press_token = press_token.clone();
+            glib::timeout_add_local_once(DRAG_HOLD, move || {
+                if press_token.get() != ticket || drag_active() {
+                    // Released, cancelled, or superseded by another press.
                     return;
                 }
-                let pointer_x = row_start + offset_x;
-                if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
-                    tasks.queue_allocate();
+                let Some((_, held)) = pressed.borrow().clone() else {
+                    return;
+                };
+                if held != app {
+                    return;
                 }
-                return;
-            }
-            // Not lifted yet: only the threshold stands between a click and a
-            // drag. Past it, the square leaves the row and starts riding the
-            // pointer -- and this same move already carries it, so nothing waits
-            // a frame. Total travel, not horizontal alone: a press dragged
-            // straight down is no more a click than one dragged sideways, and
-            // leaving the vertical out let it fall through to activate.
-            if offset_x.abs() + offset_y.abs() >= DRAG_LOG_THRESHOLD {
-                let pointer_x = row_start + offset_x;
+                let pointer_x = pointer.get();
                 drag_begin(&app);
                 if drag_active() {
                     DRAG.with(|drag| {
@@ -4650,20 +4656,52 @@ fn watch_bar_drag(tasks: &GtkBox) {
                         }
                     });
                     if menu_debug() {
-                        eprintln!(
-                            "oxide-panel: drag {app:?} lifted at ({pointer_x:.1}, row start {row_start:.1})"
-                        );
+                        eprintln!("oxide-panel: drag {app:?} lifted by hold at {pointer_x:.1}");
                     }
                     if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
                         tasks.queue_allocate();
                     }
                 }
+            });
+        });
+    }
+    {
+        let pressed = pressed.clone();
+        let pointer = pointer.clone();
+        gesture.connect_drag_update(move |_, offset_x, _| {
+            let Some((row_start, app)) = pressed.borrow().clone() else {
+                return;
+            };
+            let pointer_x = row_start + offset_x;
+            pointer.set(pointer_x);
+            if !drag_active() {
+                // Still just a press: the hold is what picks the square up, so
+                // travelling before it elapses changes nothing but the pointer
+                // position the lift will measure from.
+                return;
+            }
+            // A second press landing mid-drag is not the drag: only the carried
+            // square's own press drives it.
+            let mine = DRAG.with(|drag| {
+                drag.borrow()
+                    .as_ref()
+                    .map(|state| state.borrow().app.clone())
+            });
+            if mine.as_deref() != Some(app.as_str()) {
+                return;
+            }
+            if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                tasks.queue_allocate();
             }
         });
     }
     {
         let pressed = pressed.clone();
+        let press_token = press_token.clone();
         gesture.connect_drag_end(move |_, _, _| {
+            // Disarms the hold: a release beats the timer, so a press let go
+            // early is a click and nothing else.
+            press_token.set(press_token.get().wrapping_add(1));
             let taken = pressed.borrow_mut().take();
             if drag_active() {
                 let moved = drag_end();
@@ -4679,15 +4717,19 @@ fn watch_bar_drag(tasks: &GtkBox) {
     // A cancelled gesture is a release that never came: the square is still
     // lifted, and nothing else would put it back. It is dropped where it sits,
     // exactly as a release would have dropped it.
-    gesture.connect_cancel(move |_, _| {
-        pressed.borrow_mut().take();
-        if drag_active() {
-            let moved = drag_end();
-            if moved {
-                glib::idle_add_local_once(|| rebuild_bar());
+    {
+        let press_token = press_token.clone();
+        gesture.connect_cancel(move |_, _| {
+            press_token.set(press_token.get().wrapping_add(1));
+            pressed.borrow_mut().take();
+            if drag_active() {
+                let moved = drag_end();
+                if moved {
+                    glib::idle_add_local_once(|| rebuild_bar());
+                }
             }
-        }
-    });
+        });
+    }
     tasks.add_controller(gesture);
 }
 
