@@ -274,7 +274,7 @@ impl WindowAnimation {
     }
 }
 
-fn ease_out_cubic(t: f64) -> f64 {
+pub(crate) fn ease_out_cubic(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)
 }
 

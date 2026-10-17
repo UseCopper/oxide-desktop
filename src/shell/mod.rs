@@ -48,7 +48,7 @@ use crate::{
     state::{AnvilState, Backend},
 };
 
-mod animation;
+pub(crate) mod animation;
 mod capture;
 mod element;
 mod geometry;

@@ -4,6 +4,7 @@ use smithay::{
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
             AsRenderElements, Kind, RenderElement, Wrap,
+            memory::MemoryRenderBufferRenderElement,
             solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::WaylandSurfaceRenderElement,
             utils::{
@@ -62,6 +63,7 @@ smithay::backend::renderer::element::render_elements! {
     Custom=CustomRenderElements<R>,
     SnapPreview=SolidColorRenderElement,
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
+    Background=MemoryRenderBufferRenderElement<R>,
 }
 
 impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug> std::fmt::Debug
@@ -74,6 +76,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Custom(arg0) => f.debug_tuple("Custom").field(arg0).finish(),
             Self::SnapPreview(arg0) => f.debug_tuple("SnapPreview").field(arg0).finish(),
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
+            Self::Background(arg0) => f.debug_tuple("Background").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -279,6 +282,24 @@ where
         )
         .expect("output without mode?");
         output_render_elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+        // The wallpaper, last, which is the back: these lists run front to
+        // back, so everything above is already in place. It is built after the
+        // rest only because of that — the image itself is decoded once, on its
+        // own thread, and only the element is per-frame.
+        if let Some(mode) = output.current_mode() {
+            let scale = output.current_scale().fractional_scale();
+            let physical = output.current_transform().transform_size(mode.size);
+            // Sized in logical units, so it is stretched to the output's own
+            // logical size and the renderer multiplies it back up by the scale.
+            let logical = physical.to_f64().to_logical(scale);
+            let output_size = Size::from((logical.w.round() as i32, logical.h.round() as i32));
+            if let Some(element) =
+                crate::background::element(renderer, output_size, scale, physical)
+            {
+                output_render_elements.push(OutputRenderElements::Background(element));
+            }
+        }
 
         (output_render_elements, CLEAR_COLOR)
     }

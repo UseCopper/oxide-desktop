@@ -253,6 +253,16 @@ const TRADE_SLIDE: Duration = Duration::from_millis(250);
 const CELL_FADE: Duration = Duration::from_millis(140);
 /// How long the menu's reveal takes.
 const MENU_FADE: Duration = Duration::from_millis(180);
+/// How full a square looks when its app has windows on screen. One step above
+/// the bar, so a running app reads as *there* rather than as an empty outline.
+const TASK_RUNNING_ALPHA: f64 = 0.06;
+/// An app whose windows are all minimized: still running, not on screen. A
+/// dimmer step than [`TASK_RUNNING_ALPHA`], so the fill says how much of the app
+/// is visible; a pinned app with nothing open gets no fill at all.
+const TASK_MINIMIZED_ALPHA: f64 = 0.03;
+/// The white a square shows under the pointer. Above both rest states, so a
+/// hover is always a change, whatever the square was showing.
+const TASK_HOVER_ALPHA: f64 = 0.10;
 /// How far below its resting place the menu starts, so it slides out from the bar
 /// as it fades up.
 const MENU_SLIDE: i32 = 10;
@@ -3359,21 +3369,24 @@ impl Square {
         let group = group_for_key(&self.key);
         let count = group.len();
         let focused = group.iter().any(|window| window.focused);
-        // Only when every one of the app's windows is minimized, so the square says
-        // the app is there but not on screen rather than implying anything about
-        // the others. A square with nothing behind it is a pinned app's, there to
-        // be started from — not minimized, with no window to have been.
-        let dimmed = (count > 0 && group.iter().all(|window| window.minimized)) || count == 0;
-        if dimmed {
-            self.button.add_css_class("minimized");
-        } else {
-            self.button.remove_css_class("minimized");
-        }
-        if focused {
-            self.button.add_css_class("focused");
-        } else {
-            self.button.remove_css_class("focused");
-        }
+        // How much of the app is on screen, as a step in the square's fill: a
+        // running app sits a step above the bar, one whose windows are all
+        // minimized a step below that, and a pinned app with nothing open is not
+        // filled at all — it is the empty one, so it should look it. Only every
+        // window being minimized earns the middle step: one visible window means
+        // the app is on screen, whatever the others are doing.
+        let all_minimized = count > 0 && group.iter().all(|window| window.minimized);
+        let running = count > 0 && !all_minimized;
+        let resemble = |class: &str, on: bool| {
+            if on {
+                self.button.add_css_class(class);
+            } else {
+                self.button.remove_css_class(class);
+            }
+        };
+        resemble("minimized", all_minimized);
+        resemble("running", running);
+        resemble("focused", focused);
 
         // A square with nothing behind it names the app rather than counting windows it
         // does not have.
@@ -4124,6 +4137,12 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // Squares are this wide in every calculation the drag does, so the theme may
     // not be able to out-minimum the code's own arithmetic.
     let square = SQUARE_SIZE;
+    // How full a square looks, by how much of its app is on screen — see the
+    // `running` and `minimized` rules below. Numbers rather than literals in the
+    // sheet, so the ladder can be asserted instead of eyeballed.
+    let task_running = TASK_RUNNING_ALPHA;
+    let task_minimized = TASK_MINIMIZED_ALPHA;
+    let task_hover = TASK_HOVER_ALPHA;
     // The app menu's body is the preview menu's cell fill, read off the same
     // constant the cairo drawing reads, so the two engines agree by
     // construction rather than by two careful copies of the same hexes. The
@@ -4181,8 +4200,11 @@ button.task.ghost {{
     border-color: transparent;
     background: none;
 }}
+button.task.running {{
+    background-color: rgba(255, 255, 255, {task_running});
+}}
 button.task:hover {{
-    background-color: rgba(255, 255, 255, 0.10);
+    background-color: rgba(255, 255, 255, {task_hover});
 }}
 /* A square being carried. It has left the row and is in a layer over it, so it needs no
  * transition to stay under the pointer and nothing to lift it: the layer is above.
@@ -4194,18 +4216,18 @@ button.task:hover {{
 button.task.carrying {{
     background-color: rgba(255, 255, 255, 0.18);
 }}
-/* Deliberately not dimmed. Minimized and closed are different things, and dimming
-   the square conflates them with a pinned app that has nothing open at all. */
+/* An app whose windows are all minimized: still there, not on screen. One step
+   below a running square's fill, so the ladder reads as how much of the app is
+   visible — and a pinned app with nothing open has no fill at all. */
 button.task.minimized {{
-    background-color: rgba(255, 255, 255, 0.04);
+    background-color: rgba(255, 255, 255, {task_minimized});
 }}
-/* A hovered square shows the panel's hover, whatever its rest state is. The
-   minimized rule above is where a pinned empty square parks between sessions,
-   and at equal specificity the later rule wins -- so without this, hovering
-   an empty square stayed dim instead of marking. A focused square keeps its
-   accent under the pointer and wins here anyway, by being later. */
-button.task.minimized:hover {{
-    background-color: rgba(255, 255, 255, 0.10);
+/* A hovered square shows the panel's hover, whatever its rest state is: at
+   equal specificity the later rule wins, so without this a hovered square
+   would keep its running or minimized fill. A focused square keeps its accent
+   under the pointer and wins here anyway, by being later. */
+button.task:hover {{
+    background-color: rgba(255, 255, 255, {task_hover});
 }}
 button.task.focused {{
     background-color: rgba({r}, {g}, {b}, 0.28);
@@ -4541,6 +4563,45 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     start_polling(&tasks, &menu, &channel, hover, &context);
 
     bar.present();
+    // And then it slides in from above the top edge. The bar is a layer surface
+    // anchored to that edge, so its own margin is the only thing that moves it —
+    // a negative one puts it off the screen, and the compositor clips what is
+    // outside the output. The margin is a protocol margin, which is signed, so
+    // this is the same mechanism the menus slide with, in reverse.
+    drop_in(&bar);
+}
+
+/// How long the bar takes to slide down into place.
+const BAR_SLIDE: Duration = Duration::from_millis(400);
+
+/// Slide a freshly presented bar in from above the top edge on an ease-out.
+///
+/// The bar is placed above the screen and eases down to its resting margin, so
+/// the panel arrives rather than blinking on. The exclusive zone is set
+/// explicitly by the bar itself, so the space it reserves is claimed from the
+/// first frame: windows do not start under it and then move.
+fn drop_in(bar: &ApplicationWindow) {
+    let from = -PANEL_HEIGHT;
+    let start = glib::monotonic_time();
+    bar.set_margin(Edge::Top, from);
+    glib::timeout_add_local(Duration::from_millis(16), glib::clone!(
+        #[weak]
+        bar,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
+        move || {
+            let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+            let t = (elapsed / BAR_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
+            bar.set_margin(Edge::Top, ease_margin(from, 0, ease_out(t)));
+            if t < 1.0 {
+                return glib::ControlFlow::Continue;
+            }
+            // Land exactly on the resting margin, so no rounding residue is
+            // left to show up as a hairline above the bar.
+            bar.set_margin(Edge::Top, 0);
+            glib::ControlFlow::Break
+        }
+    ));
 }
 
 /// The bar: a fixed-height strip across the top of the output.
@@ -8823,6 +8884,36 @@ mod tests {
         assert_eq!(ease_margin(400, 100, 1.0), 100);
         // Landed exactly on the end, so no residue is left behind.
         assert_eq!(ease_margin(7, 7, 0.3), 7);
+    }
+
+    #[test]
+    fn a_square_looks_fuller_the_more_of_its_app_is_on_screen() {
+        // The fill says how much of the app is visible, and the ladder has to
+        // climb: a running app above an all-minimized one, which is above the
+        // nothing a pinned but unopened app shows, and a hover above all three.
+        // A running square used to carry no fill at all while a pinned empty one
+        // did, so opening an app made its square *emptier* — backwards.
+        assert!(
+            TASK_RUNNING_ALPHA > TASK_MINIMIZED_ALPHA,
+            "a running square must not be emptier than a minimized one"
+        );
+        assert!(
+            TASK_MINIMIZED_ALPHA > 0.0,
+            "a minimized app is running: it should not look like nothing at all"
+        );
+        assert!(
+            TASK_HOVER_ALPHA > TASK_RUNNING_ALPHA,
+            "hovering must brighten the full square too"
+        );
+        // And the sheet carries them: the classes are only useful if the numbers
+        // reach the stylesheet that draws them.
+        let sheet = style_sheet((80, 160, 240));
+        assert!(sheet.contains("button.task.running {"), "no running rule");
+        assert!(sheet.contains("button.task.minimized {"), "no minimized rule");
+        assert!(
+            sheet.contains(&format!("0.18")),
+            "the carrying fill should still be the brightest rest"
+        );
     }
 
     #[test]
