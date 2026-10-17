@@ -1138,20 +1138,30 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
     // commit carrying one is what tells us. The window is centered by the same
     // measure it was mapped with — the decorated geometry — so the frame's
     // middle is the area's middle.
-    {
-        let mut state = window.decoration_state();
-        if state.center_when_sized {
-            let size = window.geometry().size;
-            if size.w > 0 && size.h > 0 {
-                state.center_when_sized = false;
-                drop(state);
-                let at = (window_loc + window.bbox().loc).to_f64()
-                    + Point::from((size.w as f64 / 2.0, size.h as f64 / 2.0));
-                let area = work_area_under(space, at);
-                let location = centered_in(area, size);
-                space.relocate_element(&window, location);
-                window_loc = location;
-            }
+    // `with_state` rather than a held `decoration_state()` borrow: the flag is
+    // read and cleared on its own, and `geometry` below is called with no
+    // borrow alive. Reading it inside a held borrow re-enters the same
+    // `RefCell` — the panic `with_state`'s own comment warns about.
+    let wants_center = window.with_state(|state| {
+        let wanted = state.center_when_sized;
+        if wanted {
+            state.center_when_sized = false;
+        }
+        wanted
+    });
+    if wants_center {
+        let size = window.geometry().size;
+        if size.w > 0 && size.h > 0 {
+            let at = (window_loc + window.bbox().loc).to_f64()
+                + Point::from((size.w as f64 / 2.0, size.h as f64 / 2.0));
+            let area = work_area_under(space, at);
+            let location = centered_in(area, size);
+            space.relocate_element(&window, location);
+            window_loc = location;
+        } else {
+            // Still no size to center by: the next commit carrying one tries
+            // again.
+            window.with_state(|state| state.center_when_sized = true);
         }
     }
 

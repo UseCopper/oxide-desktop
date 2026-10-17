@@ -1263,7 +1263,7 @@ fn place_new_window(
     // the area and is moved to the middle of its real size on that commit.
     let size = window.geometry().size;
     let sized = size.w > 0 && size.h > 0;
-    window.decoration_state().center_when_sized = !sized;
+    window.with_state(|state| state.center_when_sized = !sized);
     let location = centered_in(area, size);
     space.map_element(window.clone(), location, activate);
 
