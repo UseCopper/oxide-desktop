@@ -5152,16 +5152,20 @@ fn drag_active() -> bool {
 /// landing's re-list — leaves its widget waiting for the next layout pass. GTK
 /// paints a laid-out-late widget cold: the first frames of a flight were a
 /// blank shell, so the slide appeared to start from wherever it had already
-/// got to, a few ticks in — the "wrong start". Allocating the bar here, at its
-/// own current size, lays every child in the same pass, so the next frame
-/// paints each square exactly where the geometry placed it.
+/// got to, a few ticks in — the "wrong start".
+///
+/// The cascade has to go through `size_allocate`, the classic allocation path
+/// containers run themselves: `allocate` (with the transform) is the
+/// layout-manager path, and a widget whose own allocation belongs to its
+/// parent — the overlay's belongs to the window — ignores it quietly. The
+/// test saw exactly that: a flyer still 0×0 after an `allocate` flush.
 fn flush_layout() {
     let Some(bar) = OVERLAY.with(|cell| cell.borrow().clone()) else {
         return;
     };
     let (width, height) = (bar.width(), bar.height());
     if width > 0 && height > 0 {
-        bar.allocate(width, height, -1, None);
+        bar.size_allocate(&gtk4::Allocation::new(0, 0, width, height), -1);
     }
 }
 
@@ -7982,16 +7986,26 @@ mod tests {
             square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
             tasks.append(&square);
         }
+        // Production geometry, not an approximation: the row is the overlay's
+        // main child, the carried layer is an overlay child, and the global
+        // OVERLAY handle — which flush_layout reads to lay the bar out
+        // synchronously — points at this overlay for the length of the
+        // section. A synthetic column-sibling layer answers coordinates
+        // through a different allocation ladder, and cannot see the flush.
         let layer = gtk4::Fixed::new();
-        let column = GtkBox::new(Orientation::Vertical, 0);
-        column.append(&tasks);
-        column.append(&layer);
+        layer.set_halign(gtk4::Align::Fill);
+        layer.set_valign(gtk4::Align::Fill);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&tasks));
+        overlay.add_overlay(&layer);
         let window = gtk4::Window::new();
-        window.set_child(Some(&column));
+        window.set_child(Some(&overlay));
         window.present();
+        OVERLAY.with(|cell| *cell.borrow_mut() = Some(overlay.clone()));
         for _ in 0..250 {
             glib::MainContext::default().iteration(false);
         }
+        overlay.allocate(320, PANEL_HEIGHT, -1, None);
         let order = || {
             let mut apps = Vec::new();
             let mut cursor = tasks.first_child();
@@ -8027,10 +8041,6 @@ mod tests {
             window.close();
             return;
         }
-        // The stand-in is the ghost named `held:` in the row. Its allocation
-        // needs a frame: it was just put into a freshly re-listed row, and an
-        // unallocated widget answers every coordinate question with (0,0) —
-        // the same trap the flight's retarget used to fall into.
         let stand_in = {
             let mut found = None;
             let mut cursor = tasks.first_child();
@@ -8042,12 +8052,32 @@ mod tests {
             }
             found
         };
+        // Does the flush work? The flyer must carry a real allocation at its
+        // own old slot the instant the trade returns, without waiting for a
+        // frame. An unallocated flyer here means the flush laid nothing and
+        // every flight's first paint really is cold.
+        let flyer_now = {
+            let mut found = None;
+            let mut cursor = layer.first_child();
+            while let Some(widget) = cursor {
+                if app_of(&widget).as_deref() == Some("b") {
+                    found = Some(widget.clone());
+                }
+                cursor = widget.next_sibling();
+            }
+            found.and_then(|flyer| {
+                flyer
+                    .translate_coordinates(&layer, 0.0, 0.0)
+                    .map(|pos| (pos, flyer.width(), flyer.height()))
+            })
+        };
+        eprintln!("oxide-test: the flyer right after the trade: {flyer_now:?}");
         let mut aimed = None;
         let start = std::time::Instant::now();
         while let Some(stand) = stand_in.as_ref() {
             // The suite's window never paints on its own; every layout pass is
             // pumped by hand, exactly as the drag counter-part does.
-            column.allocate(320, 96, -1, None);
+            overlay.allocate(320, PANEL_HEIGHT, -1, None);
             for _ in 0..250 {
                 glib::MainContext::default().iteration(false);
             }
@@ -8088,7 +8118,7 @@ mod tests {
             let mut landed = None;
             let start = std::time::Instant::now();
             while let Some(sq) = square_for(&tasks, "b") {
-                column.allocate(320, 96, -1, None);
+                overlay.allocate(320, PANEL_HEIGHT, -1, None);
                 for _ in 0..250 {
                     glib::MainContext::default().iteration(false);
                 }
@@ -8172,10 +8202,11 @@ mod tests {
             assert_eq!(order2(), ["b", "c", "", "d"], "the chained fling mislaid a slot");
             window2.close();
         }
+        OVERLAY.with(|cell| *cell.borrow_mut() = None);
         window.close();
     }
 
-        /// Section of `the_widget_suite_dances_in_one_process`.
+    /// Section of `the_widget_suite_dances_in_one_process`.
     fn a_live_row_trades_neighbours_as_the_pointer_crosses_them() {
         // The arithmetic above proves the mapping; this proves the machinery it
         // drives: real squares, a real layout, the real `row_geometry` and the
