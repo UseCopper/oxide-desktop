@@ -18,7 +18,7 @@ tracing = { version = "0.1.37", features = ["max_level_trace", "release_max_leve
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 xkbcommon = "0.8.0"
 xcursor = "0.3"
-image = { version = "0.24", optional = true }
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 fps_ticker = { version = "1", optional = true }
 renderdoc = { version = "0.12", optional = true }
 puffin_http = { version = "0.3", optional = true }
@@ -65,7 +65,7 @@ x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl
 xwayland = ["smithay/xwayland", "smithay/backend_libei"]
 libei = []
 renderer_sync = []
-debug = ["image", "fps_ticker", "renderdoc"]
+debug = ["fps_ticker", "renderdoc"]
 egl = ["smithay/backend_egl", "smithay/renderer_gl", "wayland-egl"]
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client"]
 profile-with-tracy-mem = ["profile-with-tracy"]

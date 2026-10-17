@@ -7,6 +7,7 @@
     allow(dead_code, unused_imports)
 )]
 
+pub mod background;
 pub mod cursor;
 pub mod desktop;
 pub mod drawing;
