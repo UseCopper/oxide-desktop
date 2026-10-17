@@ -210,11 +210,15 @@ fn phase_value(ease: fn(f64) -> f64, elapsed: f64) -> (f64, bool) {
 /// How long a press on a square must be held before the square is picked up and
 /// becomes a drag rather than staying a click.
 ///
-/// The pick-up is decided by the clock alone: moving no longer lifts anything,
-/// so a hurried drag starts from a deliberate place instead of wherever the
-/// hand had already wandered, and a click with a shaky pointer is still a
-/// click. A release beats the timer, so letting go early is an ordinary click.
+/// One of two ways to pick a square up: hold the press this long, or move
+/// [`DRAG_MOVE_THRESHOLD`] pixels — whichever happens first. A deliberate hold
+/// picks the square up where it stands; a decisive drag need not wait the hold
+/// out. A release beats both, so letting go early is an ordinary click.
 const DRAG_HOLD: Duration = Duration::from_millis(250);
+/// How far a press has to travel to pick up its square instead of waiting out
+/// [`DRAG_HOLD`]. Twice GTK's own double-click radius, so a jittered click
+/// cannot read as a drag.
+const DRAG_MOVE_THRESHOLD: f64 = 16.0;
 /// How long a displaced square takes to slide into its new home when a trade
 /// makes a spot for another. A fixed length, so even a fast sweep shows the
 /// slide rather than snapping; a new trade lands whatever is still flying.
@@ -241,14 +245,13 @@ const HOVER_GRACE: Duration = Duration::from_millis(60);
 /// that travelling along the bar does not open a menu for every square crossed.
 const HOVER_OPEN: Duration = Duration::from_millis(250);
 /// How the press on a square answers: press and let go quickly and it opens its
-/// windows; hold it for [`DRAG_HOLD`] and the square is picked up instead. There
-/// is deliberately no separate hold-to-activate underneath: there used to be
-/// one, firing at 180ms, and the two could not both be true — holding a square
-/// for a quarter of a second activated the app *and then* picked the square up.
+/// windows; hold it for [`DRAG_HOLD`] or move [`DRAG_MOVE_THRESHOLD`] pixels,
+/// whichever comes first, and the square is picked up instead. There is
+/// deliberately no separate hold-to-activate underneath: there used to be one,
+/// firing at 180ms, and the two could not both be true — holding a square for a
+/// quarter of a second activated the app *and then* picked the square up.
 ///
-/// The window between a click and a hold is [`DRAG_HOLD`], and the two timers
-/// are tuned apart so a press cannot land in both: a click arrives on release,
-/// which disarms the hold.
+/// A click arrives on release, which disarms both pick-up triggers.
 
 /// How long to wait for every preview before showing the menu anyway.
 ///
@@ -4585,10 +4588,11 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     (window, row, tasks)
 }
 
-/// Reorder the squares by dragging: a press held for [`DRAG_HOLD`] picks the
-/// square up, and it then rides the pointer, trading slots with every
-/// neighbour it crosses, with the drop committed to the remembered order. A
-/// press released before the hold is a click, decided by [`square_click`].
+/// Reorder the squares by dragging: a press that is held for [`DRAG_HOLD`] — or
+/// that travels [`DRAG_MOVE_THRESHOLD`], whichever comes first — picks the
+/// square up, and it then rides the pointer, trading slots with every neighbour
+/// it crosses, with the drop committed to the remembered order. A press
+/// released before either is a click, decided by [`square_click`].
 ///
 /// One gesture on the row, not one per square. A drag gesture reports its
 /// offsets in its own widget's coordinates, so a gesture owned by the square
@@ -4679,16 +4683,39 @@ fn watch_bar_drag(tasks: &GtkBox) {
     {
         let pressed = pressed.clone();
         let pointer = pointer.clone();
-        gesture.connect_drag_update(move |_, offset_x, _| {
+        gesture.connect_drag_update(move |_, offset_x, offset_y| {
             let Some((row_start, app)) = pressed.borrow().clone() else {
                 return;
             };
             let pointer_x = row_start + offset_x;
             pointer.set(pointer_x);
             if !drag_active() {
-                // Still just a press: the hold is what picks the square up, so
-                // travelling before it elapses changes nothing but the pointer
-                // position the lift will measure from.
+                // Either the hold or the travel picks the square up, whichever
+                // comes first: a hand that moves decisively need not wait the
+                // hold out, and a hand that holds still need not move a pixel.
+                // Total travel, not horizontal alone: a press dragged straight
+                // down is no more a click than one dragged sideways.
+                if offset_x.abs() + offset_y.abs() >= DRAG_MOVE_THRESHOLD {
+                    drag_begin(&app);
+                    if drag_active() {
+                        // Anchored at the press, like the hold's lift: the
+                        // square comes up under the pointer rather than a
+                        // threshold's worth behind it.
+                        DRAG.with(|drag| {
+                            if let Some(state) = drag.borrow().as_ref() {
+                                state.borrow().pointer_meet(row_start);
+                            }
+                        });
+                        if menu_debug() {
+                            eprintln!(
+                                "oxide-panel: drag {app:?} lifted by travel (pointer {pointer_x:.1}, press {row_start:.1})"
+                            );
+                        }
+                        if drag_update(pointer_x) && let Some(tasks) = tasks_box() {
+                            tasks.queue_allocate();
+                        }
+                    }
+                }
                 return;
             }
             // A second press landing mid-drag is not the drag: only the carried
