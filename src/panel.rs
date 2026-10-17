@@ -219,10 +219,35 @@ const DRAG_HOLD: Duration = Duration::from_millis(250);
 /// [`DRAG_HOLD`]. Twice GTK's own double-click radius, so a jittered click
 /// cannot read as a drag.
 const DRAG_MOVE_THRESHOLD: f64 = 16.0;
+/// How far the pointer must travel past a slot's edge before the square gives
+/// way into the next one. Measured from where the hole last moved, so a crossing
+/// that has only just happened is not immediately undone by a pixel of jitter —
+/// and the square visibly leans before it commits.
+const STICK_GIVE: f64 = 10.0;
+/// How far a carried square leans toward the pointer while it is still inside
+/// its slot. Fraction of the pointer's travel since the hole last moved, capped
+/// at [`STICK_LEAN_MAX`] so it pulls toward the neighbour without landing on it.
+const STICK_LEAN_FRACTION: f64 = 0.35;
+/// The furthest the carried square leans out of its slot, in pixels.
+const STICK_LEAN_MAX: f64 = 7.0;
+
+/// How far a carried square leans toward the pointer, given the pointer's
+/// travel since the hole last moved.
+///
+/// Small and capped: enough that the square visibly pulls toward where it is
+/// being dragged — the drag reads as tugging a stuck thing rather than the
+/// square teleporting a slot at a time — but never far enough to sit on the
+/// neighbour it is about to trade with.
+fn stick_lean(travel: f64) -> f64 {
+    (travel * STICK_LEAN_FRACTION).clamp(-STICK_LEAN_MAX, STICK_LEAN_MAX)
+}
+
 /// How long a displaced square takes to slide into its new home when a trade
 /// makes a spot for another. A fixed length, so even a fast sweep shows the
-/// slide rather than snapping; a new trade lands whatever is still flying.
+/// slide rather than snapping; a new trade lands whatever is still flying. The
+/// carried square glides on the same clock, so the row moves as one piece.
 const TRADE_SLIDE: Duration = Duration::from_millis(250);
+
 /// How long a window takes to fade in or out, separately from the width, because
 /// the two run one after the other rather than together.
 const CELL_FADE: Duration = Duration::from_millis(140);
@@ -4653,7 +4678,7 @@ fn watch_bar_drag(tasks: &GtkBox) {
                     return;
                 }
                 let pointer_x = pointer.get();
-                drag_begin(&app);
+                drag_begin(&app, pointer_x);
                 if drag_active() {
                     if menu_debug() {
                         eprintln!(
@@ -4683,7 +4708,7 @@ fn watch_bar_drag(tasks: &GtkBox) {
                 // Total travel, not horizontal alone: a press dragged straight
                 // down is no more a click than one dragged sideways.
                 if offset_x.abs() + offset_y.abs() >= DRAG_MOVE_THRESHOLD {
-                    drag_begin(&app);
+                    drag_begin(&app, pointer_x);
                     if drag_active() {
                         if menu_debug() {
                             eprintln!(
@@ -5176,6 +5201,10 @@ struct DragState {
     /// pointer resting on the seam between two slots would flip the gap forever
     /// otherwise.
     last_gap_x: f64,
+    /// The pointer position the carried square's lean is measured from: where
+    /// the hole last gave way, or the lift itself. The square is drawn in its
+    /// slot, leaning toward the pointer by the travel since this.
+    stick_ref: f64,
 }
 
 thread_local! {
@@ -5249,7 +5278,7 @@ fn ghost(name: &str) -> Button {
 /// size takes its place, so the row keeps its width and closes up around the hole exactly
 /// as it would if the square were still there and had moved. Nothing in the row is asked
 /// for a negative size.
-fn drag_begin(app: &str) {
+fn drag_begin(app: &str, pointer_x: f64) {
     if drag_active() {
         // A second square cannot join the first. Ignoring it is better than ending the
         // drag in progress, which would leave the carried square stranded in the overlay.
@@ -5329,6 +5358,7 @@ fn drag_begin(app: &str) {
             // square's x comes from the hole it is drawn in.
             carried_at: put,
             last_gap_x: row_left + f64::from(SQUARE_SIZE) / 2.0,
+            stick_ref: pointer_x,
         })));
     });
     // The carry starts exactly where it was put, so the first aim to a slot
@@ -5400,30 +5430,6 @@ fn drag_update(pointer_x: f64) -> bool {
     // motion the pointer made.
     let mut hole = state.borrow().gap;
     let target = row_geometry(&tasks).gap_at(pointer_x);
-    if target == hole {
-        // No crossing: the hole is where it was, and the carried square is
-        // already drawn in it — possibly still gliding there.
-        return false;
-    }
-    if (pointer_x - state.borrow().last_gap_x).abs() < 4.0 {
-        // Still within noise of the seam the hole last crossed; a pointer
-        // parked on a boundary would flip the slot with every pixel otherwise.
-        return false;
-    }
-    // Swaps run one slot at a time towards the pointer, so a fling across
-    // several squares leaves them exactly as a slow sweep would have. Each
-    // trade flies its square home; a trade that starts while the last is still
-    // flying lands it first, so intermediate snaps are pixel-correct and only
-    // the last trade animates.
-    // With short flights every trade slides, so crossing several slots in
-    // one motion flies each square in turn and they land one after another
-    // rather than all at once. That reads as a chain. For a slower hand to
-    // see each slide, every trade keeps its full 250ms.
-    // With a 250ms slide each trade stays on screen long enough to read. A
-    // trade that fires while another square is still flying lands it first, so
-    // a fling chains pixel-correctly — and slides that are merely overtaken by
-    // pointer motion, with no trade behind it, keep flying.
-    //
     // The slots' own geometry is read ONCE, before any of it: a chained trade
     // re-parents the placeholder to a slot the previous frame never laid out,
     // and coordinates measured through a freshly re-parented widget are its
@@ -5447,27 +5453,56 @@ fn drag_update(pointer_x: f64) -> bool {
         }
         slots
     };
-    let direction = if target > hole { 1 } else { -1 };
+
+    // Stickiness. A square does not give way the instant the pointer crosses
+    // its seam: it leans toward the drag like something stuck, and only commits
+    // once the pointer is STICK_GIVE past where the hole last moved. The lean is
+    // a fraction of that travel, capped, so it pulls toward the neighbour
+    // without landing on it.
+    let mut lean = 0.0;
     let mut relisted = false;
-    while hole != target {
-        let next = (hole as isize + direction) as usize;
-        let (Some(from), Some(to)) = (
-            slots.get(next).copied().flatten(),
-            slots.get(hole).copied().flatten(),
-        ) else {
-            // A slot with no allocation yet has no honest geometry: relist it
-            // plainly rather than fly it somewhere made up.
-            swap_row_slots(&tasks, hole, next);
+    if target != hole && (pointer_x - state.borrow().last_gap_x).abs() >= STICK_GIVE {
+        // Swaps run one slot at a time towards the pointer, so a fling across
+        // several squares leaves them exactly as a slow sweep would have. Each
+        // trade flies its square home; a trade that starts while the last is
+        // still flying lands it first, so intermediate snaps are pixel-correct
+        // and only the last trade animates.
+        let direction = if target > hole { 1 } else { -1 };
+        while hole != target {
+            let next = (hole as isize + direction) as usize;
+            let (Some(from), Some(to)) = (
+                slots.get(next).copied().flatten(),
+                slots.get(hole).copied().flatten(),
+            ) else {
+                // A slot with no allocation yet has no honest geometry: relist it
+                // plainly rather than fly it somewhere made up.
+                swap_row_slots(&tasks, hole, next);
+                hole = next;
+                relisted = true;
+                continue;
+            };
+            trade_slots_with(&tasks, &overlay, hole, next, from, to);
             hole = next;
             relisted = true;
-            continue;
-        };
-        trade_slots_with(&tasks, &overlay, hole, next, from, to);
-        hole = next;
-        relisted = true;
+        }
+        state.borrow_mut().gap = hole;
+        state.borrow_mut().last_gap_x = pointer_x;
+        // The give-way is the new resting place, so the lean starts over from
+        // here: the square is drawn in the slot it just won.
+        state.borrow_mut().stick_ref = pointer_x;
+        if menu_debug() {
+            eprintln!(
+                "oxide-panel: {app:?} traded through to slot {hole} (pointer {pointer_x:.0})"
+            );
+        }
+    } else {
+        // The square has not given way — either the pointer never left the slot
+        // or it has not pushed STICK_GIVE past the seam — so it is drawn where
+        // it belongs, leaning toward the pointer by the travel since the hole
+        // last moved.
+        lean = stick_lean(pointer_x - state.borrow().stick_ref);
     }
-    state.borrow_mut().gap = hole;
-    state.borrow_mut().last_gap_x = pointer_x;
+
     // The carried square follows the hole, not the pointer: it is drawn in the
     // slot it would land in, gliding after the hole on the same clock the
     // traded squares slide on, so the whole row moves as one piece. The target
@@ -5476,12 +5511,7 @@ fn drag_update(pointer_x: f64) -> bool {
     // answer with its last allocation.
     if let Some((slot_x, _)) = slots.get(hole).copied().flatten() {
         let y = state.borrow().carried_at.1;
-        carry_to(&square, &overlay, (slot_x - inset, y));
-    }
-    if menu_debug() {
-        eprintln!(
-            "oxide-panel: {app:?} traded through to slot {hole} (pointer {pointer_x:.0})"
-        );
+        carry_to(&square, &overlay, (slot_x - inset + lean, y));
     }
     relisted
 }
@@ -8190,6 +8220,30 @@ mod tests {
         eprintln!("oxide-test: held target y {held_y:.1}, row was {rest_y:.1}");
         assert_eq!(held_y, rest_y, "the flight must target a square's y, not the row top");
         window.close();
+    }
+
+    #[test]
+    fn a_carried_square_leans_while_it_is_stuck() {
+        // Inside a slot the square leans toward the drag, a fraction of the
+        // travel, so the drag reads as tugging something stuck.
+        assert_eq!(stick_lean(0.0), 0.0);
+        assert_eq!(stick_lean(10.0), 3.5);
+        // Capped: it pulls toward the neighbour without landing on it. Half a
+        // square is where two squares would start to overlap.
+        assert_eq!(stick_lean(100.0), STICK_LEAN_MAX);
+        assert_eq!(stick_lean(-100.0), -STICK_LEAN_MAX);
+        assert!(
+            STICK_LEAN_MAX < f64::from(SQUARE_SIZE) / 2.0,
+            "the lean must stay inside the square's own footprint"
+        );
+        // And the give-way is a deliberate pull, not a pixel of jitter: more
+        // than a nudge (which would make the square feel loose) and less than
+        // half a slot (which would make it ignore the drag).
+        assert!(STICK_GIVE >= 8.0, "the give-way should be felt");
+        assert!(
+            STICK_GIVE <= f64::from(SQUARE_SIZE) / 2.0,
+            "the give-way should not be half the shelf"
+        );
     }
 
     #[test]
