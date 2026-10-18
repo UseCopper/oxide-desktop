@@ -197,16 +197,12 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     pub minimized: Vec<(WindowElement, Point<i32, Logical>)>,
     pub ssd_drag: Option<SSDDrag>,
-    /// The window being moved by a client-initiated move grab, if any. While
-    /// set, `tick_animations` leaves its position to the grab so an in-flight
-    /// unmaximize transition only animates its size.
+    /// The window being moved by a client-initiated move grab, if any.
+    ///
+    /// A drag does not move the window itself while a transition is in flight:
+    /// it aims the transition (see `AnvilState::aim_restore_animation`), which
+    /// then carries the window to where the hand is.
     pub dragging_window: Option<WindowElement>,
-    /// Whether the drag in progress has taken the window from the restore
-    /// animation. Until the pointer moves, the animation is still carrying it —
-    /// which is what makes a window dragged out of maximize travel to the
-    /// pointer instead of appearing there — so this is what the animation checks
-    /// before giving up the location.
-    pub drag_took_pointer: bool,
     /// The snap zone the pointer is currently over, and when it entered it.
     /// The preview is only shown once the pointer has dwelled here long enough.
     pub snap_candidate: Option<SnapTarget>,
@@ -877,7 +873,6 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             minimized: Vec::new(),
             ssd_drag: None,
             dragging_window: None,
-            drag_took_pointer: false,
             snap_candidate: None,
             snap_candidate_since: Instant::now(),
             panel_ipc: None,

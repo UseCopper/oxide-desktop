@@ -372,6 +372,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
     }
 
+    /// Aim an in-flight transition at where a drag wants the window.
+    ///
+    /// Returns whether there was one to aim, which is also the answer to "does
+    /// the transition own the position this frame". The drag hands the window to
+    /// the transition rather than moving it: the transition travels from where
+    /// the window was — the corner a maximized one sat in — to where the hand
+    /// has taken it, so the window arrives smoothly instead of appearing under
+    /// the pointer. Having the drag move the window instead leaves it wherever
+    /// the transition had reached, offset from the pointer by the travel that
+    /// was left, which is further out the earlier the hand moves.
+    fn aim_restore_animation(&mut self, window: &WindowElement, want: Point<f64, Logical>) -> bool {
+        let mut state = window.decoration_state();
+        match state.animation.as_mut() {
+            Some(animation) => {
+                animation.retarget_location(want);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Start an unmaximize transition for a client-decorated window, whose
     /// restored size is chosen by the client and so isn't known yet. The window
     /// is frozen at its current (maximized) geometry, keeping the pre-maximize
@@ -394,18 +415,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // the client has chosen its size.
         self.space.map_element(window.clone(), start_loc, true);
         window.decoration_state().animation = Some(animation);
-    }
-
-    /// Pin any in-flight transition of `window` to its current location. Called
-    /// when an interactive drag ends so the window stays where it was dropped
-    /// while the size transition finishes.
-    pub fn pin_window_animation(&self, window: &WindowElement) {
-        let Some(loc) = self.space.element_location(window) else {
-            return;
-        };
-        if let Some(animation) = window.decoration_state().animation.as_mut() {
-            animation.pin_location(loc.to_f64());
-        }
     }
 
     /// Resolve the snap target under `global`. `exclude` is the window being
@@ -927,14 +936,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
             ));
-            // While a client move grab owns the window, it drives the position;
-            // the animation only supplies the (shrinking) size — but it keeps the
-            // position until the grab has actually taken it, so a window dragged
-            // out of maximize travels from where it was to the pointer rather
-            // than appearing there.
-            let being_dragged = self.dragging_window.as_ref() == Some(window)
-                && drag_owns_position(self.drag_took_pointer);
-            if !being_dragged && self.space.element_location(window) != Some(loc) {
+            // Applied even while a drag is in progress: the transition owns the
+            // window's position for as long as it exists, and a drag *aims* it
+            // (see `aim_restore_animation`) rather than moving the window
+            // underneath it. That is what makes a window dragged out of maximize
+            // travel from the corner it was in to the hand, and what stops a
+            // drag from leaving it stranded in that corner with no motion to
+            // place it.
+            if self.space.element_location(window) != Some(loc) {
                 self.space.relocate_element(window, loc);
             }
             // Once the curve is done, keep the animation (which holds the window
@@ -1243,20 +1252,6 @@ fn centered_in(area: Rectangle<i32, Logical>, size: Size<i32, Logical>) -> Point
     ))
 }
 
-/// Whether the drag in progress owns the window's position.
-///
-/// It does from the first motion, and not before: until then the restore
-/// animation is still carrying the window — out of the corner it was maximized
-/// into and towards the pointer — and taking the position away from it then
-/// leaves the window sitting wherever it started, which is what "the window goes
-/// to the top-left and corrects itself when I move" was.
-///
-/// Separated from the state it is read from so the handover can be asserted
-/// without a compositor: a drag that has not moved does not own anything.
-fn drag_owns_position(took_pointer: bool) -> bool {
-    took_pointer
-}
-
 fn place_new_window(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
@@ -1349,17 +1344,3 @@ fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool 
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_restore_animation_keeps_the_window_until_the_drag_moves_it() {
-        // A drag that has not moved owns nothing: the animation is still
-        // carrying the window out of the corner it was maximized into. Handing
-        // the position over at drag start instead is what left the window
-        // sitting in that corner until the pointer twitched.
-        assert!(!drag_owns_position(false), "a live drag should still be carried");
-        assert!(drag_owns_position(true), "the first motion takes the window over");
-    }
-}

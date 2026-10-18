@@ -718,13 +718,11 @@ impl HeaderBar {
             ?start_global,
             "SSD drag started"
         );
-        // The drag owns the window's position, so any restore animation that
-        // starts on the first motion only animates its size. Reset any stale
-        // preview so the dwell starts fresh from the first motion.
+        // A transition started on the first motion — a snapped window restoring
+        // as it is dragged out — carries the window from there; the drag aims it
+        // rather than moving the window itself. Reset any stale preview so the
+        // dwell starts fresh from the first motion.
         state.dragging_window = Some(window.clone());
-        // The restore animation carries a window out of maximize until the drag
-        // moves it, the same as the client-initiated move grabs.
-        state.drag_took_pointer = false;
         state.clear_snap_preview();
         state.ssd_drag = Some(SSDDrag {
             window: window.clone(),
@@ -1441,9 +1439,8 @@ impl WindowElement {
 impl<B: Backend> AnvilState<B> {
     pub fn end_ssd_drag(&mut self) {
         if let Some(drag) = self.ssd_drag.take() {
-            // Keep any in-flight restore transition at the drop position, then
-            // hand the window back to the animation before tiling.
-            self.pin_window_animation(&drag.window);
+            // Any restore transition in flight is aimed at the drop and left to
+            // finish it, the same as for the client-initiated move grabs.
             self.dragging_window = None;
             // The preview is only meaningful while the button is held.
             self.clear_snap_preview();
@@ -1466,9 +1463,7 @@ impl<B: Backend> AnvilState<B> {
         let Some(mut drag) = self.ssd_drag.clone() else {
             return;
         };
-        // From here the drag owns the window's position; the animation that was
-        // carrying it keeps only the size.
-        self.drag_took_pointer = true;
+
         if self.space.element_location(&drag.window).is_none() {
             self.ssd_drag = None;
             self.clear_snap_preview();
@@ -1505,7 +1500,11 @@ impl<B: Backend> AnvilState<B> {
         let new_origin = drag.start_origin + delta.to_i32_round();
         let new_origin =
             super::clamp_window_position(&self.space, &drag.window, global, new_origin);
-        self.space.map_element(drag.window.clone(), new_origin, true);
+        // As for the client-initiated grabs: a transition in flight owns the
+        // position and is aimed at where the drag wants the window.
+        if !self.aim_restore_animation(&drag.window, new_origin.to_f64()) {
+            self.space.map_element(drag.window.clone(), new_origin, true);
+        }
 
         // Track the snap target under the pointer and show its preview.
         let target = self.snap_zone_at(global, Some(&drag.window));

@@ -53,19 +53,6 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
-        // The first motion is where the grab takes the window over: a restore
-        // animation may still be carrying it — a window dragged out of maximize
-        // travels from where it was to the pointer — so the drag continues from
-        // the window's own position rather than from the place the drag was told
-        // to start, which the animation has not reached yet.
-        if !data.drag_took_pointer {
-            data.drag_took_pointer = true;
-            if let Some(current) = data.space.element_location(&self.window) {
-                self.initial_window_location = current;
-            }
-            self.start_data.location = event.location;
-        }
-
         let new_location = match self.anchor {
             // An unmaximize drag keeps the grabbed titlebar spot under the
             // pointer, adapting to the size the client actually committed.
@@ -80,8 +67,13 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        data.space
-            .map_element(self.window.clone(), new_location, true);
+        // A transition in flight owns the window's position and is aimed at
+        // where the drag wants it, so the window travels out of the corner it
+        // was in rather than being teleported under the pointer.
+        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
+            data.space
+                .map_element(self.window.clone(), new_location, true);
+        }
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());
@@ -106,10 +98,10 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     ) {
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
-            // No more buttons are pressed: keep any in-flight restore
-            // transition at the drop position, then hand the window back to the
-            // animation before tiling.
-            data.pin_window_animation(&self.window);
+            // No more buttons are pressed. Any restore transition still in
+            // flight is already aimed at where the window was dropped, so it is
+            // left to finish: it carries the window the last of the way to the
+            // hand while it shrinks, rather than stopping short of the drop.
             data.dragging_window = None;
             data.clear_snap_preview();
             if let Some(target) = self.snap_target.take() {
@@ -252,9 +244,8 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             return;
         }
 
-        // Keep any in-flight restore transition at the drop position, then hand
-        // the window back to the animation before tiling.
-        data.pin_window_animation(&self.window);
+        // See `PointerMoveSurfaceGrab::button`: the restore transition in flight
+        // is aimed at the drop and left to finish it.
         data.dragging_window = None;
         data.clear_snap_preview();
         if let Some(target) = self.snap_target.take() {
@@ -278,17 +269,6 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             return;
         }
 
-        // See `PointerMoveSurfaceGrab::motion`: the first motion is where the
-        // grab takes the window over from the restore animation, so the drag
-        // continues from where the window actually is.
-        if !data.drag_took_pointer {
-            data.drag_took_pointer = true;
-            if let Some(current) = data.space.element_location(&self.window) {
-                self.initial_window_location = current;
-            }
-            self.start_data.location = event.location;
-        }
-
         let new_location = match self.anchor {
             Some(anchor) => {
                 anchor.locate(
@@ -303,8 +283,12 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        data.space
-            .map_element(self.window.clone(), new_location, true);
+        // See `PointerMoveSurfaceGrab::motion`: the transition in flight owns
+        // the position and is aimed at where the finger wants the window.
+        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
+            data.space
+                .map_element(self.window.clone(), new_location, true);
+        }
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());

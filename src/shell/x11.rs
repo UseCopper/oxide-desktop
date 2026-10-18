@@ -502,10 +502,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         initial_window_location = restored;
                     }
 
-                    // The restore animation carries it: the grab takes the
-                    // position over on its first motion.
-                    self.drag_took_pointer = false;
-
                     if let Some(size) = restore_size {
                         self.animate_window(&element, size, initial_window_location);
                     }
@@ -573,10 +569,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             initial_window_location = restored;
         }
-
-        // The restore animation carries it: the grab takes the position over on
-        // its first motion.
-        self.drag_took_pointer = false;
 
         if let Some(size) = restore_size {
             self.animate_window(&element, size, initial_window_location);

@@ -240,12 +240,12 @@ impl WindowAnimation {
         (elapsed / self.duration.as_secs_f64()).clamp(0.0, 1.0)
     }
 
-    /// Pin the animation's location to `loc`, leaving the content interpolation
-    /// untouched. Used when an interactive drag ends mid-transition: the window
-    /// stays where it was dropped instead of sliding to the original target
-    /// while its size finishes animating.
-    pub fn pin_location(&mut self, loc: Point<f64, Logical>) {
-        self.start.loc = loc;
+    /// Aim the animation's end at `loc`, leaving where it started and its clock
+    /// alone. Used while a drag is carrying a window out of the maximized state:
+    /// the transition still travels from the corner it started in, but it now
+    /// settles where the hand has taken the window rather than at the place the
+    /// hand was when the drag began.
+    pub fn retarget_location(&mut self, loc: Point<f64, Logical>) {
         self.end.loc = loc;
     }
 
@@ -325,14 +325,30 @@ mod tests {
     }
 
     #[test]
-    fn pinning_location_keeps_size_interpolation() {
-        let start = WindowRect::from_geometry((0, 0).into(), (100, 100).into());
-        let end = WindowRect::from_geometry((200, 200).into(), (50, 50).into());
+    fn aiming_the_location_moves_where_it_ends_not_where_it_started() {
+        // The corner a maximized window sat in, and where the restore would have
+        // left it.
+        let start = WindowRect::from_geometry((0, 0).into(), (400, 300).into());
+        let end = WindowRect::from_geometry((200, 200).into(), (100, 100).into());
         let mut animation = WindowAnimation::new(start, end, Duration::from_millis(100));
-        animation.pin_location((10.0, 20.0).into());
-        let (rect, _) = animation.sample(Instant::now());
-        assert_eq!(rect.loc, Point::from((10.0, 20.0)));
-        assert!(rect.content.w <= 100.0 && rect.content.w >= 50.0);
+
+        // A drag moves the hand while the transition is in flight, so the
+        // transition is aimed where the hand is now. What the old code did
+        // instead — handing the position to the drag — left the window behind by
+        // however much of the travel was left, which is the drift the aim is for.
+        animation.retarget_location((50.0, 60.0).into());
+
+        let now = Instant::now();
+        let (early, _) = animation.sample(now);
+        // Still on its way out of the corner it started in...
+        assert!(early.loc.x < 50.0, "left the corner at once: {:?}", early.loc);
+        assert!(early.content.w > 100.0, "jumped to the restored size");
+
+        // ...and it settles exactly where it was aimed, not at the original end.
+        let (settled, progress) = animation.sample(now + Duration::from_millis(100));
+        assert_eq!(progress, 1.0);
+        assert_eq!(settled.loc, Point::from((50.0, 60.0)));
+        assert_eq!(settled.content, Size::from((100, 100)).to_f64());
     }
 
     #[test]

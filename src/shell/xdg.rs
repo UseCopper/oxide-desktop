@@ -1016,10 +1016,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
-        // The restore animation carries the window to where the drag starts it:
-        // the grab only takes the position over on its first motion.
-        self.drag_took_pointer = false;
-
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
             // wait for the client to commit its own size first.
@@ -1144,10 +1140,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             anchor = None;
             client_unmaximize = false;
         }
-
-        // The restore animation carries the window to where the drag starts it:
-        // the grab only takes the position over on its first motion.
-        self.drag_took_pointer = false;
 
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
