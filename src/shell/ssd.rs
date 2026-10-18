@@ -464,11 +464,28 @@ pub struct Borders {
 /// the three buttons are drawn on the titlebar's fill, so only the fill is
 /// thinned.
 const CHROME_ALPHA: f32 = crate::panel::BAR_PANEL_ALPHA as f32;
-/// The titlebar and the frame. One pair of greys, both see-through by
-/// [`CHROME_ALPHA`]: the frame is not a separate colour, it is the same chrome
-/// continuing around the window.
-const CHROME_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, CHROME_ALPHA];
-const CHROME_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, CHROME_ALPHA];
+/// The chrome's own grey, taken from the panel's: a window's titlebar and frame
+/// are the same surface as the bar they line up with, down to the colour — not a
+/// second grey that happens to look close.
+const CHROME_BASE: [f32; 3] = [
+    crate::panel::BAR_PANEL.0 as f32 / 255.0,
+    crate::panel::BAR_PANEL.1 as f32 / 255.0,
+    crate::panel::BAR_PANEL.2 as f32 / 255.0,
+];
+/// How much whiter the chrome is when its window is the one in use. A step of
+/// white rather than a second grey to keep in step, which is how the panel's own
+/// fills climb.
+const CHROME_FOCUS_STEP: f32 = 10.0 / 255.0;
+/// The titlebar and the frame. One colour, both see-through by [`CHROME_ALPHA`]:
+/// the frame is not a separate colour, it is the same chrome continuing around
+/// the window.
+const CHROME_COLOR: [f32; 4] = [CHROME_BASE[0], CHROME_BASE[1], CHROME_BASE[2], CHROME_ALPHA];
+const CHROME_COLOR_FOCUSED: [f32; 4] = [
+    CHROME_BASE[0] + CHROME_FOCUS_STEP,
+    CHROME_BASE[1] + CHROME_FOCUS_STEP,
+    CHROME_BASE[2] + CHROME_FOCUS_STEP,
+    CHROME_ALPHA,
+];
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
 /// A hovered button's patch, at the chrome's own transparency: an opaque patch
@@ -1626,10 +1643,24 @@ mod tests {
             (0.5..1.0).contains(&CHROME_ALPHA),
             "{CHROME_ALPHA} is not a transparency, it is a fog"
         );
-        // The titlebar and the frame are the same colour, so the chrome reads as
-        // one surface rather than a solid lid on a see-through box.
+        // The grey is the panel's too, not merely a transparency that matches:
+        // a window's chrome and the bar are one surface.
+        let (r, g, b) = crate::panel::BAR_PANEL;
+        assert_eq!(
+            [CHROME_COLOR[0], CHROME_COLOR[1], CHROME_COLOR[2]],
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+            "the chrome's own colour drifted from the panel's"
+        );
         assert_eq!(CHROME_COLOR[3], CHROME_ALPHA);
         assert_eq!(CHROME_COLOR_FOCUSED[3], CHROME_ALPHA);
+        // The focused window is the same chrome a step of white brighter, so
+        // there is no second colour to keep in step with the first.
+        for channel in 0..3 {
+            assert!(
+                (CHROME_COLOR_FOCUSED[channel] - CHROME_COLOR[channel] - CHROME_FOCUS_STEP).abs()
+                    < 1e-6
+            );
+        }
         // A hovered button's patch is thinned with the bar it sits on: an opaque
         // patch on a see-through bar reads as a hole in it.
         assert_eq!(BUTTON_HOVER_COLOR[3], CHROME_ALPHA);
