@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    Google Material Symbols, "push_pin" (filled), with a cross in the corner the pin leaves
+    free.
+    Copyright Google LLC, licensed under the Apache License 2.0.
+    Changed: rotated 45 degrees so the point faces the bottom left, scaled to leave the
+    bottom-right corner free, recoloured for the panel, and a cross drawn in that corner.
+  -->
+  <g fill="#e8e8e8" transform="rotate(45 12 12) translate(12 12) scale(0.85) translate(-12 -12)">
+    <path d="m16 12 2 2v2h-5v6l-1 1-1-1v-6H6v-2l2-2V5H7V3h10v2h-1Z"/>
+  </g>
+  <g stroke="#e8e8e8" stroke-width="1.4" stroke-linecap="butt">
+    <line x1="17.5" y1="17.5" x2="23" y2="23"/>
+    <line x1="23" y1="17.5" x2="17.5" y2="23"/>
+  </g>
+</svg>

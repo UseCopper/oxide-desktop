@@ -2775,8 +2775,6 @@ const CONTEXT_ICON_SIZE: i32 = 18;
 
 const ICON_CLOSE_ONE: &str = "window-close-symbolic";
 const ICON_CLOSE_ALL: &str = "edit-clear-all-symbolic";
-const ICON_PIN: &str = "starred-symbolic";
-const ICON_UNPIN: &str = "list-remove-symbolic";
 
 fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<ContextMenu> {
     // The shield first, only because the menu must exist after it to be able to
@@ -2902,15 +2900,13 @@ fn build_context_shield(app: &Application, monitor: &gdk::Monitor) -> gtk4::Wind
 /// Every row is the same kind of button. The app's own row starts the app
 /// rather than commanding one of its windows, and that is a fact of what it
 /// does, not of what it looks like.
-fn context_row(icon_name: &str, label: &str) -> gtk4::Button {
+fn context_row(icon: gtk4::Image, label: &str) -> gtk4::Button {
     let row = gtk4::Button::new();
     // Same as the squares: the first click must activate, not grab focus.
     row.set_focus_on_click(false);
     row.add_css_class("context-row");
     row.set_has_frame(false);
 
-    let icon = gtk4::Image::from_icon_name(icon_name);
-    icon.set_pixel_size(CONTEXT_ICON_SIZE);
     let text = gtk4::Label::new(Some(label));
     text.set_xalign(0.0);
     // The row is as wide as its widest label, and a name can be long; this is where
@@ -2923,6 +2919,58 @@ fn context_row(icon_name: &str, label: &str) -> gtk4::Button {
     content.append(&text);
     row.set_child(Some(&content));
     row
+}
+
+/// A row's icon out of the icon theme — or out of a file, for an app whose icon is one,
+/// which is the same rule the squares use.
+fn themed_icon(name: &str) -> gtk4::Image {
+    let icon = if name.starts_with('/') {
+        gtk4::Image::from_file(name)
+    } else {
+        gtk4::Image::from_icon_name(name)
+    };
+    icon.set_pixel_size(CONTEXT_ICON_SIZE);
+    icon
+}
+
+/// The panel's own pin, and the same pin with a cross in the corner, drawn here because the
+/// icon theme has no pin in it: what it has is a star, and "pin to panel" as a star is a
+/// different promise from what the row does.
+///
+/// They are files so that they can be edited and looked at, and compiled in so that nothing
+/// has to be installed beside the binary.
+const PIN_SVG: &[u8] = include_bytes!("../assets/pin.svg");
+const UNPIN_SVG: &[u8] = include_bytes!("../assets/unpin.svg");
+
+/// One of those drawn icons, rasterised into the texture a row puts beside its label.
+///
+/// The SVG is drawn at its own size and scaled down to [`CONTEXT_ICON_SIZE`], which is what
+/// keeps it crisp on a display scaled above 1: a texture rasterised at 18 pixels is 18
+/// pixels however large the display draws it.
+fn drawn_icon(svg: &'static [u8]) -> gtk4::Image {
+    let icon = match drawn_texture(svg) {
+        Some(texture) => gtk4::Image::from_paintable(Some(&texture)),
+        None => {
+            // A broken file, or a system with no SVG loader behind gdk-pixbuf. The row
+            // still says what it does; the label beside the icon is what is read.
+            tracing::warn!("a panel icon could not be drawn");
+            gtk4::Image::new()
+        }
+    };
+    icon.set_pixel_size(CONTEXT_ICON_SIZE);
+    icon
+}
+
+/// The texture an SVG draws, or nothing if this system cannot draw one.
+///
+/// Through gdk-pixbuf, which is where the SVG loader lives: GTK itself has no opinion
+/// about SVG, so an icon drawn in one is a file the system's loader has to understand.
+/// Everything here is a symbolic-icon desktop, so in practice it does.
+fn drawn_texture(svg: &'static [u8]) -> Option<gdk::Texture> {
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(svg));
+    let pixbuf =
+        gtk4::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE).ok()?;
+    Some(gdk::Texture::for_pixbuf(&pixbuf))
 }
 
 /// Empty the context menu and build it for one app.
@@ -2958,7 +3006,7 @@ fn context_rows_for(
         // opened behind it.
         1 => {
             let id = windows[0].id;
-            let row = context_row(ICON_CLOSE_ONE, "Quit window");
+            let row = context_row(themed_icon(ICON_CLOSE_ONE), "Quit window");
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2971,7 +3019,7 @@ fn context_rows_for(
             // Every window it has, closed. Sent one at a time because the protocol
             // closes one window per message and has no "quit this app" in it.
             let ids: Vec<u64> = windows.iter().map(|info| info.id).collect();
-            let row = context_row(ICON_CLOSE_ALL, "Quit all windows");
+            let row = context_row(themed_icon(ICON_CLOSE_ALL), "Quit all windows");
             let sender = stream.clone();
             let owned = context.clone();
             row.connect_clicked(move |_| {
@@ -2987,12 +3035,14 @@ fn context_rows_for(
     }
 
     if crate::desktop::is_app_id(key) {
-        let (label, icon_name) = if is_pinned(key) {
-            ("Unpin from panel", ICON_UNPIN)
+        // The pin, and the same pin with a cross in the corner: the two rows are one
+        // gesture either way round, so they are one drawing either way round.
+        let (label, icon) = if is_pinned(key) {
+            ("Unpin from panel", UNPIN_SVG)
         } else {
-            ("Pin to panel", ICON_PIN)
+            ("Pin to panel", PIN_SVG)
         };
-        let row = context_row(icon_name, label);
+        let row = context_row(drawn_icon(icon), label);
         let id = key.to_string();
         // The windows are kept so the menu can refill itself: the row's own label
         // and icon are what just changed, and rebuilding it needs to know how many
@@ -3017,7 +3067,7 @@ fn context_rows_for(
         let label = crate::desktop::cached(key)
             .map(|app| app.label().to_string())
             .unwrap_or_else(|| key.to_string());
-        let row = context_row(&resolve_icon(key), &label);
+        let row = context_row(themed_icon(&resolve_icon(key)), &label);
         let id = key.to_string();
         let owned = context.clone();
         row.connect_clicked(move |_| {
@@ -8757,6 +8807,76 @@ mod tests {
         a_row_local_read_is_short_of_the_layer_frame();
         a_sliding_bar_keeps_its_shape();
         a_leaving_square_fades_before_the_row_closes_behind_it();
+        the_panels_own_icons_draw_something();
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The panel's own icons are SVGs compiled into the binary, and every way they can fail
+    /// is silent: a path that resolves to nothing, a file that will not parse, a system whose
+    /// gdk-pixbuf has no SVG loader behind it. A row with a blank space where its icon should
+    /// be looks like a decision, so this is what says otherwise.
+    ///
+    /// And they are one drawing: the unpin is the pin with a cross in the corner, so every
+    /// pixel outside that corner has to be the pin's, exactly.
+    fn the_panels_own_icons_draw_something() {
+        use gtk4::gdk::prelude::TextureExtManual as _;
+
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let pin = drawn_texture(PIN_SVG).expect("the pin did not draw");
+        let unpin = drawn_texture(UNPIN_SVG).expect("the unpin did not draw");
+        assert_eq!(
+            (pin.width(), pin.height()),
+            (unpin.width(), unpin.height()),
+            "the two icons are not the same drawing at the same size"
+        );
+
+        let (w, h) = (pin.width() as usize, pin.height() as usize);
+        let stride = w * 4;
+        let mut drawn = vec![0u8; stride * h];
+        let mut crossed = vec![0u8; stride * h];
+        pin.download(&mut drawn, stride);
+        unpin.download(&mut crossed, stride);
+
+        // Every pixel of the pin is a pixel of the unpin — it is the same drawing — and
+        // every pixel the unpin has that the pin does not is the cross. An alpha of nothing
+        // is nothing drawn, so this compares what is actually on the icon.
+        let inked = |data: &[u8], x: usize, y: usize| data[y * stride + x * 4 + 3] > 0;
+        let mut pin_ink = 0;
+        let mut cross = 0;
+        for y in 0..h {
+            for x in 0..w {
+                match (inked(&drawn, x, y), inked(&crossed, x, y)) {
+                    (true, false) => panic!("the unpin is missing the pin's ink at ({x}, {y})"),
+                    (true, true) => pin_ink += 1,
+                    (false, true) => {
+                        cross += 1;
+                        // The cross, and nothing else: the bottom-right corner, which is the
+                        // one a pin leaning up from the bottom-left leaves free. A cross
+                        // drawn anywhere else is a different icon.
+                        assert!(
+                            x * 2 >= w && y * 2 >= h,
+                            "the cross has ink outside the bottom-right corner, at ({x}, {y})"
+                        );
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+        // And the pin is not simply blank: a texture that drew nothing would satisfy every
+        // check above by having nothing to disagree about. As a share of the icon, because
+        // the share is what a pin is, whatever size the drawing happens to be rasterised at.
+        assert!(
+            pin_ink * 8 > w * h,
+            "the pin drew almost nothing: {pin_ink} of {} pixels",
+            w * h
+        );
+        assert!(cross >= 8, "the cross is not drawn: {cross} pixels of it");
+
+        // The rows get it at the size they ask for.
+        assert_eq!(drawn_icon(PIN_SVG).pixel_size(), CONTEXT_ICON_SIZE);
     }
 
     /// A square in a row of its own, named as the bar names one.

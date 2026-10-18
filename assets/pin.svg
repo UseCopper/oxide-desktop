@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    Google Material Symbols, "push_pin" (filled).
+    Copyright Google LLC, licensed under the Apache License 2.0.
+    Changed: rotated 45 degrees so the point faces the bottom left, scaled to leave the
+    bottom-right corner free for the cross the unpin draws, and recoloured for the panel.
+  -->
+  <g fill="#e8e8e8" transform="rotate(45 12 12) translate(12 12) scale(0.85) translate(-12 -12)">
+    <path d="m16 12 2 2v2h-5v6l-1 1-1-1v-6H6v-2l2-2V5H7V3h10v2h-1Z"/>
+  </g>
+</svg>
