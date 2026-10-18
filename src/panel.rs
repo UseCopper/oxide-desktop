@@ -2792,8 +2792,9 @@ fn build_context_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel
     // The same namespace as the preview menu, so a compositor that hides panels by
     // namespace treats the two alike.
     window.set_namespace(Some("oxide-panel-menu"));
-    // Top, the same as the preview menu. The shield is underneath on Bottom, so
-    // the menu is above it and its clicks always reach the rows.
+    // Top, the same as the preview menu and the shield. The shield is shown first and so
+    // sits underneath: the menu's rows take their own clicks and everything else is the
+    // shield's.
     window.set_layer(Layer::Top);
     window.set_monitor(Some(monitor));
     window.set_anchor(Edge::Top, true);
@@ -2862,11 +2863,18 @@ fn build_context_shield(app: &Application, monitor: &gdk::Monitor) -> gtk4::Wind
     window.add_css_class("panel-window");
     window.init_layer_shell();
     window.set_namespace(Some("oxide-panel-shield"));
-    // Bottom: above every window and the desktop, below the bar and both
-    // menus. A click lands on the shield exactly when it was not aimed at
-    // anything of the panel's — which is the whole trick — and hovering the
-    // bar with the menu up still moves the menu, because the bar is above.
-    window.set_layer(Layer::Bottom);
+    // Top, which is the whole trick: a click lands on the shield exactly when it was not
+    // aimed at anything of the panel's, so what matters is where the *compositor* looks for
+    // a surface. It walks the layers `Overlay`, then `Top`, then the windows, then `Bottom`
+    // and `Background` — so `Bottom`, which is what this used to be, is under every window
+    // and a click on one went to the window with the menu left standing.
+    //
+    // Within a layer the last surface mapped is the one on top, and the shield is shown
+    // before the menu it belongs to: the menu is above it and its rows take their own
+    // clicks. The bar is below it while the menu is up, which is what the panel wants —
+    // hovering the bar does nothing while the app menu is open — and a click on the bar
+    // closes the menu either way.
+    window.set_layer(Layer::Top);
     window.set_monitor(Some(monitor));
     for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
         window.set_anchor(edge, true);
