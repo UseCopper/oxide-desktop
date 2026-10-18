@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     sync::{Mutex, atomic::Ordering},
     time::Duration,
 };
@@ -33,7 +34,12 @@ use smithay::{
         calloop::EventLoop,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{Display, protocol::wl_surface},
-        winit::event_loop::pump_events::PumpStatus,
+        winit::{
+            dpi::{PhysicalSize, Size},
+            event_loop::pump_events::PumpStatus,
+            monitor::VideoMode,
+            window::Window as WinitWindow,
+        },
     },
     utils::{IsAlive, Scale, Transform},
     wayland::{
@@ -96,6 +102,87 @@ impl Backend for WinitData {
     }
 }
 
+/// The refresh rate for an output's mode, out of a display's best mode: the number the
+/// compositor paces frames at, or 60Hz for a display that will not say.
+fn display_refresh(display: Option<(PhysicalSize<u32>, u32)>) -> i32 {
+    display.map(|(_, refresh)| refresh as i32).unwrap_or(60_000)
+}
+
+thread_local! {
+    /// Whether the window has been asked, once, to be the size of its display.
+    ///
+    /// Once, so that the host answering with a resize does not ask again — and so that a
+    /// window the user has resized since is left where they put it.
+    static DISPLAY_SIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Ask the window to be the size of the best mode its display offers, if that has not been
+/// asked yet and the display is known.
+///
+/// The display is not known until the host has placed the window, which is after the first
+/// frame: the compositor's own window is created at the size its attributes give it and the
+/// answer to this arrives as a resize, which is what sets the output's mode.
+fn size_to_display(window: &dyn WinitWindow, best: Option<&(PhysicalSize<u32>, u32)>) {
+    if DISPLAY_SIZED.with(Cell::get) {
+        return;
+    }
+    let Some((want, _)) = best else {
+        // This host does not say: a virtual display, a remote session. The window stays
+        // the size it was created at, and 60Hz stays on the output.
+        return;
+    };
+    if want.width == 0 || want.height == 0 {
+        return;
+    }
+    let asked: Size = (*want).into();
+    let _ = window.request_surface_size(asked);
+    DISPLAY_SIZED.with(|sized| sized.set(true));
+}
+
+/// The mode the display a nested window is on is best served by: its size, and its refresh
+/// rate in millihertz.
+///
+/// The same rule a real monitor's modes go through — the most pixels, then the highest
+/// refresh — because a nested session's display is a monitor with a mode list like any
+/// other, and the list is in no order.
+///
+/// Nothing comes back for a display that will not say, which is a virtual one or a remote
+/// session: the window keeps the size its attributes asked for and the output keeps 60Hz,
+/// as both were for everything.
+fn display_mode(window: &dyn WinitWindow) -> Option<(PhysicalSize<u32>, u32)> {
+    let display = window.current_monitor()?;
+    // What the display offers, or — on a host that will only say what it is running at, as
+    // Wayland does — the one mode it is in. Either is a mode list; the same rule picks from
+    // both, and a list of one picks that one.
+    let mut modes: Vec<VideoMode> = display.video_modes().collect();
+    if modes.is_empty() {
+        modes = display.current_video_mode().into_iter().collect();
+    }
+    let keys: Vec<(u64, u32)> = modes
+        .iter()
+        .map(|mode| {
+            let size = mode.size();
+            (
+                crate::output::pixels(size.width, size.height),
+                refresh_of(mode),
+            )
+        })
+        .collect();
+    let mode = modes.get(crate::output::best_mode(&keys)?)?;
+    Some((mode.size(), refresh_of(mode)))
+}
+
+/// A video mode's refresh rate in millihertz, with the 60Hz fallback for one that will not
+/// say. This is the rate the compositor paces its frames at, so a made-up 1Hz would be
+/// worse than the number it replaces.
+fn refresh_of(mode: &VideoMode) -> u32 {
+    match mode.refresh_rate_millihertz().map(|rate| rate.get()) {
+        // Between 1Hz and 1kHz: anything outside that is not a display.
+        Some(rate) if (1_000..=1_000_000).contains(&rate) => rate,
+        _ => 60_000,
+    }
+}
+
 pub fn run_winit() {
     let mut event_loop = EventLoop::try_new().unwrap();
     let display = Display::new().unwrap();
@@ -127,12 +214,26 @@ pub fn run_winit() {
             }
         }
     };
+    // The window is the whole of the compositor's output in a nested session, so it asks to
+    // be the size of the best mode its display offers: the resolution the desktop lays
+    // itself out at is the display's own, and a window smaller than the screen is a smaller
+    // desktop than the screen has. On most hosts the display is not known this early, and
+    // the resize handler below asks instead.
+    let best = display_mode(backend.window());
+    size_to_display(backend.window(), best.as_ref());
+
     let size = backend.window_size();
 
     let mode = Mode {
         size,
-        refresh: 60_000,
+        refresh: display_refresh(best),
     };
+    info!(
+        width = mode.size.w,
+        height = mode.size.h,
+        refresh = mode.refresh,
+        "output mode"
+    );
     let output = Output::new(
         OUTPUT_NAME.to_string(),
         PhysicalProperties {
@@ -245,9 +346,12 @@ pub fn run_winit() {
                 let output = state.space.outputs().next().unwrap().clone();
                 crate::shell::capture_relative_geometries(&state.space, &output);
                 state.space.map_output(&output, (0, 0));
+                let window = state.backend_data.backend.window();
+                let best = display_mode(window);
+                size_to_display(window, best.as_ref());
                 let mode = Mode {
                     size,
-                    refresh: 60_000,
+                    refresh: display_refresh(best),
                 };
                 output.change_current_state(Some(mode), None, None, None);
                 output.set_preferred(mode);

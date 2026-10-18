@@ -209,10 +209,19 @@ pub fn run_x11() {
         (s.w as i32, s.h as i32).into()
     };
 
+    // An X11 window is a window like any other, and its refresh is the X screen's, which
+    // this does not ask for: the app's `x11rb` is not the version smithay's X11 backend
+    // exposes its connection with, so RandR is not reachable from here. 60Hz, as before.
     let mode = Mode {
         size,
         refresh: 60_000,
     };
+    info!(
+        width = mode.size.w,
+        height = mode.size.h,
+        refresh = mode.refresh,
+        "output mode"
+    );
 
     #[cfg(feature = "debug")]
     #[allow(deprecated)]
