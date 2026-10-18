@@ -6797,18 +6797,31 @@ fn release_hold(square: &Button) {
 /// the first arrival move by a different number of slots from those behind the second, and
 /// one translate cannot say that — so a batch of them goes immediately, as it always did.
 fn start_slot_changes(tasks: &GtkBox, arriving: &[Button], leaving: &[Button]) {
-    // Whatever was in flight is finished first: it owns the row until it lands, and a
-    // change cannot be measured against a row that is still moving.
-    settle_slot_change(tasks);
+    // Nothing changed in this snapshot: leave whatever is in flight to finish in its own
+    // time.
+    //
+    // Settling here instead was the whole of the departure animation going missing. A
+    // snapshot is sent when the list changes, and closing a window changes it twice — the
+    // window goes, and the focus moves on, which is a change of its own — so the very next
+    // snapshot arrived a frame or two into the fade and finished the change on the spot.
+    // Most snapshots are this one: no square arriving, none leaving.
+    if arriving.is_empty() && leaving.is_empty() {
+        return;
+    }
     // A drag owns the row — it measures the slots to know what a trade is trading with —
     // and a square held a slot away from where the layout has it would be measured wrong.
-    // One arriving during a drag simply appears; one leaving is simply gone.
+    // One arriving during a drag simply appears; one leaving is simply gone. A batch is the
+    // row being rebuilt rather than a slot opening, for the reason the doc gives.
     if arriving.len() + leaving.len() != 1 || drag_active() {
+        settle_slot_change(tasks);
         for button in leaving {
             tasks.remove(button);
         }
         return;
     }
+    // Whatever is in flight is finished first: it owns the row until it lands, and a change
+    // cannot be measured against a row that is still moving.
+    settle_slot_change(tasks);
     let now = glib::monotonic_time();
     let change = if let Some(button) = arriving.first() {
         // The row has already moved for it — the square is in its slot and the squares
@@ -8735,6 +8748,109 @@ mod tests {
         a_live_row_trades_neighbours_as_the_pointer_crosses_them();
         a_row_local_read_is_short_of_the_layer_frame();
         a_sliding_bar_keeps_its_shape();
+        a_leaving_square_fades_before_the_row_closes_behind_it();
+    }
+
+    /// A square in a row of its own, named as the bar names one.
+    fn row_square(key: &str) -> Button {
+        let square = Button::new();
+        square.add_css_class("task");
+        square.set_widget_name(&format!("{APP_NAME_PREFIX}{key}"));
+        square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        square
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The row makes room for a square arriving, and closes only after one that has left is
+    /// invisible. Both halves are frame-timed, so the ticks are driven by hand here — a
+    /// widget that is never mapped has no frame clock, which is a test's luck and not
+    /// something the code may rely on.
+    ///
+    /// The first bug in this was the departure disappearing: a snapshot ended the change the
+    /// frame after it started. A window closing changes the list twice — the window goes,
+    /// and the focus moves on with it — so the fade was over before it could be seen.
+    fn a_leaving_square_fades_before_the_row_closes_behind_it() {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
+        let squares: Vec<Button> = ["one", "two", "three"]
+            .iter()
+            .map(|key| {
+                let square = row_square(key);
+                tasks.append(&square);
+                square
+            })
+            .collect();
+        let leaving = squares[1].clone();
+        let behind = squares[2].clone();
+
+        start_slot_changes(&tasks, &[], std::slice::from_ref(&leaving));
+        assert!(slot_change_in_flight(), "a square leaving is a slot change");
+        assert!(
+            leaving.parent().is_some(),
+            "the square left the row before it had faded"
+        );
+
+        // What a window closing sends next: the list changed again, and nothing in it is
+        // arriving or leaving. The fade has to survive it.
+        start_slot_changes(&tasks, &[], &[]);
+        assert!(slot_change_in_flight(), "a later snapshot ended the fade");
+        assert!(leaving.parent().is_some(), "so the square went before it was seen");
+
+        // Part way through the fade, the square is part way faded.
+        std::thread::sleep(SLOT_FADE / 3);
+        tick_slot_change(&tasks);
+        let partway = leaving.opacity();
+        assert!(
+            partway < 1.0 && partway > 0.0,
+            "the square is not fading: {partway}"
+        );
+
+        // Only once it is invisible does the row close, and it closes with the squares
+        // behind held where they were drawn, so the frame that closes it does not also jump
+        // them across the screen.
+        std::thread::sleep(SLOT_FADE);
+        tick_slot_change(&tasks);
+        assert!(
+            leaving.parent().is_none(),
+            "the square is still in the row after its fade"
+        );
+        assert!(
+            behind.has_css_class("held-forward"),
+            "the row closed without holding the squares behind it"
+        );
+        // Held for the frame the layout is drawn in, let go the one after.
+        tick_slot_change(&tasks);
+        assert!(
+            !behind.has_css_class("held-forward"),
+            "the row was never let go of"
+        );
+        std::thread::sleep(SLOT_FADE + SLOT_SLIDE);
+        tick_slot_change(&tasks);
+        assert!(!slot_change_in_flight(), "the change never finished");
+
+        // And the other way round: an arrival is invisible until the row has made room for
+        // it, which is the same hold taken from the other side.
+        let arriving = row_square("four");
+        tasks.prepend(&arriving);
+        start_slot_changes(&tasks, std::slice::from_ref(&arriving), &[]);
+        assert_eq!(arriving.opacity(), 0.0, "a square arrives already visible");
+        tick_slot_change(&tasks);
+        assert!(
+            behind.has_css_class("held-back"),
+            "the row did not make room for the square arriving"
+        );
+        tick_slot_change(&tasks);
+        assert!(
+            !behind.has_css_class("held-back"),
+            "the row never stopped holding back"
+        );
+        std::thread::sleep(SLOT_SLIDE + SLOT_FADE);
+        tick_slot_change(&tasks);
+        assert_eq!(arriving.opacity(), 1.0, "the arrival never finished fading in");
+        assert!(!slot_change_in_flight(), "the change never finished");
     }
 
     /// Section of `the_widget_suite_dances_in_one_process`.
