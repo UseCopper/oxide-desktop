@@ -53,6 +53,19 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
+        // The first motion is where the grab takes the window over: a restore
+        // animation may still be carrying it — a window dragged out of maximize
+        // travels from where it was to the pointer — so the drag continues from
+        // the window's own position rather than from the place the drag was told
+        // to start, which the animation has not reached yet.
+        if !data.drag_took_pointer {
+            data.drag_took_pointer = true;
+            if let Some(current) = data.space.element_location(&self.window) {
+                self.initial_window_location = current;
+            }
+            self.start_data.location = event.location;
+        }
+
         let new_location = match self.anchor {
             // An unmaximize drag keeps the grabbed titlebar spot under the
             // pointer, adapting to the size the client actually committed.
@@ -263,6 +276,17 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
     ) {
         if event.slot != self.start_data.slot {
             return;
+        }
+
+        // See `PointerMoveSurfaceGrab::motion`: the first motion is where the
+        // grab takes the window over from the restore animation, so the drag
+        // continues from where the window actually is.
+        if !data.drag_took_pointer {
+            data.drag_took_pointer = true;
+            if let Some(current) = data.space.element_location(&self.window) {
+                self.initial_window_location = current;
+            }
+            self.start_data.location = event.location;
         }
 
         let new_location = match self.anchor {

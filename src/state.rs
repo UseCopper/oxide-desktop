@@ -201,6 +201,12 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// set, `tick_animations` leaves its position to the grab so an in-flight
     /// unmaximize transition only animates its size.
     pub dragging_window: Option<WindowElement>,
+    /// Whether the drag in progress has taken the window from the restore
+    /// animation. Until the pointer moves, the animation is still carrying it —
+    /// which is what makes a window dragged out of maximize travel to the
+    /// pointer instead of appearing there — so this is what the animation checks
+    /// before giving up the location.
+    pub drag_took_pointer: bool,
     /// The snap zone the pointer is currently over, and when it entered it.
     /// The preview is only shown once the pointer has dwelled here long enough.
     pub snap_candidate: Option<SnapTarget>,
@@ -871,6 +877,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             minimized: Vec::new(),
             ssd_drag: None,
             dragging_window: None,
+            drag_took_pointer: false,
             snap_candidate: None,
             snap_candidate_since: Instant::now(),
             panel_ipc: None,

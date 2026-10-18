@@ -1016,11 +1016,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
-        // Put it where the drag starts it before anything animates: the grab
-        // that follows only moves the window when the pointer does, so a window
-        // dragged out of maximize would otherwise sit in the corner it was
-        // maximized into until the first twitch.
-        self.place_for_drag(&window, initial_window_location);
+        // The restore animation carries the window to where the drag starts it:
+        // the grab only takes the position over on its first motion.
+        self.drag_took_pointer = false;
 
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
@@ -1147,11 +1145,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
-        // Put it where the drag starts it before anything animates: the grab
-        // that follows only moves the window when the pointer does, so a window
-        // dragged out of maximize would otherwise sit in the corner it was
-        // maximized into until the first twitch.
-        self.place_for_drag(&window, initial_window_location);
+        // The restore animation carries the window to where the drag starts it:
+        // the grab only takes the position over on its first motion.
+        self.drag_took_pointer = false;
 
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:

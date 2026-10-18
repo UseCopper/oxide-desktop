@@ -722,6 +722,9 @@ impl HeaderBar {
         // starts on the first motion only animates its size. Reset any stale
         // preview so the dwell starts fresh from the first motion.
         state.dragging_window = Some(window.clone());
+        // The restore animation carries a window out of maximize until the drag
+        // moves it, the same as the client-initiated move grabs.
+        state.drag_took_pointer = false;
         state.clear_snap_preview();
         state.ssd_drag = Some(SSDDrag {
             window: window.clone(),
@@ -1463,6 +1466,9 @@ impl<B: Backend> AnvilState<B> {
         let Some(mut drag) = self.ssd_drag.clone() else {
             return;
         };
+        // From here the drag owns the window's position; the animation that was
+        // carrying it keeps only the size.
+        self.drag_took_pointer = true;
         if self.space.element_location(&drag.window).is_none() {
             self.ssd_drag = None;
             self.clear_snap_preview();

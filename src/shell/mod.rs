@@ -835,26 +835,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         Some(restored)
     }
 
-    /// Put a window where a drag is starting it from.
-    ///
-    /// The grab that follows drives the window's position from the pointer's own
-    /// deltas, so until the pointer moves there is nothing else to place it — and
-    /// a window dragged out of the maximized state would sit in the corner it was
-    /// maximized into until the hand twitched. Placed here, the only thing left
-    /// for the restore transition to animate is the size, which is what it is
-    /// for.
-    ///
-    /// A drag that starts anywhere else passes its own location, so this is a
-    /// no-op for it.
-    fn place_for_drag(&mut self, window: &WindowElement, location: Point<i32, Logical>) {
-        if self.space.element_location(window) != Some(location) {
-            // Relocated, not re-mapped: `map_element` re-appends the window to
-            // the front of the stack, and moving a window does not reorder the
-            // desktop.
-            self.space.relocate_element(window, location);
-        }
-    }
-
     /// Configure `window`'s client to occupy the decorated rectangle `rect`.
     /// Wayland clients are given the undecorated content size; X11's
     /// `configure` takes the frame rectangle directly. Returns the size to
@@ -948,8 +928,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.y.round() as i32,
             ));
             // While a client move grab owns the window, it drives the position;
-            // the animation only supplies the (shrinking) size.
-            let being_dragged = self.dragging_window.as_ref() == Some(window);
+            // the animation only supplies the (shrinking) size — but it keeps the
+            // position until the grab has actually taken it, so a window dragged
+            // out of maximize travels from where it was to the pointer rather
+            // than appearing there.
+            let being_dragged = self.dragging_window.as_ref() == Some(window)
+                && drag_owns_position(self.drag_took_pointer);
             if !being_dragged && self.space.element_location(window) != Some(loc) {
                 self.space.relocate_element(window, loc);
             }
@@ -1259,6 +1243,20 @@ fn centered_in(area: Rectangle<i32, Logical>, size: Size<i32, Logical>) -> Point
     ))
 }
 
+/// Whether the drag in progress owns the window's position.
+///
+/// It does from the first motion, and not before: until then the restore
+/// animation is still carrying the window — out of the corner it was maximized
+/// into and towards the pointer — and taking the position away from it then
+/// leaves the window sitting wherever it started, which is what "the window goes
+/// to the top-left and corrects itself when I move" was.
+///
+/// Separated from the state it is read from so the handover can be asserted
+/// without a compositor: a drag that has not moved does not own anything.
+fn drag_owns_position(took_pointer: bool) -> bool {
+    took_pointer
+}
+
 fn place_new_window(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
@@ -1349,4 +1347,19 @@ fn window_is_x11_surface(window: &WindowElement, surface: &WlSurface) -> bool {
 #[cfg(not(feature = "xwayland"))]
 fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_restore_animation_keeps_the_window_until_the_drag_moves_it() {
+        // A drag that has not moved owns nothing: the animation is still
+        // carrying the window out of the corner it was maximized into. Handing
+        // the position over at drag start instead is what left the window
+        // sitting in that corner until the pointer twitched.
+        assert!(!drag_owns_position(false), "a live drag should still be carried");
+        assert!(drag_owns_position(true), "the first motion takes the window over");
+    }
 }
