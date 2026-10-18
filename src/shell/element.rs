@@ -247,6 +247,28 @@ impl IsAlive for WindowElement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SSD(WindowElement);
 
+/// Hand the pointer to the window's header bar, unless the frame's own edge has
+/// it.
+///
+/// The two share the window's top-right corner: the close button lives there,
+/// and so does the corner the window is resized from. A pointer on the frame is
+/// resizing, not hovering a button — the cursor already says as much — so it is
+/// not handed on, and the button does not light up under a resize.
+fn hover_header_bar(window: &WindowElement, location: Point<f64, Logical>) {
+    // Decided before the borrow, because `resize_edge_at` reads the decoration
+    // state itself: reading it inside a held borrow is the re-entrant panic.
+    let on_the_frame = window.resize_edge_at(location).is_some();
+    let mut state = window.decoration_state();
+    if !state.is_ssd {
+        return;
+    }
+    if on_the_frame {
+        state.header_bar.pointer_leave();
+    } else {
+        state.header_bar.pointer_enter(location);
+    }
+}
+
 impl IsAlive for SSD {
     #[inline]
     fn alive(&self) -> bool {
@@ -291,10 +313,7 @@ impl SSD {
         } else {
             CursorImageStatus::default_named()
         };
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(location);
-        }
+        hover_header_bar(&self.0, location);
         if data.cursor_status != status {
             data.cursor_status = status;
         }
@@ -477,10 +496,7 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         _data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::MotionEvent,
     ) {
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-        }
+        hover_header_bar(&self.0, event.location);
     }
 
     fn frame(
@@ -583,10 +599,7 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
         event: &smithay::input::tablet::tool::MotionEvent,
     ) {
         // Same as pointer: tablet handling already subtracts the focus offset.
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-        }
+        hover_header_bar(&self.0, event.location);
     }
 
     fn button(

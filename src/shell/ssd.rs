@@ -51,6 +51,13 @@ pub struct WindowState {
     /// zone with the shared divider grid so a snapped window can never have one
     /// without the other.
     pub snap: Option<Snap>,
+    /// Where the drag currently moving this window picked it up, if one is.
+    ///
+    /// A drag carries the window under the pointer, so where the window is
+    /// dropped is where the hand is, not where the window belongs. Anything the
+    /// drop records as a place to put the window back to — a tiling, a maximize
+    /// — keeps this instead, and the drag clears it when it ends.
+    pub pickup: Option<RelativeGeometry>,
     /// Position and size of the window as fractions of its output's work area
     /// (0.0..=1.0, with 0.5,0.5 being the middle). Captured before an output
     /// resize and reapplied against the new work area so floating windows keep
@@ -282,7 +289,7 @@ pub struct VisibilityState {
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A window's geometry expressed relative to its output's work area.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RelativeGeometry {
     pub x: f64,
     pub y: f64,
@@ -414,6 +421,10 @@ pub struct SSDDrag {
     /// The snap target the pointer is currently over, resolved on each motion
     /// and applied when the drag ends.
     pub snap_target: Option<SnapTarget>,
+    /// Whether where the hand picked the window up has been recorded yet. It is
+    /// read from the window on the first motion, which is the first moment the
+    /// window's own state may be touched and the last moment it has not moved.
+    pub pickup_recorded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -718,9 +729,10 @@ impl HeaderBar {
             ?start_global,
             "SSD drag started"
         );
-        // The drag owns the window's position, so any restore animation that
-        // starts on the first motion only animates its size. Reset any stale
-        // preview so the dwell starts fresh from the first motion.
+        // A transition started on the first motion — a snapped window restoring
+        // as it is dragged out — carries the window from there; the drag aims it
+        // rather than moving the window itself. Reset any stale preview so the
+        // dwell starts fresh from the first motion.
         state.dragging_window = Some(window.clone());
         state.clear_snap_preview();
         state.ssd_drag = Some(SSDDrag {
@@ -728,6 +740,7 @@ impl HeaderBar {
             start_global,
             start_origin: window_origin,
             snap_target: None,
+            pickup_recorded: false,
         });
     }
 
@@ -1131,6 +1144,7 @@ impl WindowElement {
                 is_ssd: false,
                 restore: None,
                 snap: None,
+                pickup: None,
                 relative: None,
                 animation: None,
                 visibility: VisibilityState::default(),
@@ -1264,6 +1278,12 @@ impl WindowElement {
     /// callers can safely follow up with other `decoration_state()` reads.
     pub fn snap_floating(&self) -> Option<RelativeGeometry> {
         self.decoration_state().snap.map(|snap| snap.floating)
+    }
+
+    /// Take the place a drag picked this window up from. A drag records one
+    /// place, so this is what consumes it.
+    pub fn take_pickup(&self) -> Option<RelativeGeometry> {
+        self.decoration_state().pickup.take()
     }
 
     /// The divider grid shared by the window's snap group, if any.
@@ -1438,19 +1458,27 @@ impl WindowElement {
 impl<B: Backend> AnvilState<B> {
     pub fn end_ssd_drag(&mut self) {
         if let Some(drag) = self.ssd_drag.take() {
-            // Keep any in-flight restore transition at the drop position, then
-            // hand the window back to the animation before tiling.
-            self.pin_window_animation(&drag.window);
+            // Any restore transition in flight is aimed at the drop and left to
+            // finish it, the same as for the client-initiated move grabs.
             self.dragging_window = None;
             // The preview is only meaningful while the button is held.
             self.clear_snap_preview();
-            if let Some(target) = drag.snap_target {
-                // Deferred: this may run while the window's decoration state is
-                // borrowed (e.g. from the touch/tablet target handlers), and
-                // `apply_snap` needs to borrow it.
-                let window = drag.window;
-                self.handle
-                    .insert_idle(move |data| data.apply_snap(&window, &target));
+            match drag.snap_target {
+                Some(target) => {
+                    // Deferred: this may run while the window's decoration state
+                    // is borrowed (e.g. from the touch/tablet target handlers),
+                    // and `apply_snap` needs to borrow it.
+                    let window = drag.window;
+                    self.handle.insert_idle(move |data| {
+                        data.apply_snap(&window, &target);
+                        data.forget_pickup(&window);
+                    });
+                }
+                None => {
+                    // Dropped where it stood, so the place it came from is no
+                    // longer a place to put it back to.
+                    self.forget_pickup(&drag.window);
+                }
             }
             tracing::debug!("SSD drag ended");
         }
@@ -1463,6 +1491,19 @@ impl<B: Backend> AnvilState<B> {
         let Some(mut drag) = self.ssd_drag.clone() else {
             return;
         };
+
+        // Where the hand picked the window up, recorded before the snap it may
+        // be leaving is taken below and before the window is moved. Read here
+        // rather than at drag start, which runs with the window's decoration
+        // state already borrowed: only this first motion has a window that has
+        // not moved yet.
+        if !drag.pickup_recorded {
+            self.remember_pickup(&drag.window);
+            if let Some(active) = self.ssd_drag.as_mut() {
+                active.pickup_recorded = true;
+            }
+        }
+
         if self.space.element_location(&drag.window).is_none() {
             self.ssd_drag = None;
             self.clear_snap_preview();
@@ -1499,7 +1540,11 @@ impl<B: Backend> AnvilState<B> {
         let new_origin = drag.start_origin + delta.to_i32_round();
         let new_origin =
             super::clamp_window_position(&self.space, &drag.window, global, new_origin);
-        self.space.map_element(drag.window.clone(), new_origin, true);
+        // As for the client-initiated grabs: a transition in flight owns the
+        // position and is aimed at where the drag wants the window.
+        if !self.aim_restore_animation(&drag.window, new_origin.to_f64()) {
+            self.space.map_element(drag.window.clone(), new_origin, true);
+        }
 
         // Track the snap target under the pointer and show its preview.
         let target = self.snap_zone_at(global, Some(&drag.window));
@@ -1690,6 +1735,22 @@ mod tests {
             "the title changed colour as well as strength"
         );
         assert_eq!(&ICON_COLOR_UNFOCUSED[..3], &ICON_COLOR[..3]);
+    }
+
+    #[test]
+    fn the_corners_a_button_sits_in_are_the_corners_you_resize_from() {
+        // The close button occupies the window's top-right corner, and so does
+        // the corner you resize the window from: that overlap is why a pointer
+        // on the frame must not be handed to the header bar as a hover.
+        let size = Size::from((800, 600));
+        let corner = Point::from((799.0, 1.0));
+        let edge = resize_edge_band(corner, size).expect("the top-right corner is a resize");
+        assert!(edge.intersects(ResizeEdge::TOP) && edge.intersects(ResizeEdge::RIGHT));
+
+        // And the button's own middle is not, so hovering a button still works
+        // everywhere the frame is not.
+        let button_middle = Point::from((785.0, HEADER_BAR_HEIGHT as f64 / 2.0));
+        assert!(resize_edge_band(button_middle, size).is_none());
     }
 
     #[test]

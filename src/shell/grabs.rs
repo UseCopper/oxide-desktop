@@ -67,8 +67,13 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        data.space
-            .map_element(self.window.clone(), new_location, true);
+        // A transition in flight owns the window's position and is aimed at
+        // where the drag wants it, so the window travels out of the corner it
+        // was in rather than being teleported under the pointer.
+        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
+            data.space
+                .map_element(self.window.clone(), new_location, true);
+        }
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());
@@ -93,15 +98,18 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     ) {
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
-            // No more buttons are pressed: keep any in-flight restore
-            // transition at the drop position, then hand the window back to the
-            // animation before tiling.
-            data.pin_window_animation(&self.window);
+            // No more buttons are pressed. Any restore transition still in
+            // flight is already aimed at where the window was dropped, so it is
+            // left to finish: it carries the window the last of the way to the
+            // hand while it shrinks, rather than stopping short of the drop.
             data.dragging_window = None;
             data.clear_snap_preview();
             if let Some(target) = self.snap_target.take() {
                 data.apply_snap(&self.window, &target);
             }
+            // The drop has had the place the drag picked the window up from;
+            // nobody is carrying it any more.
+            data.forget_pickup(&self.window);
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -202,6 +210,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        data.forget_pickup(&self.window);
     }
 }
 
@@ -239,14 +248,15 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
             return;
         }
 
-        // Keep any in-flight restore transition at the drop position, then hand
-        // the window back to the animation before tiling.
-        data.pin_window_animation(&self.window);
+        // See `PointerMoveSurfaceGrab::button`: the restore transition in flight
+        // is aimed at the drop and left to finish it.
         data.dragging_window = None;
         data.clear_snap_preview();
         if let Some(target) = self.snap_target.take() {
             data.apply_snap(&self.window, &target);
         }
+        // See `PointerMoveSurfaceGrab::button`.
+        data.forget_pickup(&self.window);
         handle.up(data, event);
         handle.unset_grab(self, data);
     }
@@ -279,8 +289,12 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        data.space
-            .map_element(self.window.clone(), new_location, true);
+        // See `PointerMoveSurfaceGrab::motion`: the transition in flight owns
+        // the position and is aimed at where the finger wants the window.
+        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
+            data.space
+                .map_element(self.window.clone(), new_location, true);
+        }
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());
@@ -328,6 +342,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        data.forget_pickup(&self.window);
     }
 }
 

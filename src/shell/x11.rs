@@ -333,9 +333,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Maximizing supersedes any snap; the floating geometry would be stale.
         elem.decoration_state().clear_snap();
 
-        let old_geo = match self.space.element_bbox(&elem) {
-            Some(geo) => geo,
-            None => return,
+        // Where to come back to: the place the hand picked the window up, if a
+        // drag carried it here, rather than the top edge it was dropped on. X11
+        // has no fractional geometry of ours, so the place is turned back into
+        // the rectangle it stands for. Falls back to where the window is for a
+        // maximize nobody dragged it into.
+        let old_geo = elem
+            .take_pickup()
+            .and_then(|rel| super::absolute_geometry(&self.space, &elem, rel))
+            .map(|(loc, content)| {
+                Rectangle::new(loc, super::xdg::decorated_content_size(content, elem.is_ssd()))
+            })
+            .or_else(|| self.space.element_bbox(&elem));
+        let Some(old_geo) = old_geo else {
+            return;
         };
         let outputs_for_window = self.space.outputs_for_element(&elem);
         let output = outputs_for_window
@@ -469,6 +480,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         return;
                     };
 
+                    // Where the hand is picking the window up from, before
+                    // anything moves it. A maximized X11 window's own geometry
+                    // is the window manager's, so the drag reads that one below
+                    // instead.
+                    if !window.is_maximized() {
+                        self.remember_pickup(&element);
+                    }
+
                     // If surface is maximized then unmaximize it
                     let mut restore_size = None;
                     if window.is_maximized() {
@@ -483,6 +502,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             .and_then(|data| data.restore())
                         {
                             restore_size = Some(old_geo.size);
+                            // The place it came from before it was maximized.
+                            // This is what a drop that tiles it again must
+                            // remember, so that dragging it back out returns it
+                            // here rather than to the top edge it was dragged to.
+                            self.remember_pickup_from(&element, old_geo.loc, old_geo.size);
                             if let Err(err) =
                                 window.configure(Rectangle::new(initial_window_location, old_geo.size))
                             {
@@ -491,8 +515,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         }
                     }
 
-                    // The grab drives the position, so restore/unmaximize
-                    // transitions only animate the window's size.
+                    // From here the drag owns the window: it aims the restore
+                    // transition above rather than moving the window underneath
+                    // it.
                     self.dragging_window = Some(element.clone());
 
                     // A snapped window restores to its floating size.
@@ -538,6 +563,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
+        // Where the hand is picking the window up from, before anything moves
+        // it. A maximized X11 window's own geometry is the window manager's, so
+        // the drag reads that one below instead.
+        if !window.is_maximized() {
+            self.remember_pickup(&element);
+        }
+
         // If surface is maximized then unmaximize it
         let mut restore_size = None;
         if window.is_maximized() {
@@ -552,6 +584,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .and_then(|data| data.restore())
             {
                 restore_size = Some(old_geo.size);
+                // See the touch path: the place it came from before it was
+                // maximized.
+                self.remember_pickup_from(&element, old_geo.loc, old_geo.size);
                 if let Err(err) = window.configure(Rectangle::new(initial_window_location, old_geo.size))
                 {
                     tracing::warn!(?err, "Failed to configure X11 window");
@@ -559,8 +594,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
 
-        // The grab drives the position, so restore/unmaximize transitions only
-        // animate the window's size.
+        // From here the drag owns the window: it aims the restore transition
+        // above rather than moving the window underneath it.
         self.dragging_window = Some(element.clone());
 
         // A snapped window restores to its floating size.
