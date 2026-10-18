@@ -446,6 +446,10 @@ pub struct HeaderBar {
 
 #[derive(Debug, Clone)]
 pub struct Borders {
+    /// Three strips, not four: the window's top edge is the titlebar itself,
+    /// which is drawn at the chrome's own colour and transparency, so a strip
+    /// along it would be the same surface seen twice.
+
     pub bottom: SolidColorBuffer,
     pub left: SolidColorBuffer,
     pub right: SolidColorBuffer,
@@ -453,11 +457,38 @@ pub struct Borders {
     pub height: u32,
 }
 
-const BG_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 1.0];
-const BG_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0];
+/// How see-through a window's own chrome is — the titlebar and the frame alike.
+///
+/// The panel's number, not a second one that happens to look close: the bar and
+/// the windows under it are the same surface in two places, and the title and
+/// the three buttons are drawn on the titlebar's fill, so only the fill is
+/// thinned.
+const CHROME_ALPHA: f32 = crate::panel::BAR_PANEL_ALPHA as f32;
+/// The chrome's own grey, taken from the panel's: a window's titlebar and frame
+/// are the same surface as the bar they line up with, down to the colour — not a
+/// second grey that happens to look close.
+const CHROME_BASE: [f32; 3] = [
+    crate::panel::BAR_PANEL.0 as f32 / 255.0,
+    crate::panel::BAR_PANEL.1 as f32 / 255.0,
+    crate::panel::BAR_PANEL.2 as f32 / 255.0,
+];
+/// The titlebar and the frame, at the panel's own colour and transparency. One
+/// colour whether or not the window is focused: a focused window used to be a
+/// step lighter, which made it a *different* surface from the bar it lines up
+/// with, and that is the one thing the chrome is not allowed to be.
+const CHROME_COLOR: [f32; 4] = [CHROME_BASE[0], CHROME_BASE[1], CHROME_BASE[2], CHROME_ALPHA];
+/// The glyphs, and how they read when the window is not the one in use. What
+/// says which window is focused is the writing on the titlebar now, since its
+/// fill is the panel's own colour either way — the title and the three glyphs
+/// come up to full strength for the window being used and sit back for the
+/// others, the way a dimmed title has always said it.
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
+const ICON_COLOR_UNFOCUSED: [f32; 4] = [0.8, 0.8, 0.8, 0.55];
 const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
-const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
+const TITLE_COLOR_UNFOCUSED: [f32; 4] = [0.85, 0.85, 0.87, 0.55];
+/// A hovered button's patch, at the chrome's own transparency: an opaque patch
+/// on a see-through bar reads as a hole in it.
+const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, CHROME_ALPHA];
 
 pub const HEADER_BAR_HEIGHT: i32 = 30;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
@@ -833,13 +864,20 @@ impl HeaderBar {
         // The title sits on the left, in the space the three buttons leave.
         let max_title_width =
             (width as i32 - BUTTON_WIDTH as i32 * 3 - 2 * TITLE_PADDING).max(0);
+        let title_color = if focused {
+            TITLE_COLOR
+        } else {
+            TITLE_COLOR_UNFOCUSED
+        };
         if let Some(title) = title
-            && (title != self.title || max_title_width != self.title_max_width)
+            && (title != self.title
+                || max_title_width != self.title_max_width
+                || focused != self.focused)
         {
             self.title.clear();
             self.title.push_str(title);
             self.title_max_width = max_title_width;
-            match crate::text::rasterize(title, max_title_width, HEADER_BAR_HEIGHT, TITLE_COLOR) {
+            match crate::text::rasterize(title, max_title_width, HEADER_BAR_HEIGHT, title_color) {
                 Some((buffer, size)) => {
                     self.title_buffer = buffer;
                     self.title_width = size.w;
@@ -850,7 +888,10 @@ impl HeaderBar {
             }
         }
 
-        let bg = if focused { BG_COLOR_FOCUSED } else { BG_COLOR };
+        // One colour for the whole chrome, focused or not: the titlebar and the
+        // frame are the same surface as the bar they line up with.
+        let bg = CHROME_COLOR;
+        let frame = bg;
 
         self.background
             .update((width as i32, HEADER_BAR_HEIGHT), bg);
@@ -861,9 +902,9 @@ impl HeaderBar {
         self.borders.height = content_height;
         let ring_w = (content_width + 2 * BORDER_WIDTH as u32) as i32;
         let ring_h = content_height as i32;
-        self.borders.bottom.update((ring_w, BORDER_WIDTH), bg);
-        self.borders.left.update((BORDER_WIDTH, ring_h), bg);
-        self.borders.right.update((BORDER_WIDTH, ring_h), bg);
+        self.borders.bottom.update((ring_w, BORDER_WIDTH), frame);
+        self.borders.left.update((BORDER_WIDTH, ring_h), frame);
+        self.borders.right.update((BORDER_WIDTH, ring_h), frame);
 
         let mut needs_redraw_buttons = false;
         if width != self.width {
@@ -873,6 +914,18 @@ impl HeaderBar {
         if focused != self.focused {
             needs_redraw_buttons = true;
             self.focused = focused;
+            // The glyphs are what says which window is in use, so they are
+            // written again at the new strength — the fill does not move.
+            let icons = if focused {
+                ICON_COLOR
+            } else {
+                ICON_COLOR_UNFOCUSED
+            };
+            let (w, h) = (ICON_SIZE as u32, ICON_SIZE as u32);
+            self.close_icon = xbm_icon(&CLOSE_ICON, w, h, icons);
+            self.maximize_icon = xbm_icon(&MAXIMIZE_ICON, w, h, icons);
+            self.minimize_icon = xbm_icon(&MINIMIZE_ICON, w, h, icons);
+            self.restore_icon = xbm_icon(&RESTORE_ICON, w, h, icons);
         }
 
         if self
@@ -1105,24 +1158,32 @@ impl WindowElement {
                         width: 0,
                         height: 0,
                     },
-                    close_icon: xbm_icon(&CLOSE_ICON, ICON_SIZE as u32, ICON_SIZE as u32, ICON_COLOR),
+                    // Born unfocused, like the rest of the state: the first
+                    // redraw writes them at the strength for whatever the window
+                    // turns out to be.
+                    close_icon: xbm_icon(
+                        &CLOSE_ICON,
+                        ICON_SIZE as u32,
+                        ICON_SIZE as u32,
+                        ICON_COLOR_UNFOCUSED,
+                    ),
                     maximize_icon: xbm_icon(
                         &MAXIMIZE_ICON,
                         ICON_SIZE as u32,
                         ICON_SIZE as u32,
-                        ICON_COLOR,
+                        ICON_COLOR_UNFOCUSED,
                     ),
                     minimize_icon: xbm_icon(
                         &MINIMIZE_ICON,
                         ICON_SIZE as u32,
                         ICON_SIZE as u32,
-                        ICON_COLOR,
+                        ICON_COLOR_UNFOCUSED,
                     ),
                     restore_icon: xbm_icon(
                         &RESTORE_ICON,
                         ICON_SIZE as u32,
                         ICON_SIZE as u32,
-                        ICON_COLOR,
+                        ICON_COLOR_UNFOCUSED,
                     ),
                     title: String::new(),
                     title_buffer: MemoryRenderBuffer::default(),
@@ -1592,6 +1653,44 @@ impl<B: Backend> AnvilState<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chrome_is_as_transparent_as_the_panel() {
+        // Not "close to" the panel's transparency: the panel's number. The bar
+        // and the windows under it are the same surface in two places, and this
+        // is the one place that could drift from it without anything noticing.
+        assert_eq!(CHROME_ALPHA, crate::panel::BAR_PANEL_ALPHA as f32);
+        assert!(
+            (0.5..1.0).contains(&CHROME_ALPHA),
+            "{CHROME_ALPHA} is not a transparency, it is a fog"
+        );
+        // The grey is the panel's too, not merely a transparency that matches:
+        // a window's chrome and the bar are one surface.
+        let (r, g, b) = crate::panel::BAR_PANEL;
+        assert_eq!(
+            [CHROME_COLOR[0], CHROME_COLOR[1], CHROME_COLOR[2]],
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+            "the chrome's own colour drifted from the panel's"
+        );
+        assert_eq!(CHROME_COLOR[3], CHROME_ALPHA);
+        // A hovered button's patch is thinned with the bar it sits on: an opaque
+        // patch on a see-through bar reads as a hole in it.
+        assert_eq!(BUTTON_HOVER_COLOR[3], CHROME_ALPHA);
+        // The chrome does not change with focus — there is no second colour for
+        // it to be — so what says which window is in use is the writing on it.
+        assert_eq!(TITLE_COLOR[3], 1.0);
+        assert_eq!(ICON_COLOR[3], 1.0);
+        assert!(
+            TITLE_COLOR_UNFOCUSED[3] < 1.0 && ICON_COLOR_UNFOCUSED[3] < 1.0,
+            "an unfocused window's writing is not sitting back"
+        );
+        assert_eq!(
+            &TITLE_COLOR_UNFOCUSED[..3],
+            &TITLE_COLOR[..3],
+            "the title changed colour as well as strength"
+        );
+        assert_eq!(&ICON_COLOR_UNFOCUSED[..3], &ICON_COLOR[..3]);
+    }
 
     #[test]
     fn drag_anchor_adapts_to_committed_size() {
