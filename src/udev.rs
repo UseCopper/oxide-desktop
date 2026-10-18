@@ -73,7 +73,7 @@ use smithay::{
         },
         drm::{
             Device as _,
-            control::{Device, ModeTypeFlags, connector, crtc},
+            control::{Device, connector, crtc},
         },
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
@@ -970,14 +970,32 @@ impl AnvilState<UdevData> {
                 );
             }
         } else {
-            let mode_id = connector
+            let sizes: Vec<(u64, u32)> = connector
                 .modes()
                 .iter()
-                .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .unwrap_or(0);
+                .map(|mode| {
+                    let (width, height) = mode.size();
+                    (
+                        crate::output::pixels(u32::from(width), u32::from(height)),
+                        crate::output::millihertz(mode.vrefresh()),
+                    )
+                })
+                .collect();
+            let Some(mode_id) = crate::output::best_mode(&sizes) else {
+                warn!(connector = %output_name, "Connector offers no modes");
+                return;
+            };
 
             let drm_mode = connector.modes()[mode_id];
             let wl_mode = WlMode::from(drm_mode);
+            let (width, height) = drm_mode.size();
+            info!(
+                connector = %output_name,
+                width,
+                height,
+                refresh = drm_mode.vrefresh(),
+                "output mode"
+            );
 
             let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
             let output = Output::new(

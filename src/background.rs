@@ -153,26 +153,10 @@ fn appearance(elapsed: Duration) -> (f64, f64) {
 
 fn load(cap: Size<u32, Physical>) -> Option<Wallpaper> {
     let path = image_path()?;
-    let image = match image::open(&path) {
-        Ok(image) => image,
-        Err(err) => {
-            tracing::warn!(?path, ?err, "wallpaper could not be read");
-            return None;
-        }
-    };
-    // Down to the size it is drawn at: a wallpaper is usually much larger than
-    // the screen, and the pixels that get cropped away were never going to be
-    // seen. `thumbnail` keeps the aspect, so the cover crop below still works.
-    let image = if image.width() > cap.w || image.height() > cap.h {
-        image.thumbnail(cap.w, cap.h)
-    } else {
-        image
-    };
-    let rgba = image.to_rgba8();
-    let size = Size::from((rgba.width() as i32, rgba.height() as i32));
-    if size.w <= 0 || size.h <= 0 {
+    let Some(rgba) = decode(&path, cap) else {
         return None;
-    }
+    };
+    let size = Size::from((rgba.width() as i32, rgba.height() as i32));
     // `Abgr8888` is the format whose bytes are R, G, B, A in memory, which is
     // what `to_rgba8` hands over. (`Argb8888` is the same word the other way
     // round, and would swap the red and blue channels.)
@@ -184,14 +168,44 @@ fn load(cap: Size<u32, Physical>) -> Option<Wallpaper> {
         Transform::Normal,
         None,
     );
-    tracing::info!(?path, "wallpaper loaded");
+    tracing::info!(?path, size = ?size, "wallpaper loaded");
     Some(Wallpaper {
         buffer: Arc::new(buffer),
         size,
     })
 }
 
+/// The wallpaper's pixels, at most `cap` of them in either direction.
+///
+/// Down to the size it is drawn at: a wallpaper is usually much larger than the
+/// screen, and the pixels that get cropped away were never going to be seen.
+/// `thumbnail` keeps the aspect, so the cover crop below still works.
+///
+/// Read separately from the buffer above so that what comes out of a decode can be
+/// asserted without a renderer: the size it is brought down to, and the order the colour
+/// channels arrive in.
+fn decode(path: &PathBuf, cap: Size<u32, Physical>) -> Option<image::RgbaImage> {
+    let image = match image::open(path) {
+        Ok(image) => image,
+        Err(err) => {
+            tracing::warn!(?path, ?err, "wallpaper could not be read");
+            return None;
+        }
+    };
+    let image = if image.width() > cap.w || image.height() > cap.h {
+        image.thumbnail(cap.w, cap.h)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    (rgba.width() > 0 && rgba.height() > 0).then_some(rgba)
+}
+
 /// Where the wallpaper is looked for, in order, ending at nothing.
+///
+/// The names are the ones a user would guess, and the extensions are the formats the
+/// compositor can read: the three the `image` crate is built with. A picture in any other
+/// format has to be named outright with `OXIDE_WALLPAPER`.
 fn image_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("OXIDE_WALLPAPER") {
         let path = PathBuf::from(explicit);
@@ -209,7 +223,7 @@ fn image_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for dir in [Some(config), data].into_iter().flatten() {
         for name in ["wallpaper", "background"] {
-            for extension in ["png", "jpg", "jpeg"] {
+            for extension in ["png", "jpg", "jpeg", "webp"] {
                 candidates.push(dir.join("oxide").join(format!("{name}.{extension}")));
             }
         }
@@ -320,6 +334,46 @@ mod tests {
     }
 
     #[test]
+    fn a_wallpaper_is_decoded_to_the_outputs_pixels_and_no_more() {
+        // A picture larger than the screen is brought down to it, keeping its shape, so the
+        // pixels that the cover crop throws away are never decoded into a buffer at all.
+        let dir = std::env::temp_dir().join(format!("oxide-decode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wallpaper.png");
+        let pixels: Vec<u8> = (0..(256 * 128 * 4)).map(|i| (i % 251) as u8).collect();
+        image::RgbaImage::from_raw(256, 128, pixels)
+            .expect("pixels")
+            .save(&path)
+            .expect("encode");
+
+        let big: Size<u32, Physical> = Size::from((4096u32, 4096u32));
+        let decoded = decode(&path, big).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (256, 128));
+
+        // Down to a quarter of it, shape and all.
+        let small: Size<u32, Physical> = Size::from((64u32, 64u32));
+        let decoded = decode(&path, small).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (64, 32));
+
+        // The channels come out in the order the buffer's format says they do: red first,
+        // alpha last, which is what `Abgr8888` means as bytes. Getting this the other way
+        // round is a desktop with the red and blue swapped, and nothing else to show for it.
+        let one = dir.join("one.png");
+        image::RgbaImage::from_raw(1, 1, vec![10, 20, 30, 40])
+            .expect("pixel")
+            .save(&one)
+            .expect("encode");
+        let decoded = decode(&one, big).expect("decode");
+        assert_eq!(decoded.into_raw(), vec![10, 20, 30, 40], "not R, G, B, A");
+
+        // And something that is not an image is not a wallpaper.
+        let junk = dir.join("junk.png");
+        std::fs::write(&junk, b"this is not a png").expect("junk");
+        assert!(decode(&junk, big).is_none(), "a file that is not an image was decoded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_degenerate_wallpaper_is_handed_back_whole() {
         // A zero-sized image or output cannot be scaled, and dividing by it
         // would be a NaN that tints the whole screen.
@@ -355,3 +409,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

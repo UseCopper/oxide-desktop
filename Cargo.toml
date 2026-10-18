@@ -18,7 +18,7 @@ tracing = { version = "0.1.37", features = ["max_level_trace", "release_max_leve
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 xkbcommon = "0.8.0"
 xcursor = "0.3"
-image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 fps_ticker = { version = "1", optional = true }
 renderdoc = { version = "0.12", optional = true }
 puffin_http = { version = "0.3", optional = true }
@@ -61,7 +61,9 @@ features = [
 default = ["winit", "xwayland"]
 winit = ["smithay/backend_winit", "smithay/backend_egl", "smithay/renderer_gl", "egl"]
 udev = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_udev", "smithay/backend_libinput", "smithay/backend_session_libseat", "smithay/renderer_multi", "smithay/input", "smithay/drm", "smithay/gbm", "smithay/backend_egl", "smithay/renderer_gl", "egl", "nix", "libinput-rs", "drm-fourcc", "gbm", "smithay-drm-extras", "wayland-backend", "wayland-client", "wayland-server", "wayland-protocols", "wayland-egl"]
-x11 = ["smithay/backend_x11", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
+# The X11 window path imports smithay's vulkan allocator without gating it, so the feature
+# needs that backend too: without it this feature does not compile at all.
+x11 = ["smithay/backend_x11", "smithay/backend_vulkan", "smithay/backend_egl", "smithay/renderer_gl", "egl", "x11rb"]
 xwayland = ["smithay/xwayland", "smithay/backend_libei"]
 libei = []
 renderer_sync = []
@@ -73,3 +75,15 @@ profile-with-puffin = ["puffin", "puffin_http"]
 
 [build-dependencies]
 gl_generator = "0.14"
+
+# A debug build is a debug build for this workspace, not for its dependencies. What it
+# cost: decoding a 6000x4000 wallpaper photograph took 3.1 seconds with an unoptimised
+# JPEG decoder in the tree, and 0.25 seconds with one built to run; the small
+# 1773x980 JPEG in a config directory took 250ms and now takes 11ms. None of that is the
+# image's fault and none of it is visible in a stack trace — the crates nobody debugs are
+# the ones worth optimising, and the first build after this change pays for it once.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3
