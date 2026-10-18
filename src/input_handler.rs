@@ -486,6 +486,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let output_geo = self.space.output_geometry(output).unwrap();
         let layers = layer_map_for_output(output);
 
+        // The order here is the contract with the panel: a fullscreen window, then the
+        // `Overlay` and `Top` layers, then the windows, then `Bottom` and `Background`.
+        // The panel's menus are `Top` and the shield behind them is `Top` as well, so that
+        // a click meant for neither lands on the shield rather than on the window under it;
+        // moving the shield back to `Bottom` — where layer-shell's own documentation puts
+        // "below the windows" — hands those clicks to the window again.
         let mut under = None;
         if let Some((surface, loc)) = output
             .user_data()
