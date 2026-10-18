@@ -253,16 +253,11 @@ const TRADE_SLIDE: Duration = Duration::from_millis(250);
 const CELL_FADE: Duration = Duration::from_millis(140);
 /// How long the menu's reveal takes.
 const MENU_FADE: Duration = Duration::from_millis(180);
-/// How full a square looks when its app has windows on screen. One step above
-/// the bar, so a running app reads as *there* rather than as an empty outline.
-const TASK_RUNNING_ALPHA: f64 = 0.06;
-/// An app whose windows are all minimized: still running, not on screen. A
-/// dimmer step than [`TASK_RUNNING_ALPHA`], so the fill says how much of the app
-/// is visible; a pinned app with nothing open gets no fill at all.
-const TASK_MINIMIZED_ALPHA: f64 = 0.03;
-/// The white a square shows under the pointer. Above both rest states, so a
-/// hover is always a change, whatever the square was showing.
+/// The white a square shows under the pointer — and while it is being carried,
+/// which is the same thing: the square in hand is the square under the pointer.
 const TASK_HOVER_ALPHA: f64 = 0.10;
+/// The accent's strength behind a focused app's square.
+const TASK_FOCUSED_ALPHA: f64 = 0.28;
 /// How far below its resting place the menu starts, so it slides out from the bar
 /// as it fades up.
 const MENU_SLIDE: i32 = 10;
@@ -3369,24 +3364,16 @@ impl Square {
         let group = group_for_key(&self.key);
         let count = group.len();
         let focused = group.iter().any(|window| window.focused);
-        // How much of the app is on screen, as a step in the square's fill: a
-        // running app sits a step above the bar, one whose windows are all
-        // minimized a step below that, and a pinned app with nothing open is not
-        // filled at all — it is the empty one, so it should look it. Only every
-        // window being minimized earns the middle step: one visible window means
-        // the app is on screen, whatever the others are doing.
-        let all_minimized = count > 0 && group.iter().all(|window| window.minimized);
-        let running = count > 0 && !all_minimized;
-        let resemble = |class: &str, on: bool| {
-            if on {
-                self.button.add_css_class(class);
-            } else {
-                self.button.remove_css_class(class);
-            }
-        };
-        resemble("minimized", all_minimized);
-        resemble("running", running);
-        resemble("focused", focused);
+        // The square says one thing with its fill: whether the pointer is on it,
+        // and whether its app is the one being used. An app that is open,
+        // open-but-minimized and pinned-but-empty all look the same — the border
+        // and the icon say what they are, and the dots count the windows — so
+        // there is no state class for them to carry.
+        if focused {
+            self.button.add_css_class("focused");
+        } else {
+            self.button.remove_css_class("focused");
+        }
 
         // A square with nothing behind it names the app rather than counting windows it
         // does not have.
@@ -4139,12 +4126,11 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     let square = SQUARE_SIZE;
     let panel_height = PANEL_HEIGHT;
     let bar_slide = BAR_SLIDE.as_millis() as i32;
-    // How full a square looks, by how much of its app is on screen — see the
-    // `running` and `minimized` rules below. Numbers rather than literals in the
-    // sheet, so the ladder can be asserted instead of eyeballed.
-    let task_running = TASK_RUNNING_ALPHA;
-    let task_minimized = TASK_MINIMIZED_ALPHA;
+    // How full a square looks, by what is happening to it — see the `hover`,
+    // `focused` and `carrying` rules below. Numbers rather than literals in the
+    // sheet, so the order can be asserted instead of eyeballed.
     let task_hover = TASK_HOVER_ALPHA;
+    let task_focused = TASK_FOCUSED_ALPHA;
     // The app menu's body is the preview menu's cell fill, read off the same
     // constant the cairo drawing reads, so the two engines agree by
     // construction rather than by two careful copies of the same hexes. The
@@ -4215,11 +4201,20 @@ button.task.ghost {{
     border-color: transparent;
     background: none;
 }}
-button.task.running {{
-    background-color: rgba(255, 255, 255, {task_running});
-}}
+/* A square is filled for two reasons only: the pointer is on it, or its app is
+   the one being used. An app that is open, minimized or pinned-with-nothing-open
+   is not filled at all — the icon, the border and the dots already say all of
+   that, and a fill for it read as a state of its own.
+
+   The order is the rule, not just tidiness: these have the same weight, so the
+   later one wins when a square is both. The carried square is written last and
+   with the hover's own number: what is in hand is what is under the pointer,
+   whether or not the app behind it is focused. */
 button.task:hover {{
     background-color: rgba(255, 255, 255, {task_hover});
+}}
+button.task.focused {{
+    background-color: rgba({r}, {g}, {b}, {task_focused});
 }}
 /* A square being carried. It has left the row and is in a layer over it, so it needs no
  * transition to stay under the pointer and nothing to lift it: the layer is above.
@@ -4229,23 +4224,7 @@ button.task:hover {{
  * negative width, which GTK refuses, and GTK's CSS has no z-index at all — the property
  * it warned about on startup. */
 button.task.carrying {{
-    background-color: rgba(255, 255, 255, 0.18);
-}}
-/* An app whose windows are all minimized: still there, not on screen. One step
-   below a running square's fill, so the ladder reads as how much of the app is
-   visible — and a pinned app with nothing open has no fill at all. */
-button.task.minimized {{
-    background-color: rgba(255, 255, 255, {task_minimized});
-}}
-/* A hovered square shows the panel's hover, whatever its rest state is: at
-   equal specificity the later rule wins, so without this a hovered square
-   would keep its running or minimized fill. A focused square keeps its accent
-   under the pointer and wins here anyway, by being later. */
-button.task:hover {{
     background-color: rgba(255, 255, 255, {task_hover});
-}}
-button.task.focused {{
-    background-color: rgba({r}, {g}, {b}, 0.28);
 }}
 /* The app menu, opened by a right click. Widgets, so it is styled here --
    styled out of the thumbnail menu's own palette, with the body at the
@@ -8981,33 +8960,38 @@ mod tests {
     }
 
     #[test]
-    fn a_square_looks_fuller_the_more_of_its_app_is_on_screen() {
-        // The fill says how much of the app is visible, and the ladder has to
-        // climb: a running app above an all-minimized one, which is above the
-        // nothing a pinned but unopened app shows, and a hover above all three.
-        // A running square used to carry no fill at all while a pinned empty one
-        // did, so opening an app made its square *emptier* — backwards.
-        assert!(
-            TASK_RUNNING_ALPHA > TASK_MINIMIZED_ALPHA,
-            "a running square must not be emptier than a minimized one"
-        );
-        assert!(
-            TASK_MINIMIZED_ALPHA > 0.0,
-            "a minimized app is running: it should not look like nothing at all"
-        );
-        assert!(
-            TASK_HOVER_ALPHA > TASK_RUNNING_ALPHA,
-            "hovering must brighten the full square too"
-        );
-        // And the sheet carries them: the classes are only useful if the numbers
-        // reach the stylesheet that draws them.
+    fn a_square_is_filled_for_the_pointer_or_for_focus_and_nothing_else() {
+        // The fill says two things: the pointer is on this square, or its app is
+        // the one being used. An app that is open, open-but-minimized or
+        // pinned-with-nothing-open all look the same — the icon, the border and
+        // the dots already say which of those it is, and a fill for them read as
+        // a state of its own.
         let sheet = style_sheet((80, 160, 240));
-        assert!(sheet.contains("button.task.running {"), "no running rule");
-        assert!(sheet.contains("button.task.minimized {"), "no minimized rule");
         assert!(
-            sheet.contains(&format!("0.18")),
-            "the carrying fill should still be the brightest rest"
+            !sheet.contains("button.task.minimized {") && !sheet.contains("button.task.running {"),
+            "a state with no fill of its own still has a rule"
         );
+        let at = |rule: &str| {
+            sheet
+                .find(rule)
+                .unwrap_or_else(|| panic!("missing from the sheet: {rule}"))
+        };
+        assert_eq!(
+            sheet.matches("button.task:hover {").count(),
+            1,
+            "the hover rule is written twice; which one wins is then a guess"
+        );
+        // The carried square is the square under the pointer, so it carries the
+        // hover's own number — and it is written last, so a dragged square looks
+        // the same whatever the app behind it is doing.
+        assert!(at("button.task.carrying {") > at("button.task.focused {"));
+        let hover = format!("rgba(255, 255, 255, {TASK_HOVER_ALPHA})");
+        assert_eq!(
+            sheet.matches(&hover).count(),
+            2,
+            "hover and carrying should be the same fill"
+        );
+        assert!(TASK_FOCUSED_ALPHA > TASK_HOVER_ALPHA);
     }
 
     #[test]
