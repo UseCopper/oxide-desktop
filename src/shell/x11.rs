@@ -502,6 +502,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         initial_window_location = restored;
                     }
 
+                    self.place_for_drag(&element, initial_window_location);
+
                     if let Some(size) = restore_size {
                         self.animate_window(&element, size, initial_window_location);
                     }
@@ -569,6 +571,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             initial_window_location = restored;
         }
+
+        // Placed where the drag starts it before anything animates: the grab
+        // that follows moves the window only when the pointer does, so one
+        // dragged out of maximize would sit in its corner until the first
+        // twitch.
+        self.place_for_drag(&element, initial_window_location);
 
         if let Some(size) = restore_size {
             self.animate_window(&element, size, initial_window_location);

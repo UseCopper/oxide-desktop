@@ -1016,6 +1016,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             client_unmaximize = false;
         }
 
+        // Put it where the drag starts it before anything animates: the grab
+        // that follows only moves the window when the pointer does, so a window
+        // dragged out of maximize would otherwise sit in the corner it was
+        // maximized into until the first twitch.
+        self.place_for_drag(&window, initial_window_location);
+
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
             // wait for the client to commit its own size first.
@@ -1140,6 +1146,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             anchor = None;
             client_unmaximize = false;
         }
+
+        // Put it where the drag starts it before anything animates: the grab
+        // that follows only moves the window when the pointer does, so a window
+        // dragged out of maximize would otherwise sit in the corner it was
+        // maximized into until the first twitch.
+        self.place_for_drag(&window, initial_window_location);
 
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:

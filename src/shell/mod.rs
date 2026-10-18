@@ -835,6 +835,26 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         Some(restored)
     }
 
+    /// Put a window where a drag is starting it from.
+    ///
+    /// The grab that follows drives the window's position from the pointer's own
+    /// deltas, so until the pointer moves there is nothing else to place it — and
+    /// a window dragged out of the maximized state would sit in the corner it was
+    /// maximized into until the hand twitched. Placed here, the only thing left
+    /// for the restore transition to animate is the size, which is what it is
+    /// for.
+    ///
+    /// A drag that starts anywhere else passes its own location, so this is a
+    /// no-op for it.
+    fn place_for_drag(&mut self, window: &WindowElement, location: Point<i32, Logical>) {
+        if self.space.element_location(window) != Some(location) {
+            // Relocated, not re-mapped: `map_element` re-appends the window to
+            // the front of the stack, and moving a window does not reorder the
+            // desktop.
+            self.space.relocate_element(window, location);
+        }
+    }
+
     /// Configure `window`'s client to occupy the decorated rectangle `rect`.
     /// Wayland clients are given the undecorated content size; X11's
     /// `configure` takes the frame rectangle directly. Returns the size to
