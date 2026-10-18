@@ -3720,19 +3720,25 @@ fn sync_bar(
     // A pinned app is on the panel with or without windows — that is what pinning is
     // for — so its menu stays, and its rows go on meaning something.
     let barred: Vec<&str> = ordered.iter().map(|(key, _)| key.as_str()).collect();
-    if let Some(key) = context.app.borrow().clone()
+    // Read out of the state before closing on it: a borrow taken in the scrutinee of
+    // an `if let` is still alive in its body, and the close mutates the very cell it
+    // came from — which aborts the panel, since `RefCell`'s panic runs through a GLib
+    // trampoline that cannot unwind.
+    let closed_key = context.app.borrow().clone();
+    if let Some(key) = closed_key
         && !still_on_the_bar(&key, &barred)
     {
         context_close(context);
     }
     // And the same for one queued behind a close: a right click on a second square
     // while the first menu is still fading out opens a fade later, so its app can have
-    // gone in between.
-    let waiting_gone = context
-        .pending_open
-        .borrow()
-        .as_ref()
-        .is_some_and(|opening| !still_on_the_bar(&opening.key, &barred));
+    // gone in between. Dropped rather than opened.
+    let waiting_gone = {
+        let waiting = context.pending_open.borrow();
+        waiting
+            .as_ref()
+            .is_some_and(|opening| !still_on_the_bar(&opening.key, &barred))
+    };
     if waiting_gone {
         *context.pending_open.borrow_mut() = None;
     }
@@ -3786,9 +3792,18 @@ fn sync_bar(
     // depends on the window count — one window is closed by name, several are
     // closed together, none means no row at all — so a window opened or closed
     // underneath it has to change what is on screen.
-    // `shown` rather than `app`: the app key outlives the fade now, so refilling a
-    // menu that is on its way out would be work for nothing.
-    if let Some(key) = context.shown.get().then(|| context.app.borrow().clone()).flatten() {
+    //
+    // Not while it is on its way out. `shown` says the menu is up, and it stays set for
+    // the length of the close fade, so a refill here rebuilt the rows of a menu that was
+    // already leaving — under the pointer, mid-fade, which is what the close it had just
+    // been given did not need. Read out of the state before the guard too: a borrow in
+    // an `if let` scrutinee outlives the body, which aborts the panel rather than
+    // unwinding.
+    let shown_key = context.app.borrow().clone();
+    if context.shown.get()
+        && !context.closing.get()
+        && let Some(key) = shown_key
+    {
         let group: Vec<WindowInfo> = ordered
             .iter()
             .find(|(group_key, _)| *group_key == key)
