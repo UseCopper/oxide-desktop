@@ -29,6 +29,12 @@ use crate::panel_proto;
 const PANEL_HEIGHT: i32 = 40;
 /// Each app is a 1:1 square.
 const SQUARE_SIZE: i32 = 36;
+/// The gap between one square and the next: the row box's own spacing.
+///
+/// Named because the row's slot changes move a square by exactly one slot, which is a
+/// square and this gap, and a transformed square cannot be laid out to disagree with the
+/// gap it is moving across.
+const TASK_GAP: i32 = 2;
 /// Width of the square's CSS border, which sits inside the square.
 const SQUARE_BORDER: i32 = 1;
 const ICON_SIZE: i32 = 26;
@@ -148,10 +154,29 @@ const TITLE_FONT_SIZE: f64 = 10.0;
 const TITLE_COLOUR: (f64, f64, f64) = (0.863, 0.863, 0.863);
 /// Appended to a title that has to be cut short.
 const TITLE_ELLIPSIS: char = '\u{2026}';
-/// Menu colours, replacing what the stylesheet used to say.
-const MENU_FILL: (f64, f64, f64, f64) = (0.11, 0.11, 0.11, 0.94);
+/// Both menus' own bodies, in each engine that draws one.
+///
+/// The bar's colour at the bar's transparency, written as the bar's own constants
+/// rather than as hexes of their own. A menu hangs off the panel and is the same
+/// object as far as anyone looking at it is concerned, so a grey of its own or an
+/// alpha of its own shows up as drift the moment the two are on screen together.
+/// The shell's window chrome reads the same pair for the same reason.
+const MENU_FILL: (f64, f64, f64, f64) = (
+    BAR_PANEL.0 as f64 / 255.0,
+    BAR_PANEL.1 as f64 / 255.0,
+    BAR_PANEL.2 as f64 / 255.0,
+    BAR_PANEL_ALPHA,
+);
 const MENU_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.16);
-const CELL_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.35);
+/// The plate a menu's contents sit on. A preview's cell and a row of the app menu
+/// are the same thing in two menus, so they are one value rather than two that have
+/// to be kept in step.
+///
+/// It is the panel's hover ladder one step down: what the pointer is on is filled at
+/// [`TASK_HOVER_ALPHA`], and what is merely present is filled at half of it, so a
+/// menu reads in the same language as the squares on the bar it hangs from. The edge
+/// is what draws the plate's outline, which is why this fill can stay this faint.
+const CELL_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, TASK_HOVER_ALPHA / 2.0);
 const CELL_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
 const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
 /// The mini-CSD's strip. Nothing: the cell's own fill is already under it.
@@ -159,8 +184,8 @@ const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
 /// It was a 7% white wash, which made one preview two greys, and then it was set to
 /// [`CELL_FILL`] on the reasoning that the same value would look the same — which is
 /// wrong, because the strip is drawn *on top of* the cell fill rather than instead of
-/// it. Two 35% blacks are 58% black, so the strip came out a third value, darker than
-/// the cell it is part of, and that is what changed.
+/// it. Two of one fill stack into a third, darker value, so the strip came out darker
+/// than the cell it is part of, and that is what changed.
 ///
 /// Transparent is what "the same background transparency" actually means when the
 /// thing under it is already the colour you want. The title and the close square are
@@ -251,6 +276,17 @@ const TRADE_SLIDE: Duration = Duration::from_millis(250);
 /// How long a window takes to fade in or out, separately from the width, because
 /// the two run one after the other rather than together.
 const CELL_FADE: Duration = Duration::from_millis(140);
+/// How long a square's slot takes to open beside one arriving, or to close after one
+/// leaves.
+///
+/// The drag's own slot-to-slot slide: a square making room for another is a square moving
+/// one slot, and it should move like one.
+const SLOT_SLIDE: Duration = TRADE_SLIDE;
+/// How long the square that is arriving or leaving takes to fade.
+///
+/// The menu's cells fade on this clock, so a square arriving in the bar and a window
+/// arriving in the menu arrive at the same speed.
+const SLOT_FADE: Duration = CELL_FADE;
 /// How long the menu's reveal takes.
 const MENU_FADE: Duration = Duration::from_millis(180);
 /// The white a square shows under the pointer — and while it is being carried,
@@ -1904,6 +1940,15 @@ fn menu_replace_current(menu: &Rc<Menu>) {
     menu_replace(menu, &every, &group, &menu.stream);
 }
 
+/// Whether the app a menu is open for is still on the bar.
+///
+/// `barred` is the apps the bar is showing, in its own order: one per app with
+/// windows, plus the pinned ones with none. An app the bar is not showing has left the
+/// panel, and a menu open on it has nothing left to be about.
+fn still_on_the_bar(key: &str, barred: &[&str]) -> bool {
+    barred.iter().any(|bar_key| *bar_key == key)
+}
+
 /// The windows belonging to one app, as the bar groups them.
 ///
 /// Shared with [`sync_bar`] so the two cannot disagree about what "this app's
@@ -2212,7 +2257,12 @@ fn menu_replace(
     // hover-off plays — with the cells still on screen. Animating each departure
     // first and closing an empty menu afterwards would take the content away before
     // the close had anything to fade; here the row stays intact for the whole fade.
-    if live.is_empty() && menu.shown.get() && menu.app.borrow().is_some() {
+    //
+    // Not only once the menu is up, either. A menu still waiting for its first
+    // preview has no cells to fade, but it is on its way in, and an app with no
+    // windows left has nothing to arrive with: left alone it came up as a bare strip
+    // of padding and stayed there until the pointer happened to leave it.
+    if live.is_empty() && menu.app.borrow().is_some() {
         menu_close(menu);
         return;
     }
@@ -3677,6 +3727,39 @@ fn sync_bar(
         ordered.push(groups[index].clone());
     }
 
+    // An app that has gone off the panel takes its menus with it. A menu is anchored
+    // to a square, and an app with no square left has no menu to be showing: the
+    // previews are that app's windows, and the app menu is rows about it, hanging
+    // over the gap its square left behind. The previews reach this by their group
+    // going empty, with every snapshot; the app menu's rows are built once when it
+    // opens and its key is never looked at again, so nothing else would tell it.
+    //
+    // A pinned app is on the panel with or without windows — that is what pinning is
+    // for — so its menu stays, and its rows go on meaning something.
+    let barred: Vec<&str> = ordered.iter().map(|(key, _)| key.as_str()).collect();
+    // Read out of the state before closing on it: a borrow taken in the scrutinee of
+    // an `if let` is still alive in its body, and the close mutates the very cell it
+    // came from — which aborts the panel, since `RefCell`'s panic runs through a GLib
+    // trampoline that cannot unwind.
+    let closed_key = context.app.borrow().clone();
+    if let Some(key) = closed_key
+        && !still_on_the_bar(&key, &barred)
+    {
+        context_close(context);
+    }
+    // And the same for one queued behind a close: a right click on a second square
+    // while the first menu is still fading out opens a fade later, so its app can have
+    // gone in between. Dropped rather than opened.
+    let waiting_gone = {
+        let waiting = context.pending_open.borrow();
+        waiting
+            .as_ref()
+            .is_some_and(|opening| !still_on_the_bar(&opening.key, &barred))
+    };
+    if waiting_gone {
+        *context.pending_open.borrow_mut() = None;
+    }
+
     // An open preview menu is kept in step with every snapshot, *including* one
     // where its app has no windows left. Skipping that case — or closing the menu
     // outright on it — is what stopped the close animation: with no group to find,
@@ -3726,9 +3809,18 @@ fn sync_bar(
     // depends on the window count — one window is closed by name, several are
     // closed together, none means no row at all — so a window opened or closed
     // underneath it has to change what is on screen.
-    // `shown` rather than `app`: the app key outlives the fade now, so refilling a
-    // menu that is on its way out would be work for nothing.
-    if let Some(key) = context.shown.get().then(|| context.app.borrow().clone()).flatten() {
+    //
+    // Not while it is on its way out. `shown` says the menu is up, and it stays set for
+    // the length of the close fade, so a refill here rebuilt the rows of a menu that was
+    // already leaving — under the pointer, mid-fade, which is what the close it had just
+    // been given did not need. Read out of the state before the guard too: a borrow in
+    // an `if let` scrutinee outlives the body, which aborts the panel rather than
+    // unwinding.
+    let shown_key = context.app.borrow().clone();
+    if context.shown.get()
+        && !context.closing.get()
+        && let Some(key) = shown_key
+    {
         let group: Vec<WindowInfo> = ordered
             .iter()
             .find(|(group_key, _)| *group_key == key)
@@ -3752,8 +3844,12 @@ fn sync_bar(
     let carried = carried.flatten();
     let wants = |key: &str| !drag_active() || carried.as_deref() != Some(key);
 
-    // Squares for apps that have gone are removed, in the row and from the list.
+    // Squares for apps that have gone leave the list, and their widgets are handed to the
+    // row's slot change: one of them fades out where it stands and gives its slot back, and
+    // the row closes over it. They are not taken out of the row here — a square that is
+    // still fading is still on screen.
     let keys: HashSet<&String> = ordered.iter().map(|(key, _)| key).collect();
+    let mut leaving: Vec<Button> = Vec::new();
     SQUARES.with(|cell| {
         cell.borrow_mut().retain(|square| {
             if keys.contains(&square.key) {
@@ -3764,7 +3860,7 @@ fn sync_bar(
                 // back wherever the pointer let go of it.
                 return true;
             }
-            tasks.remove(&square.button);
+            leaving.push(square.button.clone());
             if menu_debug() {
                 eprintln!("oxide-panel: square {:?} retired", square.key);
             }
@@ -3773,12 +3869,14 @@ fn sync_bar(
     });
 
     // Squares for apps newly seen are built.
+    let mut arriving: Vec<Button> = Vec::new();
     let have: HashSet<String> =
         SQUARES.with(|cell| cell.borrow().iter().map(|s| s.key.clone()).collect());
     for (key, _) in &ordered {
         if !have.contains(key) && wants(key) {
             let square = Square::build(key, stream, menu, context);
             tasks.append(&square.button);
+            arriving.push(square.button.clone());
             SQUARES.with(|cell| cell.borrow_mut().push(square));
         }
     }
@@ -3799,7 +3897,14 @@ fn sync_bar(
     // second press. Snapshots arrive between presses more often than they
     // change the order — a focus change caused by the previous click is one —
     // so the common case is leaving the row alone.
-    if !drag_active() {
+    //
+    // Not while the row is making or closing a slot, either. The squares behind a square
+    // that is arriving or leaving are held a slot away from where the layout has them, so
+    // a re-list now would list them by the hold; and a square that is leaving is still in
+    // the row for its fade, which the listing knows nothing about. Either way the listing
+    // is asked for again once the change is over.
+    let listing_deferred = slot_change_in_flight() || !leaving.is_empty();
+    if !drag_active() && !listing_deferred {
         let buttons: HashMap<String, Button> = SQUARES.with(|cell| {
             cell.borrow()
                 .iter()
@@ -3826,7 +3931,13 @@ fn sync_bar(
                 index += 1;
             }
         }
+    } else if listing_deferred {
+        RELIST_DEFERRED.with(|cell| cell.set(true));
     }
+
+    // The row makes room for a square that has just arrived, or closes up after one that
+    // has just gone.
+    start_slot_changes(tasks, &arriving, &leaving);
 
     if menu_debug() {
         eprintln!(
@@ -4126,6 +4237,10 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // Squares are this wide in every calculation the drag does, so the theme may
     // not be able to out-minimum the code's own arithmetic.
     let square = SQUARE_SIZE;
+    // How far a square is moved while the row's layout catches up with it: one slot,
+    // which is the square and the gap after it.
+    let task_slot = SQUARE_SIZE + TASK_GAP;
+    let slot_slide = SLOT_SLIDE.as_millis() as i32;
     let panel_height = PANEL_HEIGHT;
     let bar_slide = BAR_SLIDE.as_millis() as i32;
     // How full a square looks, by what is happening to it — see the `hover`,
@@ -4133,11 +4248,12 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // sheet, so the order can be asserted instead of eyeballed.
     let task_hover = TASK_HOVER_ALPHA;
     let task_focused = TASK_FOCUSED_ALPHA;
-    // The app menu's body is the preview menu's cell fill, read off the same
-    // constant the cairo drawing reads, so the two engines agree by
-    // construction rather than by two careful copies of the same hexes. The
-    // rows are a white step on the hover's own ladder instead of a second
-    // grey, so nothing at rest keeps the body fill's variables alive.
+    // Both menus' bodies are the bar's own fill, read off the same constants the
+    // bar's rule below and the cairo drawing read, so the panel, the two menus
+    // and their two engines agree by construction rather than by three careful
+    // copies of the same hexes. A menu's contents sit on the plate the previews'
+    // cells are drawn with, and take the panel's hover under the pointer: no
+    // rule here carries a colour from a palette of its own.
     let menu_edge_a = MENU_EDGE.3;
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
@@ -4193,6 +4309,27 @@ button.task {{
        carried layer positions were worked out on 36. */
     min-width: {square}px;
     min-height: {square}px;
+    /* The one property on a square that is eased. A square moves for one reason:
+       the row is making room for a square arriving beside it, or closing the gap
+       one left behind. The fills still snap, because a hover highlight that
+       arrives late reads as lag. */
+    transition: transform {slot_slide}ms ease-out;
+}}
+/* A square the row has just moved, held where it was drawn: the layout has already
+   put it a slot along, and this is what keeps it — and the row behind it — still
+   until the frame after that has been drawn. Taking the class off again is what lets
+   the transition above carry it the rest of the way.
+   No transition on the hold itself. The jump it hides is instant by definition, and
+   easing into the hold would be a second motion that nobody asked for and that reads
+   as the square sliding backwards before it slides forwards. */
+button.task.held-back {{
+    transform: translate(-{task_slot}px, 0);
+    transition: none;
+}}
+/* And the same, one slot the other way, for the squares a departure closes behind. */
+button.task.held-forward {{
+    transform: translate({task_slot}px, 0);
+    transition: none;
 }}
 /* An invisible stand-in that holds a slot while its square is away: the same
    widget machinery as a square — the same border, painted transparent — so the
@@ -4228,11 +4365,11 @@ button.task.focused {{
 button.task.carrying {{
     background-color: rgba(255, 255, 255, {task_hover});
 }}
-/* The app menu, opened by a right click. Widgets, so it is styled here --
-   styled out of the thumbnail menu's own palette, with the body at the
-   previews' 0.35 black and one row a step lighter: the same fill ladder the
-   hover's own white sits on. Edges, radii, text and hover are the previews'
-   and the taskbar's as before.
+/* The app menu, opened by a right click. Widgets, so it is styled here -- styled
+   out of the same constants the thumbnail menu's cairo drawing reads: its body is
+   the bar's own fill, its rows are the plate the previews' cells are drawn with,
+   and a row under the pointer is filled exactly as a square on the bar is. Edges,
+   radii and text are the previews' as before.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4242,14 +4379,11 @@ window.context {{
     border: none;
 }}
 .context-rows {{
-    /* The previews' body, not the bar's panel grey: the thumbnail menu runs a
-       shade darker and more opaque than the bar, and two menus side by side
-       would show any drift. */
+    /* The bar's fill, the same constant the bar's own rule above and the
+       thumbnail menu's body read: one panel, so one body, and nothing to drift
+       between two menus that can be on screen together. */
     padding: 5px;
-    /* The cell fill, not the previews' body: the fills of the body and the
-       rows are swapped, so the rows run the lighter, more opaque shade of
-       the two and sit in front against a darker, more open background. */
-    background-color: rgba(0, 0, 0, {cell_fill_a});
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
     /* The theme paints a window background image on top of a window's background
        colour, which would put a fill of its own over this and make it a third value
        again. */
@@ -4258,10 +4392,10 @@ window.context {{
     border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    /* A shade of white over the body rather than a second grey: the row is
-       exactly one step lighter than the fill behind it, on the same ladder
-       the hover sits on. */
-    background: rgba(255, 255, 255, 0.05);
+    /* The plate a menu's contents sit on, read off the constant the previews'
+       cells are drawn with: a row and a preview are the same thing in two menus,
+       so they are one fill rather than two that must be kept in step. */
+    background: rgba(255, 255, 255, {cell_fill_a});
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
@@ -4275,11 +4409,12 @@ button.context-row {{
     transition: none;
 }}
 button.context-row:hover {{
-    /* The panel's own hover: the pointer's fill, nothing else moving. The
-       theme pours a hovering fill of its own through `background-image`,
-       which vanishes the rest rule and puts back the vanilla look, so the
-       hover has to kill it the way the rest rule does. */
-    background-color: rgba(255, 255, 255, 0.10);
+    /* The panel's own hover, at the strength a square on the bar takes under the
+       pointer: the pointer's fill, nothing else moving. The theme pours a
+       hovering fill of its own through `background-image`, which vanishes the
+       rest rule and puts back the vanilla look, so the hover has to kill it the
+       way the rest rule does. */
+    background-color: rgba(255, 255, 255, {task_hover});
     background-image: none;
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
@@ -4593,7 +4728,7 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     row.add_css_class("panel");
     row.set_size_request(-1, PANEL_HEIGHT);
 
-    let tasks = GtkBox::new(Orientation::Horizontal, 2);
+    let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
     tasks.add_css_class("tasks");
 
     let clock = Label::new(None);
@@ -5317,6 +5452,14 @@ fn drag_begin(app: &str, pointer_x: f64) {
         // alone is better than fighting it for the layer; a click on the button
         // still works, and a press that really means to drag picks up on the
         // next motion.
+        return;
+    }
+    if slot_change_in_flight() {
+        // The row is opening or closing a slot, and the squares behind the one arriving or
+        // leaving are held a slot away from where the layout has them. A drag measures the
+        // row's slots, so it would measure the hold. Leaving this press alone is better
+        // than carrying a square on geometry that is about to move: a click still works,
+        // and the next press picks up once the row has settled.
         return;
     }
     if drag_active() {
@@ -6510,6 +6653,317 @@ fn child_index(parent: &GtkBox, child: &gtk4::Widget) -> Option<usize> {
         cursor = widget.next_sibling();
     }
     None
+}
+
+// ---------------------------------------------------------------- slot changes
+
+/// Which of its steps a slot change is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotStep {
+    /// The square is fading where it stands, with the row still whole: a departure, which
+    /// keeps the slot it is drawn in until there is nothing left of it to see.
+    Fading,
+    /// The slot is opening or closing. The layout has moved under the hold, or is about
+    /// to, and the transition in the stylesheet is carrying the row the rest of the way.
+    Sliding,
+    /// The row is where it should be, and the square that arrived is fading in.
+    Appearing,
+    /// The change is over.
+    Done,
+}
+
+/// Which step a slot change is in, `elapsed` after it began.
+///
+/// The two directions run the same steps in opposite orders and take the same time: an
+/// arrival opens its slot and then fades in, a departure fades out and then gives its slot
+/// back. Pure arithmetic, so the order and the lengths can be asserted without a
+/// compositor.
+fn slot_step(arriving: bool, elapsed: Duration) -> SlotStep {
+    let slide = SLOT_SLIDE.as_secs_f64();
+    let fade = SLOT_FADE.as_secs_f64();
+    let elapsed = elapsed.as_secs_f64();
+    if arriving {
+        if elapsed < slide {
+            SlotStep::Sliding
+        } else if elapsed < slide + fade {
+            SlotStep::Appearing
+        } else {
+            SlotStep::Done
+        }
+    } else if elapsed < fade {
+        SlotStep::Fading
+    } else if elapsed < fade + slide {
+        SlotStep::Sliding
+    } else {
+        SlotStep::Done
+    }
+}
+
+/// How visible the square in a slot change is, `elapsed` after it began.
+///
+/// An arrival is invisible until its slot is open and then fades up; a departure is
+/// visible until it has faded away, which is what lets the row close over a slot that
+/// nobody can see anything in. Eased with [`ease_in_out`] rather than the row's cubic: a
+/// cubic on opacity reads as a flash, which is why the menu's cells fade on this one.
+fn slot_alpha(arriving: bool, elapsed: Duration) -> f64 {
+    let slide = SLOT_SLIDE.as_secs_f64();
+    let faded = if arriving {
+        (elapsed.as_secs_f64() - slide).max(0.0) / SLOT_FADE.as_secs_f64()
+    } else {
+        elapsed.as_secs_f64() / SLOT_FADE.as_secs_f64()
+    };
+    let eased = ease_in_out(faded);
+    if arriving { eased } else { 1.0 - eased }
+}
+
+/// A square whose slot the row is opening, or closing after one.
+///
+/// The row is a `GtkBox`, and a box lays all of its children out from their size requests
+/// at once: inserting or removing a square moves every square behind it in one step, and
+/// there is no width for a square to ease through — the theme floors every square at 36px,
+/// and the icon and dots inside one measure most of that on their own. So the squares
+/// behind are *held* where they were drawn, by a class the layout knows nothing about,
+/// while the layout moves underneath them; the hold is let go on the next frame, and the
+/// transition in the stylesheet carries them the rest of the way.
+///
+/// The square itself does the other half, and it is the half that is seen: it fades in
+/// once the row has made room for it, and fades out before the row closes behind it.
+struct SlotChange {
+    /// The square arriving or leaving.
+    button: Button,
+    /// Its app, so the debug log can say what moved.
+    key: String,
+    /// Which way it is going.
+    arriving: bool,
+    /// The squares behind it, held at the slot they were drawn in.
+    held: Vec<Button>,
+    /// Whether the hold is up yet. It goes on inside a frame callback — for an arrival,
+    /// with the layout the row has already made; for a departure, once its square is
+    /// invisible — so that the hold and the layout land in the same drawn frame.
+    holding: bool,
+    /// Whether that hold has been let go.
+    released: bool,
+    /// When the change began, on the same clock the drag's glides use.
+    started: i64,
+}
+
+thread_local! {
+    /// The slot change in flight, if one is.
+    static SLOT_CHANGE: RefCell<Option<SlotChange>> = const { RefCell::new(None) };
+    /// Whether a snapshot's re-listing of the row was put off because one was in flight.
+    static RELIST_DEFERRED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the row has a slot change in flight.
+fn slot_change_in_flight() -> bool {
+    SLOT_CHANGE.with(|cell| cell.borrow().is_some())
+}
+
+/// The squares the row draws after `button`: the ones a slot change at its position moves.
+///
+/// Read from the row itself rather than from the remembered order: an arrival has already
+/// been listed into its slot by the time its change starts, and what has to be held still
+/// is what the layout is about to move, which is what stands behind this square now.
+fn squares_after(button: &Button) -> Vec<Button> {
+    let mut squares = Vec::new();
+    let mut cursor = button.next_sibling();
+    while let Some(widget) = cursor {
+        if let Some(square) = widget.downcast_ref::<Button>() {
+            squares.push(square.clone());
+        }
+        cursor = widget.next_sibling();
+    }
+    squares
+}
+
+/// Hold a square at the slot it was drawn in, and let it go again.
+///
+/// `forward` holds it where a departure left it: one slot on, which is where it is drawn
+/// until the layout closes the gap that departure made.
+fn hold_at_slot(square: &Button, forward: bool) {
+    square.add_css_class(if forward { "held-forward" } else { "held-back" });
+}
+
+fn release_hold(square: &Button) {
+    square.remove_css_class("held-back");
+    square.remove_css_class("held-forward");
+}
+
+/// Start the row's slot change for a snapshot that added or removed one square.
+///
+/// `arriving` are the squares this pass built and `leaving` the ones it retired: exactly
+/// one of the two has to hold one square, and only when nothing else is already moving the
+/// row. A batch is the row being rebuilt rather than a slot opening — the squares behind
+/// the first arrival move by a different number of slots from those behind the second, and
+/// one translate cannot say that — so a batch of them goes immediately, as it always did.
+fn start_slot_changes(tasks: &GtkBox, arriving: &[Button], leaving: &[Button]) {
+    // Nothing changed in this snapshot: leave whatever is in flight to finish in its own
+    // time.
+    //
+    // Settling here instead was the whole of the departure animation going missing. A
+    // snapshot is sent when the list changes, and closing a window changes it twice — the
+    // window goes, and the focus moves on, which is a change of its own — so the very next
+    // snapshot arrived a frame or two into the fade and finished the change on the spot.
+    // Most snapshots are this one: no square arriving, none leaving.
+    if arriving.is_empty() && leaving.is_empty() {
+        return;
+    }
+    // A drag owns the row — it measures the slots to know what a trade is trading with —
+    // and a square held a slot away from where the layout has it would be measured wrong.
+    // One arriving during a drag simply appears; one leaving is simply gone. A batch is the
+    // row being rebuilt rather than a slot opening, for the reason the doc gives.
+    if arriving.len() + leaving.len() != 1 || drag_active() {
+        settle_slot_change(tasks);
+        for button in leaving {
+            tasks.remove(button);
+        }
+        return;
+    }
+    // Whatever is in flight is finished first: it owns the row until it lands, and a change
+    // cannot be measured against a row that is still moving.
+    settle_slot_change(tasks);
+    let now = glib::monotonic_time();
+    let change = if let Some(button) = arriving.first() {
+        // The row has already moved for it — the square is in its slot and the squares
+        // behind have been laid out a slot along — so it has to be invisible until its slot
+        // has been given to it, or it is seen arriving while the row is still getting out
+        // of its way. The hold on the squares behind goes on in the frame after this one,
+        // with the layout, for the reason the tick gives.
+        button.set_opacity(0.0);
+        SlotChange {
+            button: button.clone(),
+            key: app_of(button.upcast_ref()).unwrap_or_default(),
+            arriving: true,
+            held: Vec::new(),
+            holding: false,
+            released: false,
+            started: now,
+        }
+    } else {
+        // The square fades first, where it stands. The row keeps its shape until there is
+        // nothing of it left to see, and only then closes over the slot it held.
+        let button = leaving[0].clone();
+        SlotChange {
+            key: app_of(button.upcast_ref()).unwrap_or_default(),
+            button,
+            arriving: false,
+            held: Vec::new(),
+            holding: false,
+            released: false,
+            started: now,
+        }
+    };
+    if menu_debug() {
+        eprintln!(
+            "oxide-panel: slot {:?} {}",
+            change.key,
+            if change.arriving {
+                "opening"
+            } else {
+                "closing"
+            }
+        );
+    }
+    SLOT_CHANGE.with(|cell| *cell.borrow_mut() = Some(change));
+    let ticking = tasks.clone();
+    tasks.add_tick_callback(move |_, _| tick_slot_change(&ticking));
+}
+
+/// Give the row's slot change its next frame.
+fn tick_slot_change(tasks: &GtkBox) -> glib::ControlFlow {
+    if drag_active() {
+        // A drag never takes the row over while a change is in flight — `drag_begin` waits
+        // for the change to land — but the row is the drag's if it ever does: it measures
+        // the slots, and a square held a slot away from where the layout has it would be
+        // measured wrong. The hold goes, and the row is where the layout has it.
+        settle_slot_change(tasks);
+        return glib::ControlFlow::Break;
+    }
+    let now = glib::monotonic_time();
+    let mut finished = false;
+    SLOT_CHANGE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(change) = slot.as_mut() else {
+            return glib::ControlFlow::Break;
+        };
+        let elapsed = Duration::from_micros((now - change.started).max(0) as u64);
+        let step = slot_step(change.arriving, elapsed);
+
+        // A departure keeps its slot until it is invisible: it only closes the row once
+        // there is nothing left of it to see.
+        if !change.arriving && !change.holding && step == SlotStep::Fading {
+            change.button.set_opacity(slot_alpha(false, elapsed));
+            return glib::ControlFlow::Continue;
+        }
+        // Then the row moves under a hold. Both the hold and the layout it is hiding are
+        // done from here, inside a frame callback, so they land in the frame that is about
+        // to be drawn and the change is invisible in it — the same frame a `sync_bar` cannot
+        // reach, since it runs between frames.
+        if !change.holding {
+            change.held = squares_after(&change.button);
+            for square in &change.held {
+                hold_at_slot(square, !change.arriving);
+            }
+            if !change.arriving {
+                // A square on its way out is not something to press: the pointer it was
+                // under belongs to the square that is being made room for.
+                change.button.set_can_target(false);
+                tasks.remove(&change.button);
+            }
+            change.holding = true;
+            return glib::ControlFlow::Continue;
+        }
+        if change.holding && !change.released {
+            // The frame the layout moved under the hold. Letting go in the same frame
+            // would be the jump the hold is there to hide.
+            for square in &change.held {
+                release_hold(square);
+            }
+            change.released = true;
+            return glib::ControlFlow::Continue;
+        }
+
+        change.button.set_opacity(slot_alpha(change.arriving, elapsed));
+        if step == SlotStep::Done {
+            change.button.set_opacity(if change.arriving { 1.0 } else { 0.0 });
+            finished = true;
+        }
+        glib::ControlFlow::Continue
+    });
+    if !finished {
+        return glib::ControlFlow::Continue;
+    }
+    SLOT_CHANGE.with(|cell| *cell.borrow_mut() = None);
+    // A snapshot that arrived while the row was mid-change had its re-listing put off.
+    // Now that the row is where the layout has it, the listing can happen.
+    if RELIST_DEFERRED.with(|cell| cell.replace(false)) {
+        glib::idle_add_local_once(|| rebuild_bar());
+    }
+    glib::ControlFlow::Break
+}
+
+/// Put a slot change that is in flight straight to its end.
+///
+/// Called when a drag takes the row over: a drag measures the row's slots, and a square
+/// held a slot away from where the layout has it would be measured wrong.
+fn settle_slot_change(tasks: &GtkBox) {
+    let Some(change) = SLOT_CHANGE.with(|cell| cell.borrow_mut().take()) else {
+        return;
+    };
+    for square in &change.held {
+        release_hold(square);
+    }
+    if change.arriving {
+        change.button.set_opacity(1.0);
+    } else {
+        // A square on its way out is not something to press: the pointer it was under
+        // belongs to the square that is being made room for.
+        change.button.set_can_target(false);
+        tasks.remove(&change.button);
+    }
+    if RELIST_DEFERRED.with(|cell| cell.replace(false)) {
+        glib::idle_add_local_once(|| rebuild_bar());
+    }
 }
 
 /// Show or hide one square's tooltip, to match whether a menu is up.
@@ -8148,59 +8602,75 @@ mod tests {
     }
 
     #[test]
-    fn the_app_menu_is_styled_from_the_previews_palette() {
-        // Two menus belonging to one panel should look like one object. The
-        // previews are cairo-driven, so their constants are the fixed point:
-        // the stylesheet reads the same constants as the drawing reads, and
-        // this test pins the stylesheet to them in case a rule restarts from a
-        // hand-copied value.
+    fn both_menus_are_styled_from_the_panel_they_hang_from() {
+        // Two menus and the bar they hang from belong to one panel and should
+        // look like one object. The bar's own constants are the fixed point; the
+        // cairo drawing and the stylesheet both read them, and this test pins
+        // them to each other in case a rule restarts from a hand-copied value.
         let sheet = style_sheet((1, 2, 3));
-        // The body, from the rows-box rule. The body takes the *cell* fill --
-        // the two shades swapped -- so the rows sit lighter and more opaque in
-        // front of a darker, more open background.
-        let rule = sheet
-            .split(".context-rows {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu rows");
-        assert!(
-            rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
-            "the app menu body is not the swapped cell fill: {rule}"
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"))
+                .to_string()
+        };
+        let (r, g, b) = BAR_PANEL;
+        let body = format!("rgba({r}, {g}, {b}, {BAR_PANEL_ALPHA})");
+        // Both bodies are the bar's fill, to the byte and to the alpha: a menu
+        // that runs a shade darker, or a shade more opaque, is the drift this is
+        // here to stop.
+        assert_eq!(
+            MENU_FILL,
+            (
+                f64::from(r) / 255.0,
+                f64::from(g) / 255.0,
+                f64::from(b) / 255.0,
+                BAR_PANEL_ALPHA
+            ),
+            "the thumbnail menu's body is not the bar's"
         );
-        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
-        assert_eq!(MENU_FILL, (0.11, 0.11, 0.11, 0.94), "and the previews moved");
+        let rows_rule = rule(".context-rows {");
+        assert!(
+            rows_rule.contains(&body),
+            "the app menu's body is not the bar's: {rows_rule}"
+        );
         // The theme's window background image would put a fill of its own over
         // this, and it is invisible in a stylesheet.
         assert!(
-            rule.contains("background-image: none"),
-            "the theme's window background is back over the app menu's fill: {rule}"
+            rows_rule.contains("background-image: none"),
+            "the theme's window background is back over the app menu's fill: {rows_rule}"
         );
-        // And a row is one step lighter than that fill, on the hover's own
-        // white ladder -- not a second grey from another palette.
-        let row_rule = sheet
-            .split("button.context-row {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu rows' buttons");
+        // And a row is the plate a preview's cell is drawn with: the same value
+        // in both menus, and the panel's own hover ladder one step down.
+        assert_eq!(
+            CELL_FILL,
+            (1.0, 1.0, 1.0, TASK_HOVER_ALPHA / 2.0),
+            "the plate a menu's contents sit on moved"
+        );
+        let row_rule = rule("button.context-row {");
+        let plate = format!("rgba(255, 255, 255, {})", CELL_FILL.3);
         assert!(
-            row_rule.contains("rgba(255, 255, 255, 0.05)"),
-            "an app-menu row is not the one-step-lighter fill: {row_rule}"
+            row_rule.contains(&plate),
+            "an app-menu row is not the plate the previews are drawn with: {row_rule}"
+        );
+        // Under the pointer it is filled exactly as a square on the bar is.
+        let hover_rule = rule("button.context-row:hover {");
+        assert!(
+            hover_rule.contains(&format!("rgba(255, 255, 255, {TASK_HOVER_ALPHA})")),
+            "an app-menu row does not take the panel's hover: {hover_rule}"
         );
         // The window itself paints nothing: the strip above the rows has to stay
         // see-through for the gap between the menu and the panel to be a gap.
-        let window_rule = sheet
-            .split("window.context {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu window");
+        let window_rule = rule("window.context {");
         assert!(
             window_rule.contains("background-color: transparent"),
             "the app menu window paints over the gap strip: {window_rule}"
         );
         // The mini-CSD adds no fill of its own. The cell's fill is already under it,
         // and setting the strip to the same value does not make it the same colour --
-        // it stacks, and two 35% blacks are 58%, so the strip came out darker than
-        // the cell it belongs to.
+        // it stacks, so the strip came out darker than the cell it belongs to.
         assert_eq!(TITLEBAR_FILL.3, 0.0, "the strip must not paint over the cell");
         // Which is the one case where a fill *would* have been right: if the cell were
         // not already filled, the strip would need the colour itself.
@@ -8278,6 +8748,109 @@ mod tests {
         a_live_row_trades_neighbours_as_the_pointer_crosses_them();
         a_row_local_read_is_short_of_the_layer_frame();
         a_sliding_bar_keeps_its_shape();
+        a_leaving_square_fades_before_the_row_closes_behind_it();
+    }
+
+    /// A square in a row of its own, named as the bar names one.
+    fn row_square(key: &str) -> Button {
+        let square = Button::new();
+        square.add_css_class("task");
+        square.set_widget_name(&format!("{APP_NAME_PREFIX}{key}"));
+        square.set_size_request(SQUARE_SIZE, SQUARE_SIZE);
+        square
+    }
+
+    /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The row makes room for a square arriving, and closes only after one that has left is
+    /// invisible. Both halves are frame-timed, so the ticks are driven by hand here — a
+    /// widget that is never mapped has no frame clock, which is a test's luck and not
+    /// something the code may rely on.
+    ///
+    /// The first bug in this was the departure disappearing: a snapshot ended the change the
+    /// frame after it started. A window closing changes the list twice — the window goes,
+    /// and the focus moves on with it — so the fade was over before it could be seen.
+    fn a_leaving_square_fades_before_the_row_closes_behind_it() {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
+        let squares: Vec<Button> = ["one", "two", "three"]
+            .iter()
+            .map(|key| {
+                let square = row_square(key);
+                tasks.append(&square);
+                square
+            })
+            .collect();
+        let leaving = squares[1].clone();
+        let behind = squares[2].clone();
+
+        start_slot_changes(&tasks, &[], std::slice::from_ref(&leaving));
+        assert!(slot_change_in_flight(), "a square leaving is a slot change");
+        assert!(
+            leaving.parent().is_some(),
+            "the square left the row before it had faded"
+        );
+
+        // What a window closing sends next: the list changed again, and nothing in it is
+        // arriving or leaving. The fade has to survive it.
+        start_slot_changes(&tasks, &[], &[]);
+        assert!(slot_change_in_flight(), "a later snapshot ended the fade");
+        assert!(leaving.parent().is_some(), "so the square went before it was seen");
+
+        // Part way through the fade, the square is part way faded.
+        std::thread::sleep(SLOT_FADE / 3);
+        tick_slot_change(&tasks);
+        let partway = leaving.opacity();
+        assert!(
+            partway < 1.0 && partway > 0.0,
+            "the square is not fading: {partway}"
+        );
+
+        // Only once it is invisible does the row close, and it closes with the squares
+        // behind held where they were drawn, so the frame that closes it does not also jump
+        // them across the screen.
+        std::thread::sleep(SLOT_FADE);
+        tick_slot_change(&tasks);
+        assert!(
+            leaving.parent().is_none(),
+            "the square is still in the row after its fade"
+        );
+        assert!(
+            behind.has_css_class("held-forward"),
+            "the row closed without holding the squares behind it"
+        );
+        // Held for the frame the layout is drawn in, let go the one after.
+        tick_slot_change(&tasks);
+        assert!(
+            !behind.has_css_class("held-forward"),
+            "the row was never let go of"
+        );
+        std::thread::sleep(SLOT_FADE + SLOT_SLIDE);
+        tick_slot_change(&tasks);
+        assert!(!slot_change_in_flight(), "the change never finished");
+
+        // And the other way round: an arrival is invisible until the row has made room for
+        // it, which is the same hold taken from the other side.
+        let arriving = row_square("four");
+        tasks.prepend(&arriving);
+        start_slot_changes(&tasks, std::slice::from_ref(&arriving), &[]);
+        assert_eq!(arriving.opacity(), 0.0, "a square arrives already visible");
+        tick_slot_change(&tasks);
+        assert!(
+            behind.has_css_class("held-back"),
+            "the row did not make room for the square arriving"
+        );
+        tick_slot_change(&tasks);
+        assert!(
+            !behind.has_css_class("held-back"),
+            "the row never stopped holding back"
+        );
+        std::thread::sleep(SLOT_SLIDE + SLOT_FADE);
+        tick_slot_change(&tasks);
+        assert_eq!(arriving.opacity(), 1.0, "the arrival never finished fading in");
+        assert!(!slot_change_in_flight(), "the change never finished");
     }
 
     /// Section of `the_widget_suite_dances_in_one_process`.
@@ -8304,7 +8877,7 @@ mod tests {
         let row = GtkBox::new(Orientation::Horizontal, 8);
         row.add_css_class("panel");
         row.set_size_request(-1, PANEL_HEIGHT);
-        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
         tasks.add_css_class("tasks");
         let square = Button::new();
         square.add_css_class("task");
@@ -8375,7 +8948,7 @@ mod tests {
         let row = GtkBox::new(Orientation::Horizontal, 8);
         row.add_css_class("panel");
         row.set_size_request(-1, PANEL_HEIGHT);
-        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
         tasks.add_css_class("tasks");
         let mut squares = Vec::new();
         let mut icons = Vec::new();
@@ -8587,7 +9160,7 @@ mod tests {
         // The trade commits instantly in the row while the square itself flies
         // the overlay from its old slot to its new one. Needs a display, like
         // the live row test above, and passes silently without one.
-        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
         let hole = ghost(GAP_NAME);
         tasks.append(&hole);
         for app in ["b", "c"] {
@@ -8757,7 +9330,7 @@ mod tests {
         // stale, and a chained read would target a slot off — the sideways
         // padding a two-slot fling showed. trade_slots_with takes the snapshot
         // the way the production chain does.
-        let tasks2 = GtkBox::new(Orientation::Horizontal, 2);
+        let tasks2 = GtkBox::new(Orientation::Horizontal, TASK_GAP);
         tasks2.append(&ghost(GAP_NAME));
         for app in ["b", "c", "d"] {
             let square = Button::new();
@@ -8823,7 +9396,7 @@ mod tests {
         // real `swap_row_slots`. Needs a display — without one there is nothing
         // to lay out and nothing to measure, so it passes silently instead of
         // failing loudly.
-        let tasks = GtkBox::new(Orientation::Horizontal, 2);
+        let tasks = GtkBox::new(Orientation::Horizontal, TASK_GAP);
         for app in ["a", "b", "c", "d"] {
             let square = Button::new();
             square.set_widget_name(&format!("{APP_NAME_PREFIX}{app}"));
@@ -8962,6 +9535,98 @@ mod tests {
     }
 
     #[test]
+    fn an_arriving_square_has_its_slot_made_before_it_appears() {
+        // The row moves first and the square fades in after. A square appearing while the
+        // row was still making room for it would read as one event, and the room being made
+        // is the half of it that is easy to miss.
+        assert_eq!(slot_step(true, Duration::ZERO), SlotStep::Sliding);
+        assert_eq!(slot_step(true, SLOT_SLIDE / 2), SlotStep::Sliding);
+        assert_eq!(slot_step(true, SLOT_SLIDE), SlotStep::Appearing);
+        assert_eq!(slot_step(true, SLOT_SLIDE + SLOT_FADE), SlotStep::Done);
+        // And it is invisible for the whole of that first step, so none of it is drawn
+        // while the row is still on its way.
+        assert_eq!(slot_alpha(true, Duration::ZERO), 0.0);
+        assert_eq!(slot_alpha(true, SLOT_SLIDE / 2), 0.0);
+        assert_eq!(slot_alpha(true, SLOT_SLIDE + SLOT_FADE), 1.0);
+    }
+
+    #[test]
+    fn a_leaving_square_is_seen_until_its_slot_can_close_behind_it() {
+        // The mirror of the arrival, and the reason for the order: the row keeps its shape
+        // until there is nothing left of the square to see, so the slot closes on an empty
+        // square rather than moving a gap across the row.
+        assert_eq!(slot_step(false, Duration::ZERO), SlotStep::Fading);
+        assert_eq!(slot_step(false, SLOT_FADE / 2), SlotStep::Fading);
+        assert_eq!(slot_step(false, SLOT_FADE), SlotStep::Sliding);
+        assert_eq!(slot_step(false, SLOT_FADE + SLOT_SLIDE), SlotStep::Done);
+        assert_eq!(slot_alpha(false, Duration::ZERO), 1.0);
+        assert_eq!(slot_alpha(false, SLOT_FADE), 0.0, "and only just gone");
+        // Which is exactly when the row starts moving.
+        assert_eq!(slot_step(false, SLOT_FADE), SlotStep::Sliding);
+    }
+
+    #[test]
+    fn a_square_is_held_a_slot_away_by_a_transform_and_gives_it_up_on_a_clock() {
+        let sheet = style_sheet((1, 2, 3));
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"))
+                .to_string()
+        };
+        // One slot each way, a square and the gap after it, held by a transform: the layout
+        // is untouched, so the squares behind are offset once rather than stacking one
+        // offset each.
+        let slot = SQUARE_SIZE + TASK_GAP;
+        assert!(
+            rule("button.task.held-back {").contains(&format!("transform: translate(-{slot}px, 0)")),
+            "a square held back is not held a whole slot back"
+        );
+        assert!(
+            rule("button.task.held-forward {").contains(&format!("transform: translate({slot}px, 0)")),
+            "a square held forward is not held a whole slot forward"
+        );
+        // Applying the hold is instant, and letting it go is what the transition eases.
+        // Easing into the hold would slide the square backwards before it went forwards.
+        assert!(rule("button.task.held-back {").contains("transition: none"));
+        assert!(rule("button.task.held-forward {").contains("transition: none"));
+        // And the one transition a square has is the slot's. Anything else on this rule
+        // would ease the hover fill, which has to arrive with the pointer.
+        let base = rule("button.task {");
+        assert_eq!(
+            base.matches("transition:").count(),
+            1,
+            "a square has more than one transition: {base}"
+        );
+        assert!(
+            base.contains(&format!(
+                "transition: transform {}ms ease-out",
+                SLOT_SLIDE.as_millis()
+            )),
+            "a square does not move a slot on the slot's clock: {base}"
+        );
+    }
+
+    #[test]
+    fn an_app_menu_stays_while_its_square_does_and_goes_once_it_does_not() {
+        // The bar lists an app per set of windows, plus the pinned apps that have none,
+        // so a pinned app's square outlives its windows and an app menu open on it still
+        // has rows that mean something -- pin, launch.
+        let barred = ["firefox", "pinned-idle"];
+        assert!(still_on_the_bar("firefox", &barred));
+        assert!(
+            still_on_the_bar("pinned-idle", &barred),
+            "a pinned square stays after its last window closes"
+        );
+        assert!(
+            !still_on_the_bar("thunderbird", &barred),
+            "an app nobody pinned and nobody has open has left the panel"
+        );
+    }
+
+    #[test]
     fn a_square_is_filled_for_the_pointer_or_for_focus_and_nothing_else() {
         // The fill says two things: the pointer is on this square, or its app is
         // the one being used. An app that is open, open-but-minimized or
@@ -8987,12 +9652,22 @@ mod tests {
         // hover's own number — and it is written last, so a dragged square looks
         // the same whatever the app behind it is doing.
         assert!(at("button.task.carrying {") > at("button.task.focused {"));
+        // Hover and carried are the same fill. It is also the fill of an app
+        // menu's row under the pointer -- the same panel's hover, in the other
+        // menu -- so the two taskbar rules are read by name rather than by
+        // counting how often the value appears in the sheet.
         let hover = format!("rgba(255, 255, 255, {TASK_HOVER_ALPHA})");
-        assert_eq!(
-            sheet.matches(&hover).count(),
-            2,
-            "hover and carrying should be the same fill"
-        );
+        for head in ["button.task:hover {", "button.task.carrying {"] {
+            let body = sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"));
+            assert!(
+                body.contains(&hover),
+                "{head} is not the panel's hover fill: {body}"
+            );
+        }
         assert!(TASK_FOCUSED_ALPHA > TASK_HOVER_ALPHA);
     }
 
