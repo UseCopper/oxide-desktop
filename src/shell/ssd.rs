@@ -446,6 +446,11 @@ pub struct HeaderBar {
 
 #[derive(Debug, Clone)]
 pub struct Borders {
+    /// The strip along the top of the window. It is drawn over the titlebar's
+    /// first two pixels rather than above them — the chrome's elements are in
+    /// front of the bar's — so the frame closes around the window instead of
+    /// stopping where the titlebar starts.
+    pub top: SolidColorBuffer,
     pub bottom: SolidColorBuffer,
     pub left: SolidColorBuffer,
     pub right: SolidColorBuffer,
@@ -874,6 +879,7 @@ impl HeaderBar {
         self.borders.height = content_height;
         let ring_w = (content_width + 2 * BORDER_WIDTH as u32) as i32;
         let ring_h = content_height as i32;
+        self.borders.top.update((ring_w, BORDER_WIDTH), frame);
         self.borders.bottom.update((ring_w, BORDER_WIDTH), frame);
         self.borders.left.update((BORDER_WIDTH, ring_h), frame);
         self.borders.right.update((BORDER_WIDTH, ring_h), frame);
@@ -1056,6 +1062,16 @@ impl<R: Renderer> AsRenderElements<R> for Borders {
         let h = HEADER_BAR_HEIGHT;
 
         vec![
+            // The top strip lands on the titlebar's own first two pixels: this
+            // group is drawn in front of the bar.
+            SolidColorRenderElement::from_buffer(
+                &self.top,
+                location,
+                scale,
+                alpha,
+                Kind::Unspecified,
+            )
+            .into(),
             SolidColorRenderElement::from_buffer(
                 &self.left,
                 location + Point::from((0, h)).to_physical_precise_round(scale),
@@ -1112,6 +1128,7 @@ impl WindowElement {
                     maximize_button: SolidColorBuffer::default(),
                     minimize_button: SolidColorBuffer::default(),
                     borders: Borders {
+                        top: SolidColorBuffer::default(),
                         bottom: SolidColorBuffer::default(),
                         left: SolidColorBuffer::default(),
                         right: SolidColorBuffer::default(),
@@ -1629,6 +1646,7 @@ mod tests {
         }
         // And they differ by focus, so a window still says which it is.
         assert_ne!(BORDER_COLOR[0], BORDER_COLOR_FOCUSED[0]);
+
     }
 
     #[test]
