@@ -148,10 +148,29 @@ const TITLE_FONT_SIZE: f64 = 10.0;
 const TITLE_COLOUR: (f64, f64, f64) = (0.863, 0.863, 0.863);
 /// Appended to a title that has to be cut short.
 const TITLE_ELLIPSIS: char = '\u{2026}';
-/// Menu colours, replacing what the stylesheet used to say.
-const MENU_FILL: (f64, f64, f64, f64) = (0.11, 0.11, 0.11, 0.94);
+/// Both menus' own bodies, in each engine that draws one.
+///
+/// The bar's colour at the bar's transparency, written as the bar's own constants
+/// rather than as hexes of their own. A menu hangs off the panel and is the same
+/// object as far as anyone looking at it is concerned, so a grey of its own or an
+/// alpha of its own shows up as drift the moment the two are on screen together.
+/// The shell's window chrome reads the same pair for the same reason.
+const MENU_FILL: (f64, f64, f64, f64) = (
+    BAR_PANEL.0 as f64 / 255.0,
+    BAR_PANEL.1 as f64 / 255.0,
+    BAR_PANEL.2 as f64 / 255.0,
+    BAR_PANEL_ALPHA,
+);
 const MENU_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.16);
-const CELL_FILL: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.35);
+/// The plate a menu's contents sit on. A preview's cell and a row of the app menu
+/// are the same thing in two menus, so they are one value rather than two that have
+/// to be kept in step.
+///
+/// It is the panel's hover ladder one step down: what the pointer is on is filled at
+/// [`TASK_HOVER_ALPHA`], and what is merely present is filled at half of it, so a
+/// menu reads in the same language as the squares on the bar it hangs from. The edge
+/// is what draws the plate's outline, which is why this fill can stay this faint.
+const CELL_FILL: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, TASK_HOVER_ALPHA / 2.0);
 const CELL_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
 const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
 /// The mini-CSD's strip. Nothing: the cell's own fill is already under it.
@@ -159,8 +178,8 @@ const CELL_EDGE_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.38);
 /// It was a 7% white wash, which made one preview two greys, and then it was set to
 /// [`CELL_FILL`] on the reasoning that the same value would look the same — which is
 /// wrong, because the strip is drawn *on top of* the cell fill rather than instead of
-/// it. Two 35% blacks are 58% black, so the strip came out a third value, darker than
-/// the cell it is part of, and that is what changed.
+/// it. Two of one fill stack into a third, darker value, so the strip came out darker
+/// than the cell it is part of, and that is what changed.
 ///
 /// Transparent is what "the same background transparency" actually means when the
 /// thing under it is already the colour you want. The title and the close square are
@@ -4133,11 +4152,12 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // sheet, so the order can be asserted instead of eyeballed.
     let task_hover = TASK_HOVER_ALPHA;
     let task_focused = TASK_FOCUSED_ALPHA;
-    // The app menu's body is the preview menu's cell fill, read off the same
-    // constant the cairo drawing reads, so the two engines agree by
-    // construction rather than by two careful copies of the same hexes. The
-    // rows are a white step on the hover's own ladder instead of a second
-    // grey, so nothing at rest keeps the body fill's variables alive.
+    // Both menus' bodies are the bar's own fill, read off the same constants the
+    // bar's rule below and the cairo drawing read, so the panel, the two menus
+    // and their two engines agree by construction rather than by three careful
+    // copies of the same hexes. A menu's contents sit on the plate the previews'
+    // cells are drawn with, and take the panel's hover under the pointer: no
+    // rule here carries a colour from a palette of its own.
     let menu_edge_a = MENU_EDGE.3;
     let menu_radius = MENU_RADIUS.round() as i32;
     let cell_fill_a = CELL_FILL.3;
@@ -4228,11 +4248,11 @@ button.task.focused {{
 button.task.carrying {{
     background-color: rgba(255, 255, 255, {task_hover});
 }}
-/* The app menu, opened by a right click. Widgets, so it is styled here --
-   styled out of the thumbnail menu's own palette, with the body at the
-   previews' 0.35 black and one row a step lighter: the same fill ladder the
-   hover's own white sits on. Edges, radii, text and hover are the previews'
-   and the taskbar's as before.
+/* The app menu, opened by a right click. Widgets, so it is styled here -- styled
+   out of the same constants the thumbnail menu's cairo drawing reads: its body is
+   the bar's own fill, its rows are the plate the previews' cells are drawn with,
+   and a row under the pointer is filled exactly as a square on the bar is. Edges,
+   radii and text are the previews' as before.
    The fill is on the rows box, not the window: the window starts flush under the
    bar and its first few pixels are the gap strip, which has to stay transparent so
    the desktop shows through between the menu and the panel. */
@@ -4242,14 +4262,11 @@ window.context {{
     border: none;
 }}
 .context-rows {{
-    /* The previews' body, not the bar's panel grey: the thumbnail menu runs a
-       shade darker and more opaque than the bar, and two menus side by side
-       would show any drift. */
+    /* The bar's fill, the same constant the bar's own rule above and the
+       thumbnail menu's body read: one panel, so one body, and nothing to drift
+       between two menus that can be on screen together. */
     padding: 5px;
-    /* The cell fill, not the previews' body: the fills of the body and the
-       rows are swapped, so the rows run the lighter, more opaque shade of
-       the two and sit in front against a darker, more open background. */
-    background-color: rgba(0, 0, 0, {cell_fill_a});
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
     /* The theme paints a window background image on top of a window's background
        colour, which would put a fill of its own over this and make it a third value
        again. */
@@ -4258,10 +4275,10 @@ window.context {{
     border-radius: {menu_radius}px;
 }}
 button.context-row {{
-    /* A shade of white over the body rather than a second grey: the row is
-       exactly one step lighter than the fill behind it, on the same ladder
-       the hover sits on. */
-    background: rgba(255, 255, 255, 0.05);
+    /* The plate a menu's contents sit on, read off the constant the previews'
+       cells are drawn with: a row and a preview are the same thing in two menus,
+       so they are one fill rather than two that must be kept in step. */
+    background: rgba(255, 255, 255, {cell_fill_a});
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     box-shadow: none;
@@ -4275,11 +4292,12 @@ button.context-row {{
     transition: none;
 }}
 button.context-row:hover {{
-    /* The panel's own hover: the pointer's fill, nothing else moving. The
-       theme pours a hovering fill of its own through `background-image`,
-       which vanishes the rest rule and puts back the vanilla look, so the
-       hover has to kill it the way the rest rule does. */
-    background-color: rgba(255, 255, 255, 0.10);
+    /* The panel's own hover, at the strength a square on the bar takes under the
+       pointer: the pointer's fill, nothing else moving. The theme pours a
+       hovering fill of its own through `background-image`, which vanishes the
+       rest rule and puts back the vanilla look, so the hover has to kill it the
+       way the rest rule does. */
+    background-color: rgba(255, 255, 255, {task_hover});
     background-image: none;
 }}
 /* The label is its own node, and the theme has an opinion about its colour. */
@@ -8148,59 +8166,75 @@ mod tests {
     }
 
     #[test]
-    fn the_app_menu_is_styled_from_the_previews_palette() {
-        // Two menus belonging to one panel should look like one object. The
-        // previews are cairo-driven, so their constants are the fixed point:
-        // the stylesheet reads the same constants as the drawing reads, and
-        // this test pins the stylesheet to them in case a rule restarts from a
-        // hand-copied value.
+    fn both_menus_are_styled_from_the_panel_they_hang_from() {
+        // Two menus and the bar they hang from belong to one panel and should
+        // look like one object. The bar's own constants are the fixed point; the
+        // cairo drawing and the stylesheet both read them, and this test pins
+        // them to each other in case a rule restarts from a hand-copied value.
         let sheet = style_sheet((1, 2, 3));
-        // The body, from the rows-box rule. The body takes the *cell* fill --
-        // the two shades swapped -- so the rows sit lighter and more opaque in
-        // front of a darker, more open background.
-        let rule = sheet
-            .split(".context-rows {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu rows");
-        assert!(
-            rule.contains(&format!("rgba(0, 0, 0, {})", CELL_FILL.3)),
-            "the app menu body is not the swapped cell fill: {rule}"
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"))
+                .to_string()
+        };
+        let (r, g, b) = BAR_PANEL;
+        let body = format!("rgba({r}, {g}, {b}, {BAR_PANEL_ALPHA})");
+        // Both bodies are the bar's fill, to the byte and to the alpha: a menu
+        // that runs a shade darker, or a shade more opaque, is the drift this is
+        // here to stop.
+        assert_eq!(
+            MENU_FILL,
+            (
+                f64::from(r) / 255.0,
+                f64::from(g) / 255.0,
+                f64::from(b) / 255.0,
+                BAR_PANEL_ALPHA
+            ),
+            "the thumbnail menu's body is not the bar's"
         );
-        assert_eq!(CELL_FILL, (0.0, 0.0, 0.0, 0.35), "and the previews moved");
-        assert_eq!(MENU_FILL, (0.11, 0.11, 0.11, 0.94), "and the previews moved");
+        let rows_rule = rule(".context-rows {");
+        assert!(
+            rows_rule.contains(&body),
+            "the app menu's body is not the bar's: {rows_rule}"
+        );
         // The theme's window background image would put a fill of its own over
         // this, and it is invisible in a stylesheet.
         assert!(
-            rule.contains("background-image: none"),
-            "the theme's window background is back over the app menu's fill: {rule}"
+            rows_rule.contains("background-image: none"),
+            "the theme's window background is back over the app menu's fill: {rows_rule}"
         );
-        // And a row is one step lighter than that fill, on the hover's own
-        // white ladder -- not a second grey from another palette.
-        let row_rule = sheet
-            .split("button.context-row {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu rows' buttons");
+        // And a row is the plate a preview's cell is drawn with: the same value
+        // in both menus, and the panel's own hover ladder one step down.
+        assert_eq!(
+            CELL_FILL,
+            (1.0, 1.0, 1.0, TASK_HOVER_ALPHA / 2.0),
+            "the plate a menu's contents sit on moved"
+        );
+        let row_rule = rule("button.context-row {");
+        let plate = format!("rgba(255, 255, 255, {})", CELL_FILL.3);
         assert!(
-            row_rule.contains("rgba(255, 255, 255, 0.05)"),
-            "an app-menu row is not the one-step-lighter fill: {row_rule}"
+            row_rule.contains(&plate),
+            "an app-menu row is not the plate the previews are drawn with: {row_rule}"
+        );
+        // Under the pointer it is filled exactly as a square on the bar is.
+        let hover_rule = rule("button.context-row:hover {");
+        assert!(
+            hover_rule.contains(&format!("rgba(255, 255, 255, {TASK_HOVER_ALPHA})")),
+            "an app-menu row does not take the panel's hover: {hover_rule}"
         );
         // The window itself paints nothing: the strip above the rows has to stay
         // see-through for the gap between the menu and the panel to be a gap.
-        let window_rule = sheet
-            .split("window.context {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a rule for the app menu window");
+        let window_rule = rule("window.context {");
         assert!(
             window_rule.contains("background-color: transparent"),
             "the app menu window paints over the gap strip: {window_rule}"
         );
         // The mini-CSD adds no fill of its own. The cell's fill is already under it,
         // and setting the strip to the same value does not make it the same colour --
-        // it stacks, and two 35% blacks are 58%, so the strip came out darker than
-        // the cell it belongs to.
+        // it stacks, so the strip came out darker than the cell it belongs to.
         assert_eq!(TITLEBAR_FILL.3, 0.0, "the strip must not paint over the cell");
         // Which is the one case where a fill *would* have been right: if the cell were
         // not already filled, the strip would need the colour itself.
@@ -8987,12 +9021,22 @@ mod tests {
         // hover's own number — and it is written last, so a dragged square looks
         // the same whatever the app behind it is doing.
         assert!(at("button.task.carrying {") > at("button.task.focused {"));
+        // Hover and carried are the same fill. It is also the fill of an app
+        // menu's row under the pointer -- the same panel's hover, in the other
+        // menu -- so the two taskbar rules are read by name rather than by
+        // counting how often the value appears in the sheet.
         let hover = format!("rgba(255, 255, 255, {TASK_HOVER_ALPHA})");
-        assert_eq!(
-            sheet.matches(&hover).count(),
-            2,
-            "hover and carrying should be the same fill"
-        );
+        for head in ["button.task:hover {", "button.task.carrying {"] {
+            let body = sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"));
+            assert!(
+                body.contains(&hover),
+                "{head} is not the panel's hover fill: {body}"
+            );
+        }
         assert!(TASK_FOCUSED_ALPHA > TASK_HOVER_ALPHA);
     }
 
