@@ -446,11 +446,10 @@ pub struct HeaderBar {
 
 #[derive(Debug, Clone)]
 pub struct Borders {
-    /// The strip along the top of the window. It is drawn over the titlebar's
-    /// first two pixels rather than above them — the chrome's elements are in
-    /// front of the bar's — so the frame closes around the window instead of
-    /// stopping where the titlebar starts.
-    pub top: SolidColorBuffer,
+    /// Three strips, not four: the window's top edge is the titlebar itself,
+    /// which is drawn at the chrome's own colour and transparency, so a strip
+    /// along it would be the same surface seen twice.
+
     pub bottom: SolidColorBuffer,
     pub left: SolidColorBuffer,
     pub right: SolidColorBuffer,
@@ -458,19 +457,23 @@ pub struct Borders {
     pub height: u32,
 }
 
-const BG_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 1.0];
-const BG_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0];
-/// The frame around a window's client area: the same colour as the titlebar it
-/// continues, with a little of the desktop showing through. "Slightly" — enough
-/// that the edge reads as sitting *over* what is behind the window rather than
-/// as a strip of its own, and not so much that it stops reading as the window's
-/// edge. The titlebar itself stays solid, since the title and the buttons are
-/// written on it.
-const BORDER_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 0.85];
-const BORDER_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 0.85];
+/// How see-through a window's own chrome is — the titlebar and the frame alike.
+///
+/// The panel's number, not a second one that happens to look close: the bar and
+/// the windows under it are the same surface in two places, and the title and
+/// the three buttons are drawn on the titlebar's fill, so only the fill is
+/// thinned.
+const CHROME_ALPHA: f32 = crate::panel::BAR_PANEL_ALPHA as f32;
+/// The titlebar and the frame. One pair of greys, both see-through by
+/// [`CHROME_ALPHA`]: the frame is not a separate colour, it is the same chrome
+/// continuing around the window.
+const CHROME_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, CHROME_ALPHA];
+const CHROME_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, CHROME_ALPHA];
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
-const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
+/// A hovered button's patch, at the chrome's own transparency: an opaque patch
+/// on a see-through bar reads as a hole in it.
+const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, CHROME_ALPHA];
 
 pub const HEADER_BAR_HEIGHT: i32 = 30;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
@@ -863,12 +866,14 @@ impl HeaderBar {
             }
         }
 
-        let bg = if focused { BG_COLOR_FOCUSED } else { BG_COLOR };
-        let frame = if focused {
-            BORDER_COLOR_FOCUSED
+        // One colour for the whole chrome: the titlebar and the frame are the
+        // same surface.
+        let bg = if focused {
+            CHROME_COLOR_FOCUSED
         } else {
-            BORDER_COLOR
+            CHROME_COLOR
         };
+        let frame = bg;
 
         self.background
             .update((width as i32, HEADER_BAR_HEIGHT), bg);
@@ -879,7 +884,6 @@ impl HeaderBar {
         self.borders.height = content_height;
         let ring_w = (content_width + 2 * BORDER_WIDTH as u32) as i32;
         let ring_h = content_height as i32;
-        self.borders.top.update((ring_w, BORDER_WIDTH), frame);
         self.borders.bottom.update((ring_w, BORDER_WIDTH), frame);
         self.borders.left.update((BORDER_WIDTH, ring_h), frame);
         self.borders.right.update((BORDER_WIDTH, ring_h), frame);
@@ -1062,16 +1066,6 @@ impl<R: Renderer> AsRenderElements<R> for Borders {
         let h = HEADER_BAR_HEIGHT;
 
         vec![
-            // The top strip lands on the titlebar's own first two pixels: this
-            // group is drawn in front of the bar.
-            SolidColorRenderElement::from_buffer(
-                &self.top,
-                location,
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
             SolidColorRenderElement::from_buffer(
                 &self.left,
                 location + Point::from((0, h)).to_physical_precise_round(scale),
@@ -1128,7 +1122,6 @@ impl WindowElement {
                     maximize_button: SolidColorBuffer::default(),
                     minimize_button: SolidColorBuffer::default(),
                     borders: Borders {
-                        top: SolidColorBuffer::default(),
                         bottom: SolidColorBuffer::default(),
                         left: SolidColorBuffer::default(),
                         right: SolidColorBuffer::default(),
@@ -1624,29 +1617,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_frame_is_slightly_transparent_and_the_titlebar_is_not() {
-        // The frame is the same colour as the titlebar, thinned: the desktop
-        // shows a little through the edge of a window. The titlebar keeps its
-        // fill, because the title and the three buttons are written on it.
-        for (frame, bar, focused) in [
-            (BORDER_COLOR, BG_COLOR, false),
-            (BORDER_COLOR_FOCUSED, BG_COLOR_FOCUSED, true),
-        ] {
-            assert_eq!(
-                &frame[..3],
-                &bar[..3],
-                "the frame and the titlebar drifted apart ({focused})"
-            );
-            assert_eq!(bar[3], 1.0, "the titlebar has to be solid");
-            assert!(
-                (0.75..1.0).contains(&frame[3]),
-                "the frame is {} opaque — that is not *slightly* transparent ({focused})",
-                frame[3]
-            );
-        }
-        // And they differ by focus, so a window still says which it is.
-        assert_ne!(BORDER_COLOR[0], BORDER_COLOR_FOCUSED[0]);
-
+    fn the_chrome_is_as_transparent_as_the_panel() {
+        // Not "close to" the panel's transparency: the panel's number. The bar
+        // and the windows under it are the same surface in two places, and this
+        // is the one place that could drift from it without anything noticing.
+        assert_eq!(CHROME_ALPHA, crate::panel::BAR_PANEL_ALPHA as f32);
+        assert!(
+            (0.5..1.0).contains(&CHROME_ALPHA),
+            "{CHROME_ALPHA} is not a transparency, it is a fog"
+        );
+        // The titlebar and the frame are the same colour, so the chrome reads as
+        // one surface rather than a solid lid on a see-through box.
+        assert_eq!(CHROME_COLOR[3], CHROME_ALPHA);
+        assert_eq!(CHROME_COLOR_FOCUSED[3], CHROME_ALPHA);
+        // A hovered button's patch is thinned with the bar it sits on: an opaque
+        // patch on a see-through bar reads as a hole in it.
+        assert_eq!(BUTTON_HOVER_COLOR[3], CHROME_ALPHA);
+        // And the window still says whether it is the one in use.
+        assert_ne!(CHROME_COLOR[0], CHROME_COLOR_FOCUSED[0]);
+        // The title and the icons are not thinned: they are written on the fill.
+        assert_eq!(TITLE_COLOR[3], 1.0);
+        assert_eq!(ICON_COLOR[3], 1.0);
     }
 
     #[test]

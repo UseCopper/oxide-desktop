@@ -4112,9 +4112,11 @@ fn accent_rgb() -> (f64, f64, f64) {
 /// The bar's panel colour, at [`BAR_PANEL_ALPHA`].
 ///
 /// Named once because three rules in the stylesheet have to agree on it — the bar, the
-/// app menu, and a test that would otherwise be a fourth copy of a colour literal.
-const BAR_PANEL: (u8, u8, u8) = (32, 32, 32);
-const BAR_PANEL_ALPHA: f64 = 0.82;
+/// app menu, and a test that would otherwise be a fourth copy of a colour literal. The
+/// shell's window chrome reads it too: a window's titlebar and frame are the same grey at
+/// the same transparency as the bar they sit under.
+pub(crate) const BAR_PANEL: (u8, u8, u8) = (32, 32, 32);
+pub(crate) const BAR_PANEL_ALPHA: f64 = 0.82;
 
 fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // Fed in rather than written out, so the bar and the app menu cannot drift apart
