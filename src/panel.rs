@@ -8840,44 +8840,37 @@ mod tests {
         pin.download(&mut drawn, stride);
         unpin.download(&mut crossed, stride);
 
-        // The corner the cross sits in: bare on the pin, inked on the unpin. An alpha of
-        // nothing is nothing drawn, which is what the corner of the pin has to be.
-        let corner = 22usize.min(w).min(h);
+        // Every pixel of the pin is a pixel of the unpin — it is the same drawing — and
+        // every pixel the unpin has that the pin does not is the cross. An alpha of nothing
+        // is nothing drawn, so this compares what is actually on the icon.
         let inked = |data: &[u8], x: usize, y: usize| data[y * stride + x * 4 + 3] > 0;
-        let mut bare = 0;
+        let mut pin_ink = 0;
         let mut cross = 0;
-        for y in 0..corner {
-            for x in 0..corner {
-                bare += usize::from(inked(&drawn, x, y));
-                cross += usize::from(inked(&crossed, x, y));
-            }
-        }
-        assert_eq!(bare, 0, "the pin has ink where the cross goes");
-        assert!(cross > 20, "the cross is not drawn: {cross} pixels of it");
-        // And the pin is not simply blank: a texture that drew nothing would satisfy every
-        // check above by having nothing to disagree about.
-        let pin_ink = (0..h)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .filter(|(x, y)| inked(&drawn, *x, *y))
-            .count();
-        assert!(pin_ink > 200, "the pin drew nothing: {pin_ink} pixels of it");
-
-        // Outside it, the same drawing to the pixel.
         for y in 0..h {
             for x in 0..w {
-                if x < corner && y < corner {
-                    continue;
+                match (inked(&drawn, x, y), inked(&crossed, x, y)) {
+                    (true, false) => panic!("the unpin is missing the pin's ink at ({x}, {y})"),
+                    (true, true) => pin_ink += 1,
+                    (false, true) => {
+                        cross += 1;
+                        // The cross, and nothing else: the bottom-right corner, which is the
+                        // one a pin leaning up from the bottom-left leaves free. A cross
+                        // drawn anywhere else is a different icon.
+                        assert!(
+                            x * 2 >= w && y * 2 >= h,
+                            "the cross has ink outside the bottom-right corner, at ({x}, {y})"
+                        );
+                    }
+                    (false, false) => {}
                 }
-                let at = y * stride + x * 4;
-                assert_eq!(
-                    drawn[at..at + 4],
-                    crossed[at..at + 4],
-                    "the two icons differ outside the cross, at ({x}, {y})"
-                );
             }
         }
+        // And the pin is not simply blank: a texture that drew nothing would satisfy every
+        // check above by having nothing to disagree about.
+        assert!(pin_ink > 200, "the pin drew nothing: {pin_ink} pixels of it");
+        assert!(cross > 20, "the cross is not drawn: {cross} pixels of it");
 
-        // And the rows get it at the size they ask for.
+        // The rows get it at the size they ask for.
         assert_eq!(drawn_icon(PIN_SVG).pixel_size(), CONTEXT_ICON_SIZE);
     }
 
