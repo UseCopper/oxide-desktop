@@ -75,6 +75,30 @@ pub(crate) fn undecorated_content_size(
     Decoration::of_is_ssd(is_ssd).undecorate(decorated)
 }
 
+/// How much of its work area a window takes when it is restored without a size
+/// to restore to — it was maximized before it was ever floating, or it opened
+/// that way. A windowed part of the screen, so unmaximizing gives a window
+/// rather than another full-screen one.
+const DEFAULT_FLOATING_FRACTION: f64 = 0.6;
+
+/// The content size for a window that has no remembered floating geometry to
+/// return to.
+///
+/// Without this there is no size at all, and the arithmetic that places a window
+/// being dragged out of maximize falls back to the window's own origin — which
+/// for a maximized window is the work area's top-left corner, wherever the
+/// pointer is. A window dragged out lands under the pointer instead.
+pub(crate) fn default_floating_content_size(
+    area: Rectangle<i32, Logical>,
+    is_ssd: bool,
+) -> Size<i32, Logical> {
+    let decorated = Size::from((
+        (area.size.w as f64 * DEFAULT_FLOATING_FRACTION).round() as i32,
+        (area.size.h as f64 * DEFAULT_FLOATING_FRACTION).round() as i32,
+    ));
+    undecorated_content_size(decorated, is_ssd)
+}
+
 /// Where to anchor a window being dragged out of the maximized state so the
 /// pointer keeps grabbing the same spot on the titlebar: the same horizontal
 /// fraction of the width, and the same vertical offset from the top.
@@ -695,13 +719,32 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Take the restore first: the `decoration_state()` borrow must end
         // before `restore_target` reads the decoration kind again.
         let restore = window.decoration_state().take_maximize_restore();
-        let target = restore.and_then(|restore| super::restore_target(&self.space, &window, restore));
+        let target = restore
+            .and_then(|restore| super::restore_target(&self.space, &window, restore))
+            .or_else(|| {
+                // Nothing was recorded to restore to — the window was maximized
+                // before it was ever floating. Clearing the state alone would
+                // leave a full-screen window under a window's titlebar, so it
+                // gets a windowed size in the middle of its work area instead.
+                let area = super::output_for_window(&self.space, &window)
+                    .and_then(|output| super::output_work_area(&self.space, &output))?;
+                let content = default_floating_content_size(area, window.is_ssd());
+                let size = decorated_content_size(content, window.is_ssd());
+                Some(RestoreTarget {
+                    loc: (area.loc
+                        + Point::from((
+                            (area.size.w - size.w) / 2,
+                            (area.size.h - size.h) / 2,
+                        ))),
+                    content: Some(content),
+                })
+            });
 
         match target {
             // `restore_window` sends the configure that answers the request.
             Some(target) => self.restore_window(&window, target),
             None => {
-                // No floating geometry recorded; still answer the request by
+                // No output to restore onto, either. Answer the request by
                 // clearing the maximized state.
                 surface.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Maximized);
@@ -912,15 +955,29 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().take_maximize_restore();
+            // The size the window is going back to. A window that was maximized
+            // before it was ever floating — it opened that way, or it is a
+            // session restore — has nothing recorded, and with no size the
+            // arithmetic below keeps the window at its own origin: the work
+            // area's top-left corner, wherever the pointer happens to be. A
+            // windowed part of the work area is the answer when there is nothing
+            // better.
+            let area = super::output_for_window(&self.space, &window)
+                .and_then(|output| super::output_work_area(&self.space, &output));
+            let intended = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, content)| content)
+                .or_else(|| area.map(|area| default_floating_content_size(area, window.is_ssd())));
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
             // captured against the current (maximized) frame and reapplied to
-            // whatever size the client commits.
+            // whatever size the client commits — but the *first* frame is placed
+            // as though the client had already picked, or the window sits in the
+            // corner it was maximized into until a commit and a motion have gone
+            // by.
             if window.is_ssd() {
-                restore_size = restore
-                    .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
-                    .map(|(_, size)| size);
+                restore_size = intended;
                 initial_window_location = restore_drag_location(
                     initial_window_location,
                     decorated_size,
@@ -929,12 +986,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     true,
                 );
             } else {
+                let expected = intended
+                    .map(|content| decorated_content_size(content, false))
+                    .unwrap_or(decorated_size);
                 let captured = DragAnchor::capture(
                     initial_window_location,
                     decorated_size,
                     start_data.location,
                 );
-                initial_window_location = captured.locate(start_data.location, decorated_size);
+                initial_window_location = captured.locate(start_data.location, expected);
                 anchor = Some(captured);
                 client_unmaximize = true;
             }
@@ -1020,15 +1080,29 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|geo| geo.size)
                 .unwrap_or_default();
             let restore = window.decoration_state().take_maximize_restore();
+            // The size the window is going back to. A window that was maximized
+            // before it was ever floating — it opened that way, or it is a
+            // session restore — has nothing recorded, and with no size the
+            // arithmetic below keeps the window at its own origin: the work
+            // area's top-left corner, wherever the pointer happens to be. A
+            // windowed part of the work area is the answer when there is nothing
+            // better.
+            let area = super::output_for_window(&self.space, &window)
+                .and_then(|output| super::output_work_area(&self.space, &output));
+            let intended = restore
+                .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
+                .map(|(_, content)| content)
+                .or_else(|| area.map(|area| default_floating_content_size(area, window.is_ssd())));
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
             // captured against the current (maximized) frame and reapplied to
-            // whatever size the client commits.
+            // whatever size the client commits — but the *first* frame is placed
+            // as though the client had already picked, or the window sits in the
+            // corner it was maximized into until a commit and a motion have gone
+            // by.
             if window.is_ssd() {
-                restore_size = restore
-                    .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
-                    .map(|(_, size)| size);
+                restore_size = intended;
                 initial_window_location = restore_drag_location(
                     initial_window_location,
                     decorated_size,
@@ -1037,12 +1111,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     true,
                 );
             } else {
+                let expected = intended
+                    .map(|content| decorated_content_size(content, false))
+                    .unwrap_or(decorated_size);
                 let captured = DragAnchor::capture(
                     initial_window_location,
                     decorated_size,
                     start_data.location,
                 );
-                initial_window_location = captured.locate(start_data.location, decorated_size);
+                initial_window_location = captured.locate(start_data.location, expected);
                 anchor = Some(captured);
                 client_unmaximize = true;
             }
@@ -1284,6 +1361,46 @@ mod tests {
             centered_in(offset, Size::from((1400, 900))),
             Point::from((100, 50))
         );
+    }
+
+    #[test]
+    fn dragging_out_of_maximize_lands_under_the_pointer() {
+        // The work-area corner the maximized window sits at, a pointer that
+        // grabbed the titlebar a third of the way along, and the floating size
+        // the window is going back to.
+        let at_corner = Point::from((0, 0));
+        let maximized = Size::from((1920, 1100));
+        let grab = Point::from((600.0, 15.0));
+        let floating = Some(Size::from((1150, 640)));
+
+        let restored = restore_drag_location(at_corner, maximized, grab, floating, true);
+        assert_ne!(
+            restored,
+            at_corner,
+            "the window was dragged out and stayed in the corner"
+        );
+        // The pointer keeps its place on the titlebar: the same fraction along
+        // (600/1920), and the same distance down.
+        let decorated_w = f64::from(1150 + 2 * 2);
+        assert!((grab.x - (restored.x as f64 + (600.0 / 1920.0) * decorated_w)).abs() < 1.0);
+        assert!((grab.y - restored.y as f64).abs() < 16.0, "the titlebar left the pointer");
+
+        // Which is exactly what does not happen when there is no size to restore
+        // to: the fraction cancels the window's own width and the answer is the
+        // window's own origin — the corner — however far along the pointer was.
+        assert_eq!(
+            restore_drag_location(at_corner, maximized, grab, None, true),
+            at_corner,
+            "the degenerate case this default exists to avoid"
+        );
+
+        // So a window with nothing recorded is given one, and that places it.
+        let area = Rectangle::new(at_corner, Size::from((1920, 1080)));
+        let default = default_floating_content_size(area, true);
+        assert!(default.w < 1920 && default.h < 1080, "the default is not windowed");
+        let placed = restore_drag_location(at_corner, maximized, grab, Some(default), true);
+        assert_ne!(placed, at_corner, "the default did not place the window");
+        assert!(placed.x > 0 && placed.x < 1920 - default.w, "it landed off the screen");
     }
 
     #[test]

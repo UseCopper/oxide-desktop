@@ -1693,6 +1693,22 @@ mod tests {
     }
 
     #[test]
+    fn the_corners_a_button_sits_in_are_the_corners_you_resize_from() {
+        // The close button occupies the window's top-right corner, and so does
+        // the corner you resize the window from: that overlap is why a pointer
+        // on the frame must not be handed to the header bar as a hover.
+        let size = Size::from((800, 600));
+        let corner = Point::from((799.0, 1.0));
+        let edge = resize_edge_band(corner, size).expect("the top-right corner is a resize");
+        assert!(edge.intersects(ResizeEdge::TOP) && edge.intersects(ResizeEdge::RIGHT));
+
+        // And the button's own middle is not, so hovering a button still works
+        // everywhere the frame is not.
+        let button_middle = Point::from((785.0, HEADER_BAR_HEIGHT as f64 / 2.0));
+        assert!(resize_edge_band(button_middle, size).is_none());
+    }
+
+    #[test]
     fn drag_anchor_adapts_to_committed_size() {
         // Grabbing the titlebar at 1/4 of a 1000px-wide maximized window, 15px
         // down from the top.
