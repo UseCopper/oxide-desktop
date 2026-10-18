@@ -4137,6 +4137,8 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // Squares are this wide in every calculation the drag does, so the theme may
     // not be able to out-minimum the code's own arithmetic.
     let square = SQUARE_SIZE;
+    let panel_height = PANEL_HEIGHT;
+    let bar_slide = BAR_SLIDE.as_millis() as i32;
     // How full a square looks, by how much of its app is on screen — see the
     // `running` and `minimized` rules below. Numbers rather than literals in the
     // sheet, so the ladder can be asserted instead of eyeballed.
@@ -4166,6 +4168,19 @@ window.panel-window {{
 .panel {{
     background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
     padding: 0 10px;
+    /* The bar slides in by *moving*: the whole row, its own fill included, is
+       translated up a bar's height and then released to nothing, and the
+       surface clips what hangs outside it. A transition on `transform` is the
+       only way to move a widget in GTK without also resizing it — a margin
+       stretches the box, and a revealer compensates for its own slide by
+       growing the child, which leaves a fill that covers the surface from the
+       first frame while only the contents move. */
+    transform: translate(0, 0);
+    transition: transform {bar_slide}ms ease-out;
+}}
+/* Where the bar starts: a bar-height above its own top edge. */
+.panel.dropping {{
+    transform: translate(0, -{panel_height}px);
 }}
 .panel label {{
     color: #e8e8e8;
@@ -4290,7 +4305,6 @@ button.context-row:hover {{
 button.context-row label {{
     color: #e8e8e8;
     background: transparent;
-}}
 }}
 "
     )
@@ -4563,46 +4577,17 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     start_polling(&tasks, &menu, &channel, hover, &context);
 
     bar.present();
-    // And then it slides in from above the top edge. The bar is a layer surface
-    // anchored to that edge, so its own margin is the only thing that moves it —
-    // a negative one puts it off the screen, and the compositor clips what is
-    // outside the output. The margin is a protocol margin, which is signed, so
-    // this is the same mechanism the menus slide with, in reverse.
-    drop_in(&bar);
+    // And then it slides down into place. A frame first, so the bar has been
+    // drawn where it starts: a transition needs a state to move from, and one
+    // that is never shown is not a state.
+    let row = bar_row.clone();
+    glib::timeout_add_local_once(Duration::from_millis(16), move || {
+        row.remove_css_class("dropping");
+    });
 }
 
 /// How long the bar takes to slide down into place.
-const BAR_SLIDE: Duration = Duration::from_millis(400);
-
-/// Slide a freshly presented bar in from above the top edge on an ease-out.
-///
-/// The bar is placed above the screen and eases down to its resting margin, so
-/// the panel arrives rather than blinking on. The exclusive zone is set
-/// explicitly by the bar itself, so the space it reserves is claimed from the
-/// first frame: windows do not start under it and then move.
-fn drop_in(bar: &ApplicationWindow) {
-    let from = -PANEL_HEIGHT;
-    let start = glib::monotonic_time();
-    bar.set_margin(Edge::Top, from);
-    glib::timeout_add_local(Duration::from_millis(16), glib::clone!(
-        #[weak]
-        bar,
-        #[upgrade_or]
-        glib::ControlFlow::Break,
-        move || {
-            let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
-            let t = (elapsed / BAR_SLIDE.as_secs_f64()).clamp(0.0, 1.0);
-            bar.set_margin(Edge::Top, ease_margin(from, 0, ease_out(t)));
-            if t < 1.0 {
-                return glib::ControlFlow::Continue;
-            }
-            // Land exactly on the resting margin, so no rounding residue is
-            // left to show up as a hairline above the bar.
-            bar.set_margin(Edge::Top, 0);
-            glib::ControlFlow::Break
-        }
-    ));
-}
+const BAR_SLIDE: Duration = Duration::from_millis(250);
 
 /// The bar: a fixed-height strip across the top of the output.
 ///
@@ -4671,6 +4656,11 @@ fn build_bar_window(app: &Application, monitor: &gdk::Monitor) -> (ApplicationWi
     // the button sees it. That is why nothing in the bar could be pressed: not a broken
     // drag, a layer that was always there, doing nothing, eating every click.
     OVERLAY.with(|cell| *cell.borrow_mut() = Some(overlay.clone()));
+
+    // Where the bar starts when it slides in: a bar-height above itself, which
+    // the surface clips. Removed a frame after the window is presented, and the
+    // transition in the stylesheet carries it down.
+    row.add_css_class("dropping");
 
     window.set_child(Some(&overlay));
     (window, row, tasks)
@@ -8250,6 +8240,41 @@ mod tests {
         assert_eq!(gap_at(&middles, 150.0), 3, "past slot 3's middle: trade with it");
     }
 
+    /// Everything GLib logged while `body` ran, complaints only.
+    ///
+    /// GTK's CSS engine reports a property it does not know by logging and
+    /// dropping it, so a stylesheet that is half-understood looks fine in the
+    /// file and does nothing on screen. The one way to know is to load it and
+    /// read what it said.
+    fn gtk_complaints(body: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Mutex, Once};
+        static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static ONCE: Once = Once::new();
+
+        ONCE.call_once(|| unsafe {
+            glib::log_set_writer_func(|level, fields| {
+                let line = fields
+                    .iter()
+                    .map(|field| format!("{}={}", field.key(), field.value_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let flag = if matches!(
+                    level,
+                    glib::LogLevel::Critical | glib::LogLevel::Warning | glib::LogLevel::Error
+                ) {
+                    "COMPLAINT"
+                } else {
+                    "info"
+                };
+                LOG.lock().unwrap().push(format!("{flag}: {line}"));
+                glib::LogWriterOutput::Handled
+            });
+        });
+        LOG.lock().unwrap().clear();
+        body();
+        std::mem::take(&mut *LOG.lock().unwrap())
+    }
+
     /// The widget behaviour, tested against a real GTK on the main thread.
     ///
     /// GTK owns one thread per process, so every display-backed check lives in
@@ -8271,6 +8296,7 @@ mod tests {
         a_traded_square_slides_home_across_the_overlay();
         a_live_row_trades_neighbours_as_the_pointer_crosses_them();
         a_row_local_read_is_short_of_the_layer_frame();
+        a_sliding_bar_keeps_its_shape();
     }
 
     /// Section of `the_widget_suite_dances_in_one_process`.
@@ -8868,7 +8894,75 @@ mod tests {
         window.close();
     }
 
-        #[test]
+        /// Section of `the_widget_suite_dances_in_one_process`.
+    ///
+    /// The bar slides in by being translated: the row is placed a bar-height
+    /// above itself and released, and the transition on `transform` in the
+    /// stylesheet carries it down — the one way GTK moves a widget without also
+    /// resizing it. Everything about that lives in CSS, so what a test can hold
+    /// is that the stylesheet is one the CSS parser accepts: a property it does
+    /// not know is dropped with a warning, and the bar would simply never move.
+    fn a_sliding_bar_keeps_its_shape() {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        let sheet = style_sheet((80, 160, 240));
+        assert!(sheet.contains("transition: transform"), "no transform transition");
+        assert!(sheet.contains("transform: translate(0, -40px)"), "no off-screen start");
+        // The parser is the thing that decides, and it says so through the log.
+        let complaints = gtk_complaints(|| {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_data(&sheet);
+        });
+        for complaint in &complaints {
+            assert!(
+                !complaint.contains("Theme parser error") && !complaint.contains("not a valid property"),
+                "the stylesheet was refused in part: {complaint}"
+            );
+        }
+        // And the row itself: with the class on, CSS moves it — which also says
+        // the property is one this GTK applies, not just one it parses.
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.add_css_class("panel");
+        row.set_size_request(-1, PANEL_HEIGHT);
+        row.add_css_class("dropping");
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&row));
+        let window = gtk4::Window::new();
+        window.set_child(Some(&overlay));
+        window.present();
+        let settle = || {
+            overlay.allocate(320, PANEL_HEIGHT, -1, None);
+            for _ in 0..100 {
+                glib::MainContext::default().iteration(false);
+            }
+        };
+        settle();
+        let offset = || row.translate_coordinates(&overlay, 0.0, 0.0).map(|at| at.1);
+        if offset() != Some(0.0) && offset().is_none() {
+            // Nothing was laid out (no display): the harness proves nothing.
+            window.close();
+            return;
+        }
+        assert_eq!(
+            offset(),
+            Some(-40.0),
+            "the dropping class did not move the bar: the transform was dropped"
+        );
+
+        // Released, it travels back to nothing. The transition runs on the frame
+        // clock, which a harness without a compositor may never tick; when it
+        // does, the bar comes to rest exactly on its edge.
+        row.remove_css_class("dropping");
+        let start = std::time::Instant::now();
+        while offset() != Some(0.0) && start.elapsed() < Duration::from_secs(2) {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        window.close();
+    }
+
+    #[test]
     fn a_moving_menu_slides_from_where_it_was_to_where_it_is_going() {
         // A move eases the left margin, which `animate_surface` cannot do because an
         // open and a close have nowhere to slide to.
@@ -8970,3 +9064,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
