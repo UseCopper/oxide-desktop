@@ -736,9 +736,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 // The dragged window's own min is already applied to its size.
                 continue;
             }
-            let (min_size, _) = self::grabs::toplevel_min_max_size(member);
-            let is_ssd = member.is_ssd();
-            let deco = if is_ssd {
+            // The client's minimum and, for an SSD window, the chrome's: a cell has to fit
+            // a window, and a window is never smaller than its own titlebar.
+            let min_size = self::grabs::minimum_content_size(member);
+            let deco = if member.is_ssd() {
                 self::xdg::decorated_content_size(Size::from((0, 0)), true)
             } else {
                 Size::from((0, 0))

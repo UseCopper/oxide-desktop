@@ -718,6 +718,34 @@ pub fn toplevel_min_max_size(window: &WindowElement) -> (Size<i32, Logical>, Siz
     }
 }
 
+/// The smallest content size a window may be configured to.
+///
+/// A client's own minimum is about its content — a terminal counts rows and columns — and
+/// says nothing about the frame around it. An SSD window configured under the chrome's own
+/// minimum loses the end of its titlebar: the buttons run off it, and the title has nothing
+/// left to be cut down into. So the two minimums are taken together and whichever is larger
+/// wins.
+pub fn minimum_content_size(window: &WindowElement) -> Size<i32, Logical> {
+    minimum_for(toplevel_min_max_size(window).0, window.is_ssd())
+}
+
+/// The same rule without a window to read it from: the client's own minimum, and the
+/// chrome's if the window is server-decorated.
+///
+/// The chrome's is in content terms, because the borders and the titlebar are drawn outside
+/// the content: three buttons across the titlebar, and the titlebar's own height down, is
+/// what the content has to leave room for.
+fn minimum_for(client: Size<i32, Logical>, is_ssd: bool) -> Size<i32, Logical> {
+    if !is_ssd {
+        return client;
+    }
+    let chrome: Size<i32, Logical> = Size::from((
+        3 * crate::shell::ssd::BUTTON_WIDTH as i32,
+        crate::shell::ssd::HEADER_BAR_HEIGHT,
+    ));
+    Size::from((client.w.max(chrome.w), client.h.max(chrome.h)))
+}
+
 /// Shared interactive-resize state, driven from the pointer/touch/tablet grabs.
 ///
 /// The requested size (`last_window_size`) is computed from the pointer and is
@@ -791,7 +819,10 @@ impl ResizeGrabState {
             height = (self.initial_window_size.h as f64 + dy) as i32;
         }
 
-        let (min_size, max_size) = toplevel_min_max_size(&self.window);
+        // The client's minimum and, for an SSD window, the chrome's, which is what stops a
+        // resize dragging the titlebar's buttons off the end of it.
+        let (_, max_size) = toplevel_min_max_size(&self.window);
+        let min_size = minimum_content_size(&self.window);
         let min_width = min_size.w.max(1);
         let min_height = min_size.h.max(1);
         let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
@@ -1121,4 +1152,33 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
     }
 
     fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chrome() -> Size<i32, Logical> {
+        Size::from((
+            3 * crate::shell::ssd::BUTTON_WIDTH as i32,
+            crate::shell::ssd::HEADER_BAR_HEIGHT,
+        ))
+    }
+
+    #[test]
+    fn an_ssd_window_is_never_smaller_than_its_own_titlebar() {
+        // A client that asks for nothing still gets a titlebar its buttons fit in.
+        let nothing = Size::from((0, 0));
+        assert_eq!(minimum_for(nothing, true), chrome());
+        // A client-decorated window is its own business: there is no chrome to fit around.
+        assert_eq!(minimum_for(nothing, false), nothing);
+        // A client that wants more than the chrome needs keeps what it asked for.
+        let roomy = Size::from((500, 400));
+        assert_eq!(minimum_for(roomy, true), roomy);
+        assert_eq!(minimum_for(roomy, false), roomy);
+        // Per axis: a narrow window with room to spare vertically keeps its height, and
+        // gains only the width the buttons need.
+        let narrow = Size::from((10, 400));
+        assert_eq!(minimum_for(narrow, true), Size::from((chrome().w, 400)));
+    }
 }
