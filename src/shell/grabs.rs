@@ -107,6 +107,9 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
             if let Some(target) = self.snap_target.take() {
                 data.apply_snap(&self.window, &target);
             }
+            // The drop has had the place the drag picked the window up from;
+            // nobody is carrying it any more.
+            data.forget_pickup(&self.window);
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -207,6 +210,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        data.forget_pickup(&self.window);
     }
 }
 
@@ -251,6 +255,8 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         if let Some(target) = self.snap_target.take() {
             data.apply_snap(&self.window, &target);
         }
+        // See `PointerMoveSurfaceGrab::button`.
+        data.forget_pickup(&self.window);
         handle.up(data, event);
         handle.unset_grab(self, data);
     }
@@ -336,6 +342,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
     fn unset(&mut self, data: &mut AnvilState<BackendData>) {
         data.dragging_window = None;
         data.clear_snap_preview();
+        data.forget_pickup(&self.window);
     }
 }
 

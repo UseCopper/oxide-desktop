@@ -67,7 +67,7 @@ pub use self::grabs::*;
 pub use self::snap::*;
 
 use self::ssd::{
-    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, Snap, VisibilityState,
+    BORDER_WIDTH, CLOSE_TIMEOUT, HEADER_BAR_HEIGHT, RelativeGeometry, Restore, Snap, VisibilityState,
 };
 
 use self::xdg::{decorated_content_size, handle_toplevel_commit, undecorated_content_size};
@@ -372,6 +372,57 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
     }
 
+    /// Record where a window a drag is about to move belongs on the desktop.
+    ///
+    /// Called when a hand picks a window up, before anything moves it: a drag
+    /// carries the window under the pointer, so the place it is dropped in is
+    /// the hand's and not the window's. A tiling or a maximize that follows the
+    /// drag has to remember *this* place instead, or the window is put back
+    /// where it was dropped rather than where it came from.
+    ///
+    /// Recorded once, on the way in; the drag forgets it again when it ends.
+    pub fn remember_pickup(&self, window: &WindowElement) {
+        let state = window.decoration_state();
+        let restore = state.restore.clone();
+        let snap = state.snap.map(|snap| snap.floating);
+        // Released before reading the window's own geometry, which borrows the
+        // same state.
+        drop(state);
+        let picked = picked_up_geometry(restore.as_ref(), snap, relative_geometry_of(&self.space, window));
+        if let Some(picked) = picked {
+            window.decoration_state().pickup = Some(picked);
+        }
+    }
+
+    /// Record the place a drag is picking a window up from, when the drag knows
+    /// the place itself.
+    ///
+    /// For a window whose floating geometry the compositor records itself there
+    /// is nothing to pass: [`remember_pickup`](Self::remember_pickup) reads it.
+    /// An X11 window's is the window manager's, so the drag reads it out of the
+    /// old geometry saved when the window was maximized, and hands it here.
+    /// `size` is the window's decorated size, as recorded geometry is measured.
+    pub fn remember_pickup_from(
+        &self,
+        window: &WindowElement,
+        loc: Point<i32, Logical>,
+        size: Size<i32, Logical>,
+    ) {
+        let Some(area) =
+            output_for_window(&self.space, window).and_then(|output| output_work_area(&self.space, &output))
+        else {
+            return;
+        };
+        window.decoration_state().pickup = Some(RelativeGeometry::capture(loc, size, area));
+    }
+
+    /// Forget where a drag picked its window up. Called when the drag ends, so
+    /// that a later tiling or maximize of an untouched window — one nobody is
+    /// carrying — records where that window actually is.
+    pub fn forget_pickup(&self, window: &WindowElement) {
+        window.decoration_state().pickup = None;
+    }
+
     /// Aim an in-flight transition at where a drag wants the window.
     ///
     /// Returns whether there was one to aim, which is also the answer to "does
@@ -549,11 +600,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // Tile to exactly the rectangle the preview showed, so the two never
         // disagree on odd work-area sizes.
         let rect = grid.rect(target.zone, target.area);
-        // Read the already-recorded floating geometry first. `snap_floating`
-        // releases the state borrow before returning, so the fallback (which
-        // reads the window size and borrows the state again) is safe.
+        // Where the window came from: the place the hand picked it up, if a drag
+        // carried it here. A drag leaves the window under the pointer, so the
+        // geometry it is dropped in is the hand's, not the window's, and the
+        // place to put it back to is the one it was picked up from. An
+        // untouched window is tiled where it stands.
+        //
+        // `snap_floating` releases the state borrow before returning, so the
+        // fallback (which reads the window size and borrows the state again) is
+        // safe.
         let floating = window
-            .snap_floating()
+            .take_pickup()
+            .or_else(|| window.snap_floating())
             .or_else(|| relative_geometry_of_output(&self.space, &target.output, window));
         if let Some(floating) = floating {
             window.decoration_state().snap = Some(Snap {
@@ -587,7 +645,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let is_ssd = window.is_ssd();
         let rect = Rectangle::new(loc, decorated_content_size(content, is_ssd));
         self.configure_snapped(window, rect, false);
-        self.space.map_element(window.clone(), loc, true);
+        // Raised where it stands, not moved: the transition below carries the
+        // window out of the cell and a drag aims it from there. Moving it to
+        // `loc` first would leave the transition nothing to travel, and the
+        // window would jump out of the group with only its size following.
+        if let Some(current) = self.space.element_location(window) {
+            self.space.map_element(window.clone(), current, true);
+        }
         self.animate_window(window, content, loc);
     }
 
@@ -1252,6 +1316,27 @@ fn centered_in(area: Rectangle<i32, Logical>, size: Size<i32, Logical>) -> Point
     ))
 }
 
+/// The place to remember for a window a hand has just picked up.
+///
+/// Its own geometry while it floats. While it is tiled or maximized, the
+/// geometry it is about to be restored to: that is where picking it up actually
+/// takes it, so that is where the window belongs — and it is the size the window
+/// had before it got big, which the live geometry no longer knows.
+///
+/// Separated from the state it is read from so the choice can be asserted
+/// without a compositor.
+fn picked_up_geometry(
+    restore: Option<&Restore>,
+    snap: Option<RelativeGeometry>,
+    live: Option<RelativeGeometry>,
+) -> Option<RelativeGeometry> {
+    match restore {
+        Some(Restore::Maximize(rel)) => Some(*rel),
+        Some(Restore::Fullscreen { floating, .. }) => Some(*floating),
+        None => snap.or(live),
+    }
+}
+
 fn place_new_window(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
@@ -1344,3 +1429,44 @@ fn window_is_x11_surface(_window: &WindowElement, _surface: &WlSurface) -> bool 
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geometry(x: f64, y: f64) -> RelativeGeometry {
+        RelativeGeometry {
+            x,
+            y,
+            w: 0.5,
+            h: 0.5,
+        }
+    }
+
+    #[test]
+    fn a_window_that_floats_is_remembered_where_it_stands() {
+        let live = geometry(0.1, 0.1);
+        assert_eq!(picked_up_geometry(None, None, Some(live)), Some(live));
+    }
+
+    #[test]
+    fn a_tiled_window_is_remembered_where_it_will_restore_to() {
+        // The cell it is sitting in is not where picking it up puts it: the
+        // restore does, and that is the place a later tiling has to remember.
+        let floating = geometry(0.25, 0.25);
+        let live = geometry(0.0, 0.0);
+        assert_eq!(
+            picked_up_geometry(None, Some(floating), Some(live)),
+            Some(floating)
+        );
+    }
+
+    #[test]
+    fn a_maximized_window_is_remembered_where_it_will_unmaximize_to() {
+        let restored = geometry(0.3, 0.2);
+        let live = geometry(0.0, 0.0);
+        assert_eq!(
+            picked_up_geometry(Some(&Restore::Maximize(restored)), None, Some(live)),
+            Some(restored)
+        );
+    }
+}

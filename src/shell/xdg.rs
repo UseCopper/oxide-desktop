@@ -671,9 +671,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let already_maximized =
             surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
         if !already_maximized {
-            // Compute the geometry before touching the decoration state: it
-            // reads the window's size, which borrows the state again.
-            let restore = super::relative_geometry_of(&self.space, &window).map(Restore::Maximize);
+            // Where to come back to: the place the hand picked the window up,
+            // if a drag carried it here. A window dragged onto the top edge is
+            // under the pointer, and the pointer is not where the window
+            // belongs. Falls back to where the window stands now for a maximize
+            // nobody dragged it into (the titlebar button, the client itself).
+            let restore = window
+                .take_pickup()
+                .or_else(|| super::relative_geometry_of(&self.space, &window))
+                .map(Restore::Maximize);
             window.decoration_state().restore = restore;
         }
 
@@ -943,6 +949,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
+        // Where the hand is picking the window up from, before anything moves
+        // it: what a drop that tiles or maximizes the window must remember is
+        // this place, not wherever the drag carries it.
+        self.remember_pickup(&window);
+
         // If the surface is maximized, unmaximize it and keep the touch over
         // the same spot on the titlebar while the window restores.
         let mut restore_size = None;
@@ -1005,15 +1016,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             surface.send_configure();
         }
 
-        // The grab drives the position, so restore/unmaximize transitions only
-        // animate the window's size while it follows the finger.
+        // From here the drag owns the window: it aims the restore transition
+        // above rather than moving the window underneath it, so the window
+        // travels out of the corner it was maximized into and the hand takes it
+        // from there.
         self.dragging_window = Some(window.clone());
 
-        // A snapped window restores to its floating size as the drag starts.
+        // A snapped window restores to its floating size as the drag starts,
+        // which supersedes the unmaximize above: that one configured the client
+        // and started a transition of its own, and it is the size this window
+        // was recorded at that it restores to.
         if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
             initial_window_location = restored;
             anchor = None;
             client_unmaximize = false;
+            restore_size = None;
         }
 
         if client_unmaximize || restore_size.is_some() {
@@ -1067,6 +1084,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
 
         let mut initial_window_location = self.space.element_location(&window).unwrap();
+
+        // Where the hand is picking the window up from, before anything moves
+        // it: what a drop that tiles or maximizes the window must remember is
+        // this place, not wherever the drag carries it.
+        self.remember_pickup(&window);
 
         // If the surface is maximized, unmaximize it and keep the pointer over
         // the same spot on the titlebar while the window restores.
@@ -1130,15 +1152,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             surface.send_configure();
         }
 
-        // The grab drives the position, so restore/unmaximize transitions only
-        // animate the window's size while it follows the pointer.
+        // From here the drag owns the window: it aims the restore transition
+        // above rather than moving the window underneath it, so the window
+        // travels out of the corner it was maximized into and the hand takes it
+        // from there.
         self.dragging_window = Some(window.clone());
 
-        // A snapped window restores to its floating size as the drag starts.
+        // A snapped window restores to its floating size as the drag starts,
+        // which supersedes the unmaximize above: that one configured the client
+        // and started a transition of its own, and it is the size this window
+        // was recorded at that it restores to.
         if let Some(restored) = self.take_snap_restore_for_drag(&window, start_data.location) {
             initial_window_location = restored;
             anchor = None;
             client_unmaximize = false;
+            restore_size = None;
         }
 
         if client_unmaximize || restore_size.is_some() {

@@ -8232,7 +8232,7 @@ mod tests {
         static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
         static ONCE: Once = Once::new();
 
-        ONCE.call_once(|| unsafe {
+        ONCE.call_once(|| {
             glib::log_set_writer_func(|level, fields| {
                 let line = fields
                     .iter()
