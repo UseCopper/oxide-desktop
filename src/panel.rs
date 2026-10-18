@@ -1923,6 +1923,15 @@ fn menu_replace_current(menu: &Rc<Menu>) {
     menu_replace(menu, &every, &group, &menu.stream);
 }
 
+/// Whether the app a menu is open for is still on the bar.
+///
+/// `barred` is the apps the bar is showing, in its own order: one per app with
+/// windows, plus the pinned ones with none. An app the bar is not showing has left the
+/// panel, and a menu open on it has nothing left to be about.
+fn still_on_the_bar(key: &str, barred: &[&str]) -> bool {
+    barred.iter().any(|bar_key| *bar_key == key)
+}
+
 /// The windows belonging to one app, as the bar groups them.
 ///
 /// Shared with [`sync_bar`] so the two cannot disagree about what "this app's
@@ -2231,7 +2240,12 @@ fn menu_replace(
     // hover-off plays — with the cells still on screen. Animating each departure
     // first and closing an empty menu afterwards would take the content away before
     // the close had anything to fade; here the row stays intact for the whole fade.
-    if live.is_empty() && menu.shown.get() && menu.app.borrow().is_some() {
+    //
+    // Not only once the menu is up, either. A menu still waiting for its first
+    // preview has no cells to fade, but it is on its way in, and an app with no
+    // windows left has nothing to arrive with: left alone it came up as a bare strip
+    // of padding and stayed there until the pointer happened to leave it.
+    if live.is_empty() && menu.app.borrow().is_some() {
         menu_close(menu);
         return;
     }
@@ -3694,6 +3708,33 @@ fn sync_bar(
     let mut ordered: Vec<(String, Vec<&WindowInfo>)> = Vec::with_capacity(groups.len());
     for index in positions {
         ordered.push(groups[index].clone());
+    }
+
+    // An app that has gone off the panel takes its menus with it. A menu is anchored
+    // to a square, and an app with no square left has no menu to be showing: the
+    // previews are that app's windows, and the app menu is rows about it, hanging
+    // over the gap its square left behind. The previews reach this by their group
+    // going empty, with every snapshot; the app menu's rows are built once when it
+    // opens and its key is never looked at again, so nothing else would tell it.
+    //
+    // A pinned app is on the panel with or without windows — that is what pinning is
+    // for — so its menu stays, and its rows go on meaning something.
+    let barred: Vec<&str> = ordered.iter().map(|(key, _)| key.as_str()).collect();
+    if let Some(key) = context.app.borrow().clone()
+        && !still_on_the_bar(&key, &barred)
+    {
+        context_close(context);
+    }
+    // And the same for one queued behind a close: a right click on a second square
+    // while the first menu is still fading out opens a fade later, so its app can have
+    // gone in between.
+    let waiting_gone = context
+        .pending_open
+        .borrow()
+        .as_ref()
+        .is_some_and(|opening| !still_on_the_bar(&opening.key, &barred));
+    if waiting_gone {
+        *context.pending_open.borrow_mut() = None;
     }
 
     // An open preview menu is kept in step with every snapshot, *including* one
@@ -8993,6 +9034,23 @@ mod tests {
         assert_eq!(ease_margin(400, 100, 1.0), 100);
         // Landed exactly on the end, so no residue is left behind.
         assert_eq!(ease_margin(7, 7, 0.3), 7);
+    }
+
+    #[test]
+    fn an_app_menu_stays_while_its_square_does_and_goes_once_it_does_not() {
+        // The bar lists an app per set of windows, plus the pinned apps that have none,
+        // so a pinned app's square outlives its windows and an app menu open on it still
+        // has rows that mean something -- pin, launch.
+        let barred = ["firefox", "pinned-idle"];
+        assert!(still_on_the_bar("firefox", &barred));
+        assert!(
+            still_on_the_bar("pinned-idle", &barred),
+            "a pinned square stays after its last window closes"
+        );
+        assert!(
+            !still_on_the_bar("thunderbird", &barred),
+            "an app nobody pinned and nobody has open has left the panel"
+        );
     }
 
     #[test]
