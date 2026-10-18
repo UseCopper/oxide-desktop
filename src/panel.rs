@@ -8866,9 +8866,14 @@ mod tests {
             }
         }
         // And the pin is not simply blank: a texture that drew nothing would satisfy every
-        // check above by having nothing to disagree about.
-        assert!(pin_ink > 200, "the pin drew nothing: {pin_ink} pixels of it");
-        assert!(cross > 20, "the cross is not drawn: {cross} pixels of it");
+        // check above by having nothing to disagree about. As a share of the icon, because
+        // the share is what a pin is, whatever size the drawing happens to be rasterised at.
+        assert!(
+            pin_ink * 8 > w * h,
+            "the pin drew almost nothing: {pin_ink} of {} pixels",
+            w * h
+        );
+        assert!(cross >= 8, "the cross is not drawn: {cross} pixels of it");
 
         // The rows get it at the size they ask for.
         assert_eq!(drawn_icon(PIN_SVG).pixel_size(), CONTEXT_ICON_SIZE);

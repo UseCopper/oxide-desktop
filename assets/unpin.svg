@@ -1,13 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72">
-  <g fill="#e8e8e8"
-     transform="translate(-2 -2) rotate(45 36 36) translate(36 36) scale(0.95) translate(-36 -36)">
-    <circle cx="36" cy="15" r="8"/>
-    <rect x="33" y="21" width="6" height="12" rx="3"/>
-    <rect x="21" y="33" width="30" height="7" rx="3.5"/>
-    <path d="M33.5 40 L38.5 40 L36 66 Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    Google Material Symbols, "push_pin" (filled), with a cross in the corner the pin leaves
+    free.
+    Copyright Google LLC, licensed under the Apache License 2.0.
+    Changed: rotated 45 degrees so the point faces the bottom left, scaled to leave the
+    bottom-right corner free, recoloured for the panel, and a cross drawn in that corner.
+  -->
+  <g fill="#e8e8e8" transform="rotate(45 12 12) translate(12 12) scale(0.85) translate(-12 -12)">
+    <path d="m16 12 2 2v2h-5v6l-1 1-1-1v-6H6v-2l2-2V5H7V3h10v2h-1Z"/>
   </g>
-  <g stroke="#e8e8e8" stroke-width="5.5" stroke-linecap="butt">
-    <line x1="52" y1="52" x2="64" y2="64"/>
-    <line x1="64" y1="52" x2="52" y2="64"/>
+  <g stroke="#e8e8e8" stroke-width="1.4" stroke-linecap="butt">
+    <line x1="17.5" y1="17.5" x2="23" y2="23"/>
+    <line x1="23" y1="17.5" x2="17.5" y2="23"/>
   </g>
 </svg>
