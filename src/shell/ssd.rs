@@ -459,8 +459,7 @@ pub struct HeaderBar {
 pub struct Borders {
     /// Three strips, not four: the window's top edge is the titlebar itself,
     /// which is drawn at the chrome's own colour and transparency, so a strip
-    /// along it would be the same surface seen twice. These three are drawn at
-    /// [`FRAME_ALPHA`] instead, a step less see-through — see there for why.
+    /// along it would be the same surface seen twice.
 
     pub bottom: SolidColorBuffer,
     pub left: SolidColorBuffer,
@@ -471,11 +470,15 @@ pub struct Borders {
 
 /// How see-through a window's own chrome is — the titlebar and the frame alike.
 ///
-/// The panel's number, not a second one that happens to look close: the bar and
-/// the windows under it are the same surface in two places, and the title and
-/// the three buttons are drawn on the titlebar's fill, so only the fill is
-/// thinned.
-const CHROME_ALPHA: f32 = crate::panel::BAR_PANEL_ALPHA as f32;
+/// A step up from the bar's own transparency, and named once because it is one surface:
+/// the titlebar, the frame and a hovered button's patch all take this number, and the
+/// title and the three glyphs are drawn on top of it rather than thinned with it.
+///
+/// The bar is a strip at the edge of the screen, over the desktop; a window's chrome is a
+/// surface standing in the middle of the wallpaper, with the picture on all four sides of
+/// it. At the bar's own number it read as part of the desktop rather than as a window, so
+/// it carries a little more body than the bar it takes its colour from.
+const CHROME_ALPHA: f32 = 0.92;
 /// The chrome's own grey, taken from the panel's: a window's titlebar and frame
 /// are the same surface as the bar they line up with, down to the colour — not a
 /// second grey that happens to look close.
@@ -484,29 +487,16 @@ const CHROME_BASE: [f32; 3] = [
     crate::panel::BAR_PANEL.1 as f32 / 255.0,
     crate::panel::BAR_PANEL.2 as f32 / 255.0,
 ];
-/// The titlebar and the frame, at the panel's own colour and transparency. One
-/// colour whether or not the window is focused: a focused window used to be a
-/// step lighter, which made it a *different* surface from the bar it lines up
-/// with, and that is the one thing the chrome is not allowed to be.
+/// The titlebar and the frame, at the bar's own colour. One colour whether or not the
+/// window is focused: a focused window used to be a step lighter, which made it a
+/// *different* surface from the bar it lines up with, and that is the one thing the chrome
+/// is not allowed to be.
 const CHROME_COLOR: [f32; 4] = [CHROME_BASE[0], CHROME_BASE[1], CHROME_BASE[2], CHROME_ALPHA];
-
-/// The colour of the frame around a window: the chrome's grey, one step less see-through.
-fn frame_color() -> [f32; 4] {
-    [CHROME_BASE[0], CHROME_BASE[1], CHROME_BASE[2], FRAME_ALPHA]
-}
-/// How much body the frame around a window has — the three strips, not the titlebar.
-///
-/// A step up from [`CHROME_ALPHA`], which is the panel's own transparency. The titlebar
-/// is a surface that lines up with the bar and belongs to it, so it takes the bar's
-/// number; the frame is the *edge* of a window standing in the middle of the wallpaper,
-/// and at the bar's number a two-pixel line of it read as part of the desktop rather than
-/// as where the window stops. The same grey, with a little more behind it.
-const FRAME_ALPHA: f32 = 0.92;
 /// The glyphs, and how they read when the window is not the one in use. What
 /// says which window is focused is the writing on the titlebar now, since its
-/// fill is the panel's own colour either way — the title and the three glyphs
-/// come up to full strength for the window being used and sit back for the
-/// others, the way a dimmed title has always said it.
+/// fill does not move for focus — the title and the three glyphs come up to full
+/// strength for the window being used and sit back for the others, the way a
+/// dimmed title has always said it.
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 const ICON_COLOR_UNFOCUSED: [f32; 4] = [0.8, 0.8, 0.8, 0.55];
 const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
@@ -915,11 +905,11 @@ impl HeaderBar {
             }
         }
 
-        // One colour for the whole chrome, focused or not, and the frame a step less
-        // see-through than the titlebar: the titlebar is the bar's own surface, and the
-        // frame is the edge of a window in front of the wallpaper.
+        // One colour and one transparency for the whole chrome, focused or not: the
+        // titlebar and the three strips are the same surface, and a step between them
+        // would be a seam along the window's own edge.
         let bg = CHROME_COLOR;
-        let frame = frame_color();
+        let frame = bg;
 
         self.background
             .update((width as i32, HEADER_BAR_HEIGHT), bg);
@@ -1715,13 +1705,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_chrome_is_as_transparent_as_the_panel() {
-        // Not "close to" the panel's transparency: the panel's number. The bar
-        // and the windows under it are the same surface in two places, and this
-        // is the one place that could drift from it without anything noticing.
-        assert_eq!(CHROME_ALPHA, crate::panel::BAR_PANEL_ALPHA as f32);
+    fn the_chrome_is_the_bars_grey_a_step_more_solid_than_its_fill() {
+        // The colour is the bar's, exactly: a window's chrome and the bar are one surface
+        // in two places, and this is the one place that could drift from it without
+        // anything noticing.
+        //
+        // The transparency is not. The bar is a strip at the edge of the screen; the chrome
+        // is a surface in the middle of the wallpaper, and at the bar's own number it read
+        // as part of the desktop rather than as a window.
+        let bar_alpha = crate::panel::BAR_PANEL_ALPHA as f32;
         assert!(
-            (0.5..1.0).contains(&CHROME_ALPHA),
+            CHROME_ALPHA > bar_alpha,
+            "{CHROME_ALPHA} is no more solid than the bar's {bar_alpha}"
+        );
+        assert!(
+            (0.5..=1.0).contains(&CHROME_ALPHA),
             "{CHROME_ALPHA} is not a transparency, it is a fog"
         );
         // The grey is the panel's too, not merely a transparency that matches:
@@ -1750,26 +1748,6 @@ mod tests {
             "the title changed colour as well as strength"
         );
         assert_eq!(&ICON_COLOR_UNFOCUSED[..3], &ICON_COLOR[..3]);
-    }
-
-    #[test]
-    fn the_frame_stands_a_step_more_solid_than_the_bar_it_outlines() {
-        // The frame is not the panel's transparency: it is the edge of a window standing
-        // in the middle of the wallpaper, and the bar's own number is thin enough to read
-        // as desktop rather than as where the window stops.
-        assert!(
-            FRAME_ALPHA > CHROME_ALPHA,
-            "the frame is no more solid than the titlebar it continues"
-        );
-        assert!(
-            FRAME_ALPHA <= 1.0,
-            "{FRAME_ALPHA} is more than opaque, which is not a thing"
-        );
-        // The same grey, though: only the transparency moves, so the frame and the
-        // titlebar it continues are the same surface.
-        let frame = frame_color();
-        assert_eq!(&frame[..3], &CHROME_COLOR[..3], "the frame changed colour");
-        assert_eq!(frame[3], FRAME_ALPHA);
     }
 
     #[test]
