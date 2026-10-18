@@ -263,6 +263,13 @@ const TASK_MINIMIZED_ALPHA: f64 = 0.03;
 /// The white a square shows under the pointer. Above both rest states, so a
 /// hover is always a change, whatever the square was showing.
 const TASK_HOVER_ALPHA: f64 = 0.10;
+/// The white a square shows while it is being dragged. The lightest of the
+/// whites: a square in hand is the one thing on the bar worth looking at.
+const TASK_CARRYING_ALPHA: f64 = 0.18;
+/// The accent's strength behind a focused app's square. Tinted rather than
+/// white, so it is not comparable with the others — it simply wins over the
+/// pointer, and loses to a hand.
+const TASK_FOCUSED_ALPHA: f64 = 0.28;
 /// How far below its resting place the menu starts, so it slides out from the bar
 /// as it fades up.
 const MENU_SLIDE: i32 = 10;
@@ -4145,6 +4152,8 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     let task_running = TASK_RUNNING_ALPHA;
     let task_minimized = TASK_MINIMIZED_ALPHA;
     let task_hover = TASK_HOVER_ALPHA;
+    let task_carrying = TASK_CARRYING_ALPHA;
+    let task_focused = TASK_FOCUSED_ALPHA;
     // The app menu's body is the preview menu's cell fill, read off the same
     // constant the cairo drawing reads, so the two engines agree by
     // construction rather than by two careful copies of the same hexes. The
@@ -4215,11 +4224,28 @@ button.task.ghost {{
     border-color: transparent;
     background: none;
 }}
+/* A square's fill, as one ladder in one place, from the quietest to the one
+   that wins: an app with nothing open is not filled at all; a minimized one is
+   a whisper; a running one is a step above the bar; the pointer's square is
+   lighter again; a focused app keeps its accent under the pointer; and the
+   square actually in hand is lightest of all, whatever else it is.
+
+   The order is the rule, not just tidiness: these all have the same weight, so
+   the later one wins when a square is several of them at once. Written in
+   precedence order, the most telling thing about a square is what shows — and
+   a square being dragged looks the same whether the app behind it is focused
+   or not, which it did not when the accent came last. */
+button.task.minimized {{
+    background-color: rgba(255, 255, 255, {task_minimized});
+}}
 button.task.running {{
     background-color: rgba(255, 255, 255, {task_running});
 }}
 button.task:hover {{
     background-color: rgba(255, 255, 255, {task_hover});
+}}
+button.task.focused {{
+    background-color: rgba({r}, {g}, {b}, {task_focused});
 }}
 /* A square being carried. It has left the row and is in a layer over it, so it needs no
  * transition to stay under the pointer and nothing to lift it: the layer is above.
@@ -4229,23 +4255,7 @@ button.task:hover {{
  * negative width, which GTK refuses, and GTK's CSS has no z-index at all — the property
  * it warned about on startup. */
 button.task.carrying {{
-    background-color: rgba(255, 255, 255, 0.18);
-}}
-/* An app whose windows are all minimized: still there, not on screen. One step
-   below a running square's fill, so the ladder reads as how much of the app is
-   visible — and a pinned app with nothing open has no fill at all. */
-button.task.minimized {{
-    background-color: rgba(255, 255, 255, {task_minimized});
-}}
-/* A hovered square shows the panel's hover, whatever its rest state is: at
-   equal specificity the later rule wins, so without this a hovered square
-   would keep its running or minimized fill. A focused square keeps its accent
-   under the pointer and wins here anyway, by being later. */
-button.task:hover {{
-    background-color: rgba(255, 255, 255, {task_hover});
-}}
-button.task.focused {{
-    background-color: rgba({r}, {g}, {b}, 0.28);
+    background-color: rgba(255, 255, 255, {task_carrying});
 }}
 /* The app menu, opened by a right click. Widgets, so it is styled here --
    styled out of the thumbnail menu's own palette, with the body at the
@@ -8999,15 +9009,41 @@ mod tests {
             TASK_HOVER_ALPHA > TASK_RUNNING_ALPHA,
             "hovering must brighten the full square too"
         );
-        // And the sheet carries them: the classes are only useful if the numbers
-        // reach the stylesheet that draws them.
+        // And the sheet carries them in one order: the classes are only useful
+        // if the numbers reach the stylesheet, and the rules are only
+        // predictable if the later one is the one that wins. Same weight, so the
+        // order *is* the precedence — quietest first, in hand last.
         let sheet = style_sheet((80, 160, 240));
-        assert!(sheet.contains("button.task.running {"), "no running rule");
-        assert!(sheet.contains("button.task.minimized {"), "no minimized rule");
-        assert!(
-            sheet.contains(&format!("0.18")),
-            "the carrying fill should still be the brightest rest"
+        let at = |rule: &str| {
+            sheet
+                .find(rule)
+                .unwrap_or_else(|| panic!("missing from the sheet: {rule}"))
+        };
+        let ladder = [
+            "button.task.minimized {",
+            "button.task.running {",
+            "button.task:hover {",
+            "button.task.focused {",
+            "button.task.carrying {",
+        ];
+        for pair in ladder.windows(2) {
+            assert!(
+                at(pair[0]) < at(pair[1]),
+                "{} has to come before {}: the later rule wins",
+                pair[1],
+                pair[0]
+            );
+        }
+        assert_eq!(
+            sheet.matches("button.task:hover {").count(),
+            1,
+            "the hover rule is written twice; which one wins is then a guess"
         );
+        // A dragged square looks the same whatever the app behind it is doing:
+        // carrying has to beat the accent.
+        assert!(at("button.task.carrying {") > at("button.task.focused {"));
+        assert!(TASK_CARRYING_ALPHA > TASK_HOVER_ALPHA);
+        assert!(TASK_FOCUSED_ALPHA > TASK_HOVER_ALPHA);
     }
 
     #[test]
