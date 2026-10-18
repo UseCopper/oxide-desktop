@@ -455,6 +455,14 @@ pub struct Borders {
 
 const BG_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 1.0];
 const BG_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0];
+/// The frame around a window's client area: the same colour as the titlebar it
+/// continues, with a little of the desktop showing through. "Slightly" — enough
+/// that the edge reads as sitting *over* what is behind the window rather than
+/// as a strip of its own, and not so much that it stops reading as the window's
+/// edge. The titlebar itself stays solid, since the title and the buttons are
+/// written on it.
+const BORDER_COLOR: [f32; 4] = [33.0 / 255.0, 33.0 / 255.0, 33.0 / 255.0, 0.85];
+const BORDER_COLOR_FOCUSED: [f32; 4] = [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 0.85];
 const ICON_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 const TITLE_COLOR: [f32; 4] = [0.85, 0.85, 0.87, 1.0];
 const BUTTON_HOVER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
@@ -851,6 +859,11 @@ impl HeaderBar {
         }
 
         let bg = if focused { BG_COLOR_FOCUSED } else { BG_COLOR };
+        let frame = if focused {
+            BORDER_COLOR_FOCUSED
+        } else {
+            BORDER_COLOR
+        };
 
         self.background
             .update((width as i32, HEADER_BAR_HEIGHT), bg);
@@ -861,9 +874,9 @@ impl HeaderBar {
         self.borders.height = content_height;
         let ring_w = (content_width + 2 * BORDER_WIDTH as u32) as i32;
         let ring_h = content_height as i32;
-        self.borders.bottom.update((ring_w, BORDER_WIDTH), bg);
-        self.borders.left.update((BORDER_WIDTH, ring_h), bg);
-        self.borders.right.update((BORDER_WIDTH, ring_h), bg);
+        self.borders.bottom.update((ring_w, BORDER_WIDTH), frame);
+        self.borders.left.update((BORDER_WIDTH, ring_h), frame);
+        self.borders.right.update((BORDER_WIDTH, ring_h), frame);
 
         let mut needs_redraw_buttons = false;
         if width != self.width {
@@ -1592,6 +1605,31 @@ impl<B: Backend> AnvilState<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_is_slightly_transparent_and_the_titlebar_is_not() {
+        // The frame is the same colour as the titlebar, thinned: the desktop
+        // shows a little through the edge of a window. The titlebar keeps its
+        // fill, because the title and the three buttons are written on it.
+        for (frame, bar, focused) in [
+            (BORDER_COLOR, BG_COLOR, false),
+            (BORDER_COLOR_FOCUSED, BG_COLOR_FOCUSED, true),
+        ] {
+            assert_eq!(
+                &frame[..3],
+                &bar[..3],
+                "the frame and the titlebar drifted apart ({focused})"
+            );
+            assert_eq!(bar[3], 1.0, "the titlebar has to be solid");
+            assert!(
+                (0.75..1.0).contains(&frame[3]),
+                "the frame is {} opaque — that is not *slightly* transparent ({focused})",
+                frame[3]
+            );
+        }
+        // And they differ by focus, so a window still says which it is.
+        assert_ne!(BORDER_COLOR[0], BORDER_COLOR_FOCUSED[0]);
+    }
 
     #[test]
     fn drag_anchor_adapts_to_committed_size() {
