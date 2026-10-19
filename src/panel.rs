@@ -15,7 +15,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gtk4::{gdk, gio, glib, prelude::*};
@@ -747,6 +747,9 @@ struct Menu {
     pointer: Cell<Option<(f64, f64)>>,
     /// Whether the menu is on screen.
     shown: Cell<bool>,
+    /// When it last arrived, so a right click can let the arrival finish rather than cutting
+    /// it off and reversing it. Cleared when it leaves, so the next one starts fresh.
+    revealed_at: Cell<Option<Instant>>,
     /// Bumped by every reveal or hide, so an animation that has been superseded
     /// steps aside instead of acting on a menu that has since changed.
     animation: Cell<u64>,
@@ -962,6 +965,7 @@ fn build_menu(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<
         layout: RefCell::new(MenuLayout::default()),
         pointer: Cell::new(None),
         shown: Cell::new(false),
+        revealed_at: Cell::new(None),
         animation: Cell::new(0),
         morphing: Cell::new(false),
         switch: Cell::new(Switch::Idle),
@@ -2169,6 +2173,8 @@ fn menu_open(
     menu.icon_center.set(icon_center);
     menu.bar_width.set(bar_width);
     menu.app.replace(Some(key.to_string()));
+    // A fresh menu has not arrived yet, whatever the last one did.
+    menu.revealed_at.set(None);
     // Not held at the width of whatever was leaving: this is a new app's menu.
     menu.hold.set(false);
     // The whole snapshot, not just this app's windows. With an empty list every
@@ -2203,6 +2209,7 @@ fn menu_reveal(menu: &Rc<Menu>, force: bool) {
     // highlight was still there with the pointer somewhere else entirely.
     menu.pointer.set(None);
     menu.shown.set(true);
+    menu.revealed_at.set(Some(Instant::now()));
     sync_tooltips_from(&menu);
     animate_menu(menu, true, left);
     // Never a motion on the way in. Every window on show was open before the click,
@@ -2609,6 +2616,8 @@ fn menu_close(menu: &Rc<Menu>) {
         return;
     }
     menu.app.replace(None);
+    // It is no longer on screen, so there is no arrival left to let finish.
+    menu.revealed_at.set(None);
     // A switch that was in flight is abandoned rather than left to finish on a
     // closed menu: its next tick would otherwise swap a set of entries in for an app
     // that is no longer on show.
@@ -2631,8 +2640,38 @@ fn menu_close(menu: &Rc<Menu>) {
 }
 
 /// Whether the preview menu is up and showing.
-fn menu_open_now(menu: &Rc<Menu>) -> bool {
-    menu.shown.get() && menu.app.borrow().is_some()
+/// What a right click has to do about the previews before the app menu can come up.
+///
+/// The app menu and the previews are in the same layer, so the one that arrives second is
+/// the one on top: an app menu opened while the previews are on their way up comes up
+/// *under* them, and the previews stay there. A right click on a square whose previews are
+/// in play therefore lets them finish arriving, then leave, and only then opens.
+///
+/// Separated from the state it is read from so the three answers can be asserted without a
+/// compositor: nothing in play, arriving with this much left of it, or already up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreviewsBefore {
+    /// Nothing of the previews is on screen — no menu, or one that has not arrived yet — so
+    /// there is nothing to wait for and nothing to dismiss.
+    Clear,
+    /// They are on their way up, with this much of the arrival left to run. Then they leave,
+    /// which takes the menu's own fade.
+    Arriving(Duration),
+    /// They are up. They leave, which takes the menu's own fade.
+    Up,
+}
+
+/// Which of those a right click is looking at: whether the previews are in play at all, and
+/// how long ago they arrived if they have.
+fn previews_before(in_play: bool, arrived: Option<Duration>) -> PreviewsBefore {
+    if !in_play {
+        return PreviewsBefore::Clear;
+    }
+    match arrived {
+        None => PreviewsBefore::Clear,
+        Some(since) if since < MENU_FADE => PreviewsBefore::Arriving(MENU_FADE - since),
+        Some(_) => PreviewsBefore::Up,
+    }
 }
 
 fn animate_menu(menu: &Rc<Menu>, showing: bool, left: i32) {
@@ -3689,19 +3728,52 @@ impl Square {
                 let opening = context.clone();
                 let right_key = key.clone();
                 let button = square.clone();
-                if menu_open_now(&menu) {
-                    menu_close(&menu);
-                    glib::timeout_add_local(MENU_FADE, move || {
-                        if opening.shown.get() {
-                            // Something else opened the app menu while the previews were
-                            // closing. Two of them at once is what this is avoiding.
-                            return glib::ControlFlow::Break;
-                        }
-                        context_open(&opening, &right_key, &windows, &button);
+                // The previews leave the way before the app menu arrives: they share a
+                // layer, so whichever is mapped last is the one on top, and an app menu
+                // under the previews is a menu nobody can reach.
+                let arrived = menu.revealed_at.get().map(|at| at.elapsed());
+                let previews = previews_before(menu.app.borrow().is_some(), arrived);
+                if previews != PreviewsBefore::Clear {
+                    // The previews leave, and the app menu comes up when they have. When
+                    // they are still arriving, that waits for the arrival first: cutting it
+                    // off and reversing it is two motions where the hand asked for one.
+                    let leaving = match previews {
+                        PreviewsBefore::Arriving(left) => Some(left),
+                        _ => None,
+                    };
+                    let previews = menu.clone();
+                    let open = move || {
+                        menu_close(&previews);
+                        let opening = opening.clone();
+                        let right_key = right_key.clone();
+                        let button = button.clone();
+                        // Cloned for the timer: a `FnOnce` here would be a closure the
+                        // timeout cannot call twice, and it has to be able to.
+                        let windows = windows.clone();
+                        glib::timeout_add_local(MENU_FADE, move || {
+                            if opening.shown.get() {
+                                // Something else opened the app menu while the previews were
+                                // leaving. Two of them at once is what this is avoiding.
+                                return glib::ControlFlow::Break;
+                            }
+                            context_open(&opening, &right_key, &windows, &button);
+                            glib::ControlFlow::Break
+                        });
                         glib::ControlFlow::Break
-                    });
+                    };
+                    match leaving {
+                        Some(left) => {
+                            glib::timeout_add_local(left, open);
+                        }
+                        None => {
+                            open();
+                        }
+                    }
                     return;
                 }
+                // Nothing of them is on screen: they go without a departure, and the app
+                // menu comes up now.
+                menu_close(&menu);
                 context_open(&context, &key, &windows, &square);
             }
         ));
@@ -9660,6 +9732,33 @@ mod tests {
         assert_eq!(ease_margin(400, 100, 1.0), 100);
         // Landed exactly on the end, so no residue is left behind.
         assert_eq!(ease_margin(7, 7, 0.3), 7);
+    }
+
+    #[test]
+    fn a_right_click_waits_out_the_arrival_before_the_previews_leave() {
+        // Nothing in play: nothing to wait for, nothing to dismiss.
+        assert_eq!(previews_before(false, None), PreviewsBefore::Clear);
+        // In play but not on screen yet: still nothing to see, so nothing to wait for. It
+        // goes without a departure — which is what stops an app menu coming up under a menu
+        // that has not appeared, and then staying there.
+        assert_eq!(previews_before(true, None), PreviewsBefore::Clear);
+        // On screen and still arriving: the rest of the arrival is waited out, and then the
+        // departure takes its own fade.
+        assert_eq!(
+            previews_before(true, Some(Duration::ZERO)),
+            PreviewsBefore::Arriving(MENU_FADE)
+        );
+        assert_eq!(
+            previews_before(true, Some(MENU_FADE / 4)),
+            PreviewsBefore::Arriving(MENU_FADE * 3 / 4)
+        );
+        // Arrived: nothing left to wait for, and it still has to leave.
+        assert_eq!(previews_before(true, Some(MENU_FADE)), PreviewsBefore::Up);
+        assert_eq!(
+            previews_before(true, Some(MENU_FADE * 10)),
+            PreviewsBefore::Up,
+            "a menu that arrived long ago is not still arriving"
+        );
     }
 
     #[test]
