@@ -408,6 +408,12 @@ pub fn decoration_size(is_ssd: bool) -> Size<i32, Logical> {
 pub struct RestoreTarget {
     pub loc: Point<i32, Logical>,
     pub content: Option<Size<i32, Logical>>,
+    /// The size the window is *expected* to come back to when the client is the one that
+    /// picks: the geometry that was recorded, measured as content. The transition travels
+    /// towards it and the client's own answer replaces it, so a client-decorated window
+    /// comes out of maximize shrinking as well as moving rather than sliding out at the
+    /// size it was maximized to.
+    pub expected: Option<Size<i32, Logical>>,
 }
 
 #[derive(Debug, Clone)]

@@ -453,13 +453,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         &mut self,
         window: &WindowElement,
         target_loc: Point<i32, Logical>,
+        expected: Option<Size<i32, Logical>>,
     ) {
         let Some(start_loc) = self.space.element_location(window) else {
             return;
         };
         let content = window.resize_content_size();
         let start = WindowRect::from_geometry(start_loc, content);
-        let end = WindowRect::from_geometry(target_loc, content);
+        // The size to travel towards: the compositor's own guess when it remembers where the
+        // window was, and the size it is now when it does not. Either way the client's answer
+        // replaces it, and the transition carries on from wherever it had got to.
+        let end = WindowRect::from_geometry(target_loc, expected.unwrap_or(content));
         let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
         animation.wait_for_content();
         // Raise/activate without moving: the animation drives the location once
@@ -987,7 +991,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if pending_timed_out {
                 let committed = window.resize_content_size();
                 if let Some(animation) = window.decoration_state().animation.as_mut() {
-                    animation.resolve_content(committed);
+                    animation.resolve_content(committed, now);
                 }
             }
 

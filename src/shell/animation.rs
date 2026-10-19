@@ -180,9 +180,12 @@ impl WindowAnimation {
         }
     }
 
-    /// Freeze the transition at its start geometry until the window's final
-    /// content size is known. The pre-transition frame is still captured for the
-    /// crossfade; [`WindowAnimation::resolve_content`] starts the transition.
+    /// Hold the transition until the window's final content size is known.
+    ///
+    /// What waits is the *crossfade* and, in the end, the size: the position travels from
+    /// the first frame, and the size follows the `end` it was given — which for a
+    /// client-decorated window is the compositor's guess at the size it will come back to,
+    /// not the size it is. [`WindowAnimation::resolve_content`] hands over the real one.
     pub fn wait_for_content(&mut self) {
         self.content_pending = true;
     }
@@ -203,12 +206,20 @@ impl WindowAnimation {
         self.start_time
     }
 
-    /// Supply the content size the window settled on and start the transition
-    /// for real, from the frozen start geometry.
-    pub fn resolve_content(&mut self, size: Size<i32, Logical>) {
+    /// Supply the content size the window settled on and start the transition for real,
+    /// carrying on from wherever it has already travelled to.
+    ///
+    /// The position comes from what the transition is drawing *now* rather than from where
+    /// it began: a window that has been travelling out of the corner since the drag started
+    /// would otherwise be put back in it and set off again. The size animates from the size
+    /// it has been drawn at all along, which is the one the content is.
+    pub fn resolve_content(&mut self, size: Size<i32, Logical>, now: Instant) {
+        let drawn = self.sample(now).0;
+        self.start.loc = drawn.loc;
+        self.start.content = drawn.content;
         self.content_pending = false;
         self.end.content = size.to_f64();
-        self.start_time = Instant::now();
+        self.start_time = now;
     }
 
     /// Whether a renderer still needs to capture the pre-transition pixels.
@@ -253,10 +264,26 @@ impl WindowAnimation {
     /// `0.0..=1.0`. The same eased value drives the crossfade so the fade and
     /// the geometry move at the same rate.
     pub fn sample(&self, now: Instant) -> (WindowRect, f64) {
-        // Stay frozen at the start until the client has picked its size, so the
-        // pre-transition frame stays valid for the crossfade.
+        // Waiting for the client to pick its size. The crossfade waits with it — it crosses
+        // to content nobody has chosen yet — but the geometry does not: a window dragged out
+        // of maximize is on its way out of the corner it was in from the first frame, and
+        // towards the size the compositor remembers for it. Sitting in that corner until the
+        // client answers is what a client-decorated window used to do, and it is the one
+        // thing the transition is here to avoid.
         if self.content_pending {
-            return (self.start, 0.0);
+            let eased = ease_out_cubic(self.progress(now));
+            let (from, to) = (self.start, self.end);
+            let at = |a: f64, b: f64| lerp(a, b, eased);
+            return (
+                WindowRect {
+                    loc: Point::from((at(from.loc.x, to.loc.x), at(from.loc.y, to.loc.y))),
+                    content: Size::from((
+                        at(from.content.w, to.content.w),
+                        at(from.content.h, to.content.h),
+                    )),
+                },
+                0.0,
+            );
         }
         let progress = self.progress(now);
         let eased = ease_out_cubic(progress);
@@ -352,26 +379,50 @@ mod tests {
     }
 
     #[test]
-    fn content_pending_freezes_until_resolved() {
+    fn waiting_for_content_holds_the_crossfade_but_not_the_geometry() {
         let start = WindowRect::from_geometry((100, 100).into(), (400, 300).into());
-        let end = WindowRect::from_geometry((200, 150).into(), (400, 300).into());
+        // Where the compositor expects it to come back to, which is not where it is.
+        let end = WindowRect::from_geometry((300, 200).into(), (200, 150).into());
         let mut animation = WindowAnimation::new(start, end, Duration::from_millis(100));
         animation.wait_for_content();
+        let began = Instant::now();
 
-        // Frozen at the start no matter how much time passes.
-        let (rect, progress) = animation.sample(Instant::now() + Duration::from_secs(1));
-        assert_eq!(rect.loc, start.loc);
-        assert_eq!(rect.content, start.content);
-        assert_eq!(progress, 0.0);
+        // Part way through the wait the window has travelled — it is on its way out of the
+        // corner it was maximized into — but it is still drawn at the size it started at,
+        // which is the only size its content is a size for.
+        let (rect, progress) = animation.sample(began + Duration::from_millis(50));
+        assert!(
+            rect.loc.x > start.loc.x && rect.loc.x < end.loc.x,
+            "it did not travel: {:?}",
+            rect.loc
+        );
+        assert!(
+            rect.content.w < start.content.w && rect.content.w > end.content.w,
+            "the size did not travel towards the size it is expected to come back to: {:?}",
+            rect.content
+        );
+        assert_eq!(progress, 0.0, "and the crossfade waits for the content it crosses to");
 
-        // Resolving starts the transition from the frozen start geometry.
-        animation.resolve_content((250, 200).into());
-        let (rect, progress) = animation.sample(Instant::now());
-        assert!((rect.loc.x - start.loc.x).abs() < 1.0);
-        assert!(progress < 0.1);
-        let (rect, _) = animation.sample(Instant::now() + Duration::from_secs(1));
+        // However long the client takes, the travel does not overshoot.
+        let (rect, _) = animation.sample(began + Duration::from_secs(1));
+        assert_eq!(rect.loc, end.loc);
+        assert_eq!(rect.content, end.content);
+
+        // The client's size arrives. The size animates from where it was drawn all along,
+        // and the position carries on from where it had got to rather than starting again
+        // from the corner.
+        let travelled = animation.sample(began + Duration::from_millis(60)).0;
+        animation.resolve_content((250, 200).into(), began + Duration::from_millis(60));
+        let (rect, _) = animation.sample(began + Duration::from_millis(60));
+        assert_eq!(rect.loc, travelled.loc, "it was put back in the corner");
+        assert_eq!(
+            rect.content, travelled.content,
+            "the size jumped instead of carrying on from where it was drawn"
+        );
+        let (rect, progress) = animation.sample(began + Duration::from_secs(1));
         assert_eq!(rect.loc, end.loc);
         assert_eq!(rect.content, Size::from((250.0, 200.0)));
+        assert_eq!(progress, 1.0);
     }
 
     #[test]

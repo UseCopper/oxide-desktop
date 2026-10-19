@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, time::Instant};
 
 use smithay::{
     desktop::{
@@ -567,7 +567,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             (WindowSurface::X11(_), None) => {}
         }
 
-        self.animate_restore(window, target.loc, target.content.filter(|_| is_ssd));
+        self.animate_restore(
+            window,
+            target.loc,
+            target.content.filter(|_| is_ssd),
+            target.expected,
+        );
     }
 
     /// Play the restore transition for `window` at `loc`. With a
@@ -579,10 +584,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         window: &WindowElement,
         loc: Point<i32, Logical>,
         content: Option<Size<i32, Logical>>,
+        expected: Option<Size<i32, Logical>>,
     ) {
         match content {
             Some(size) => self.animate_window(window, size, loc),
-            None => self.animate_client_unmaximize(window, loc),
+            None => self.animate_client_unmaximize(window, loc, expected),
         }
     }
 
@@ -743,6 +749,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             (area.size.h - size.h) / 2,
                         ))),
                     content: Some(content),
+                    expected: None,
                 })
             });
 
@@ -959,6 +966,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut restore_size = None;
         let mut anchor = None;
         let mut client_unmaximize = false;
+        // The size the window is coming back to, if the compositor remembers it: only a
+        // client-decorated window needs telling twice, because it is the one that picks.
+        let mut expected = None;
         if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
             let decorated_size = self
                 .space
@@ -979,6 +989,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
                 .map(|(_, content)| content)
                 .or_else(|| area.map(|area| default_floating_content_size(area, window.is_ssd())));
+            expected = intended;
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
@@ -1036,7 +1047,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
             // wait for the client to commit its own size first.
-            self.animate_restore(&window, initial_window_location, restore_size);
+            self.animate_restore(&window, initial_window_location, restore_size, expected);
         }
 
         let grab = TouchMoveSurfaceGrab {
@@ -1095,6 +1106,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut restore_size = None;
         let mut anchor = None;
         let mut client_unmaximize = false;
+        // The size the window is coming back to, if the compositor remembers it: only a
+        // client-decorated window needs telling twice, because it is the one that picks.
+        let mut expected = None;
         if surface.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized)) {
             let decorated_size = self
                 .space
@@ -1115,6 +1129,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .and_then(|rel| super::absolute_geometry(&self.space, &window, rel))
                 .map(|(_, content)| content)
                 .or_else(|| area.map(|area| default_floating_content_size(area, window.is_ssd())));
+            expected = intended;
             // A server-decorated window has a compositor-owned size to restore,
             // so the pointer can be anchored against it directly. A
             // client-decorated window picks its own size, so the anchor is
@@ -1172,7 +1187,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if client_unmaximize || restore_size.is_some() {
             // Server-decorated: animate to the known size. Client-decorated:
             // wait for the client to commit its own size first.
-            self.animate_restore(&window, initial_window_location, restore_size);
+            self.animate_restore(&window, initial_window_location, restore_size, expected);
         }
 
         let grab = PointerMoveSurfaceGrab {
@@ -1276,7 +1291,7 @@ pub(crate) fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: 
         && animation.content_pending()
         && geometry != animation.start_content()
     {
-        animation.resolve_content(geometry);
+        animation.resolve_content(geometry, Instant::now());
     }
 
     // Read the *committed* resize state (if any) and snapshot the committed
