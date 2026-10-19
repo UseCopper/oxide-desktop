@@ -354,6 +354,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// the given content size and location. The client keeps drawing at its own
     /// pace; the frame and content are stretched to the animated rect until it
     /// catches up.
+    /// A transition created while the window is being dragged never crossfades: the hand is
+    /// on the window and its content is live under it, so there is nothing to fade *from* —
+    /// and the frame a crossfade would capture is the one being replaced. A client can
+    /// answer the configure before the next draw, which leaves that "before" picture holding
+    /// the *after* content, stretched to the old size: a magnified ghost of the window
+    /// drawn beside the real one. That is what a dragged window used to show.
     pub fn animate_window(
         &mut self,
         window: &WindowElement,
@@ -367,6 +373,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let end = WindowRect::from_geometry(target_loc, target_content);
         if start.loc == end.loc && start.content == end.content {
             return;
+        }
+        let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
+        if self.dragging_window.as_ref() == Some(window) {
+            animation.set_snapshot_unavailable();
         }
         window.decoration_state().animation =
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
@@ -466,6 +476,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let end = WindowRect::from_geometry(target_loc, content);
         let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
         animation.wait_for_content();
+        if self.dragging_window.as_ref() == Some(window) {
+            animation.set_snapshot_unavailable();
+        }
         // Raise/activate without moving: the animation drives the location once
         // the client has chosen its size.
         self.space.map_element(window.clone(), start_loc, true);
