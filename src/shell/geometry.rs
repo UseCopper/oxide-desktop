@@ -162,7 +162,6 @@ pub fn restore_target(
     Some(RestoreTarget {
         loc: rel.location(area),
         content: server.then(|| rel.content_size(area, true)),
-        expected: (!server).then(|| rel.content_size(area, false)),
     })
 }
 
