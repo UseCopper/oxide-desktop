@@ -1545,8 +1545,11 @@ impl<B: Backend> AnvilState<B> {
         let new_origin = drag.start_origin + delta.to_i32_round();
         let new_origin =
             super::clamp_window_position(&self.space, &drag.window, global, new_origin);
-        // As for the client-initiated grabs: the drag owns the position.
-        self.space.map_element(drag.window.clone(), new_origin, true);
+        // As for the client-initiated grabs: a transition in flight owns the
+        // position and is aimed at where the drag wants the window.
+        if !self.aim_restore_animation(&drag.window, new_origin.to_f64()) {
+            self.space.map_element(drag.window.clone(), new_origin, true);
+        }
 
         // Track the snap target under the pointer and show its preview.
         let target = self.snap_zone_at(global, Some(&drag.window));

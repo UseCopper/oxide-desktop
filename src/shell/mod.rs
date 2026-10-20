@@ -433,6 +433,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         window.decoration_state().pickup = None;
     }
 
+    /// Aim an in-flight transition at where a drag wants the window.
+    ///
+    /// Returns whether there was one to aim, which is also the answer to "does
+    /// the transition own the position this frame". The drag hands the window to
+    /// the transition rather than moving it: the transition travels from where
+    /// the window was — the corner a maximized one sat in — to where the hand
+    /// has taken it, so the window arrives smoothly instead of appearing under
+    /// the pointer. Having the drag move the window instead leaves it wherever
+    /// the transition had reached, offset from the pointer by the travel that
+    /// was left, which is further out the earlier the hand moves.
+    fn aim_restore_animation(&mut self, window: &WindowElement, want: Point<f64, Logical>) -> bool {
+        let mut state = window.decoration_state();
+        match state.animation.as_mut() {
+            Some(animation) => {
+                animation.retarget_location(want);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Start an unmaximize transition for a client-decorated window, whose
     /// restored size is chosen by the client and so isn't known yet. The window
     /// is frozen at its current (maximized) geometry, keeping the pre-maximize
@@ -997,13 +1018,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
             ));
-            // Not while a drag is holding the window. The hand is on it, and a window
-            // that eases towards the pointer instead of being under it is a window whose
-            // position is wrong on every frame in between — which is what the frames of a
-            // dragged window used to show. A drag moves the window; the transition keeps the
-            // size, which is the part that does have to be animated.
-            let dragged = self.dragging_window.as_ref() == Some(window);
-            if !dragged && self.space.element_location(window) != Some(loc) {
+            // Applied even while a drag is in progress: the transition owns the
+            // window's position for as long as it exists, and a drag *aims* it
+            // (see `aim_restore_animation`) rather than moving the window
+            // underneath it. That is what makes a window dragged out of maximize
+            // travel from the corner it was in to the hand, and what stops a
+            // drag from leaving it stranded in that corner with no motion to
+            // place it.
+            if self.space.element_location(window) != Some(loc) {
                 self.space.relocate_element(window, loc);
             }
             // Once the curve is done, keep the animation (which holds the window
