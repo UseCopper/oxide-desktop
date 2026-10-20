@@ -445,6 +445,9 @@ pub struct HeaderBar {
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
     pub minimize_button_hover: bool,
+    /// The button the current press began on, if it began on one. A button acts
+    /// on the release — not on the press — and only if the release is on it too.
+    pressed_button: Option<HeaderButton>,
     pub background: SolidColorBuffer,
     pub close_button: SolidColorBuffer,
     pub maximize_button: SolidColorBuffer,
@@ -707,6 +710,77 @@ fn resize_edge_band(point: Point<f64, Logical>, size: Size<i32, Logical>) -> Opt
     (!edges.is_empty()).then_some(edges)
 }
 
+/// One of the three buttons on the right of the titlebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderButton {
+    Close,
+    Maximize,
+    Minimize,
+}
+
+impl HeaderButton {
+    /// Ask for what this button does.
+    ///
+    /// Deferred: the caller holds the decoration state borrowed, and each of
+    /// these mutates it.
+    fn activate<B: Backend>(self, state: &mut AnvilState<B>, window: &WindowElement) {
+        let window = window.clone();
+        match self {
+            Self::Close => {
+                state.handle.insert_idle(move |data| data.close_window(window));
+            }
+            Self::Maximize => {
+                state.handle.insert_idle(move |data| data.toggle_maximize(window));
+            }
+            Self::Minimize => {
+                state.handle.insert_idle(move |data| data.minimize_request(window));
+            }
+        }
+    }
+}
+
+/// Which button a window-relative point is on, for a header `width` wide.
+///
+/// The three read right to left: close holds the window's top-right corner,
+/// then maximize, then minimize. Free of the state so the arithmetic can be
+/// asserted without a window.
+fn header_button_at(loc: Point<f64, Logical>, width: u32) -> Option<HeaderButton> {
+    let width = width as f64;
+    let button = BUTTON_WIDTH as f64;
+    if loc.y < 0.0 || loc.y >= HEADER_BAR_HEIGHT as f64 || loc.x < 0.0 || loc.x > width {
+        return None;
+    }
+    // A header narrower than its own three buttons has no button to hit. The
+    // minimum size makes that unreachable, but without this every point would
+    // be the close button.
+    if width < button * 3.0 {
+        return None;
+    }
+    if loc.x >= width - button {
+        Some(HeaderButton::Close)
+    } else if loc.x >= width - button * 2.0 {
+        Some(HeaderButton::Maximize)
+    } else if loc.x >= width - button * 3.0 {
+        Some(HeaderButton::Minimize)
+    } else {
+        None
+    }
+}
+
+/// The button a release should act on.
+///
+/// A press arms a button; the release has to land on that same one. Neither a
+/// release on a neighbour nor a release after the pointer left the decoration
+/// is a click on anything.
+fn confirmed_button(
+    pressed: Option<HeaderButton>,
+    loc: Option<Point<f64, Logical>>,
+    width: u32,
+) -> Option<HeaderButton> {
+    let pressed = pressed?;
+    (header_button_at(loc?, width) == Some(pressed)).then_some(pressed)
+}
+
 impl HeaderBar {
     pub fn pointer_enter(&mut self, loc: Point<f64, Logical>) {
         self.pointer_loc = Some(loc);
@@ -714,6 +788,9 @@ impl HeaderBar {
 
     pub fn pointer_leave(&mut self) {
         self.pointer_loc = None;
+        // A press that has left the decoration is no longer a click on
+        // anything; letting go out here must not fire the button it began on.
+        self.pressed_button = None;
     }
 
     /// Start dragging `window` from its title bar.
@@ -757,67 +834,87 @@ impl HeaderBar {
         });
     }
 
+    /// A press on the decoration.
+    ///
+    /// A press on one of the three buttons arms it. The action belongs to the
+    /// release, and only if the pointer is still on that button then — see
+    /// [`HeaderBar::released`]. A press anywhere else on the titlebar starts a
+    /// drag there and then, or asks a maximized window to come out of maximize.
     pub fn clicked<BackendData: Backend>(
         &mut self,
         seat: &Seat<AnvilState<BackendData>>,
         state: &mut AnvilState<BackendData>,
         window: &WindowElement,
         serial: Serial,
+        button: u32,
     ) {
+        // The decoration is a left-button surface: a right click on a titlebar
+        // is not a close, and never was the client's.
+        if button != BTN_LEFT {
+            return;
+        }
+        let Some(loc) = self.pointer_loc else {
+            return;
+        };
         if !self.pointer_is_in_header() {
             return;
         }
-        match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `close_window` mutates it.
-                let window = window.clone();
-                state.handle.insert_idle(move |data| data.close_window(window));
+        if let Some(pressed) = self.button_at(loc) {
+            self.pressed_button = Some(pressed);
+            return;
+        }
+        self.pressed_button = None;
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => {
+                let maximized =
+                    w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+                if maximized {
+                    let seat = seat.clone();
+                    let toplevel = w.clone();
+                    state
+                        .handle
+                        .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
+                } else if let Some(origin) = state.space.element_location(window) {
+                    self.start_drag(state, window, origin);
+                }
             }
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `toggle_maximize` mutates it.
-                let window = window.clone();
-                state
-                    .handle
-                    .insert_idle(move |data| data.toggle_maximize(window));
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => {
+                if w.is_maximized() {
+                    let window = w.clone();
+                    state
+                        .handle
+                        .insert_idle(move |data| data.move_request_x11(&window));
+                } else if let Some(origin) = state.space.element_location(window) {
+                    self.start_drag(state, window, origin);
+                }
             }
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `minimize_request` mutates it.
-                let window = window.clone();
-                state.handle.insert_idle(move |data| data.minimize_request(window));
-            }
-            Some(_) => {
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => {
-                        let maximized =
-                            w.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
-                        if maximized {
-                            let seat = seat.clone();
-                            let toplevel = w.clone();
-                            state
-                                .handle
-                                .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
-                        } else if let Some(origin) = state.space.element_location(window) {
-                            self.start_drag(state, window, origin);
-                        }
-                    }
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        if w.is_maximized() {
-                            let window = w.clone();
-                            state
-                                .handle
-                                .insert_idle(move |data| data.move_request_x11(&window));
-                        } else if let Some(origin) = state.space.element_location(window) {
-                            self.start_drag(state, window, origin);
-                        }
-                    }
-                };
-            }
-            _ => {}
         };
+    }
+
+    /// The release of a press: run the armed button's action, but only if the
+    /// pointer is still on that button.
+    ///
+    /// The press chose the button, and the release confirms it. Sliding onto a
+    /// neighbour and letting go does nothing, and so does letting go outside
+    /// the button. `take` comes first, so every release disarms: a press can
+    /// never be left over to fire later.
+    pub fn released<BackendData: Backend>(
+        &mut self,
+        state: &mut AnvilState<BackendData>,
+        window: &WindowElement,
+    ) {
+        // Disarm first, whatever happens: a press can never be left over to
+        // fire on a later release.
+        let pressed = self.pressed_button.take();
+        if let Some(pressed) = confirmed_button(pressed, self.pointer_loc, self.width) {
+            pressed.activate(state, window);
+        }
+    }
+
+    /// Which decoration button a window-relative point is on, if any.
+    fn button_at(&self, loc: Point<f64, Logical>) -> Option<HeaderButton> {
+        header_button_at(loc, self.width)
     }
 
     pub fn touch_down<BackendData: Backend>(
@@ -827,17 +924,22 @@ impl HeaderBar {
         window: &WindowElement,
         _serial: Serial,
     ) {
-        match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {}
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {}
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {}
-            Some(_) => {
-                if let Some(origin) = state.space.element_location(window) {
-                    self.start_drag(state, window, origin);
-                }
-            }
-            _ => {}
+        let Some(loc) = self.pointer_loc else {
+            return;
         };
+        if !self.pointer_is_in_header() {
+            return;
+        }
+        // A touch on a button is armed exactly like a press, and acts when it
+        // lifts — still on that button, or not at all.
+        if let Some(pressed) = self.button_at(loc) {
+            self.pressed_button = Some(pressed);
+            return;
+        }
+        self.pressed_button = None;
+        if let Some(origin) = state.space.element_location(window) {
+            self.start_drag(state, window, origin);
+        }
     }
 
     pub fn touch_up<BackendData: Backend>(
@@ -847,32 +949,7 @@ impl HeaderBar {
         window: &WindowElement,
     ) {
         state.end_ssd_drag();
-        if !self.pointer_is_in_header() {
-            return;
-        }
-        match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `close_window` mutates it.
-                let window = window.clone();
-                state.handle.insert_idle(move |data| data.close_window(window));
-            }
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 2)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `toggle_maximize` mutates it.
-                let window = window.clone();
-                state
-                    .handle
-                    .insert_idle(move |data| data.toggle_maximize(window));
-            }
-            Some(loc) if loc.x >= (self.width.saturating_sub(BUTTON_WIDTH * 3)) as f64 => {
-                // Deferred: the caller holds the decoration state borrowed, and
-                // `minimize_request` mutates it.
-                let window = window.clone();
-                state.handle.insert_idle(move |data| data.minimize_request(window));
-            }
-            _ => {}
-        };
+        self.released(state, window);
     }
 
     pub fn redraw(
@@ -1175,6 +1252,7 @@ impl WindowElement {
                     close_button_hover: false,
                     maximize_button_hover: false,
                     minimize_button_hover: false,
+                    pressed_button: None,
                     background: SolidColorBuffer::default(),
                     close_button: SolidColorBuffer::default(),
                     maximize_button: SolidColorBuffer::default(),
@@ -1773,6 +1851,61 @@ mod tests {
         // everywhere the frame is not.
         let button_middle = Point::from((785.0, HEADER_BAR_HEIGHT as f64 / 2.0));
         assert!(resize_edge_band(button_middle, size).is_none());
+    }
+
+    #[test]
+    fn the_three_buttons_are_the_three_squares_on_the_right() {
+        // A 300px header, right to left: close, maximize, minimize, then title.
+        let width = 300;
+        let mid = |x: f64| Point::from((x, HEADER_BAR_HEIGHT as f64 / 2.0));
+        assert_eq!(header_button_at(mid(285.0), width), Some(HeaderButton::Close));
+        assert_eq!(header_button_at(mid(255.0), width), Some(HeaderButton::Maximize));
+        assert_eq!(header_button_at(mid(225.0), width), Some(HeaderButton::Minimize));
+        assert_eq!(header_button_at(mid(100.0), width), None);
+
+        // A boundary belongs to the button on its right.
+        assert_eq!(header_button_at(mid(270.0), width), Some(HeaderButton::Close));
+        assert_eq!(header_button_at(mid(240.0), width), Some(HeaderButton::Maximize));
+        assert_eq!(header_button_at(mid(210.0), width), Some(HeaderButton::Minimize));
+
+        // Below the header, and past the window, there is no button.
+        let below = Point::from((285.0, HEADER_BAR_HEIGHT as f64));
+        assert_eq!(header_button_at(below, width), None);
+        assert_eq!(header_button_at(Point::from((300.5, 15.0)), width), None);
+
+        // A header too narrow for three squares has no buttons to press. The
+        // minimum size makes that unreachable; without the guard every point in
+        // it would be a close button.
+        assert_eq!(header_button_at(mid(45.0), 80), None);
+    }
+
+    #[test]
+    fn a_button_acts_only_if_it_was_pressed_and_is_still_under_the_pointer() {
+        let width = 300;
+        let close = Some(Point::from((285.0, 15.0)));
+        let maximize = Some(Point::from((255.0, 15.0)));
+        let title = Some(Point::from((100.0, 15.0)));
+
+        // The press chose it, and the release is on it: that is a click.
+        assert_eq!(
+            confirmed_button(Some(HeaderButton::Close), close, width),
+            Some(HeaderButton::Close)
+        );
+
+        // Letting go on a neighbour is not a click on either button.
+        assert_eq!(
+            confirmed_button(Some(HeaderButton::Close), maximize, width),
+            None
+        );
+        assert_eq!(
+            confirmed_button(Some(HeaderButton::Close), title, width),
+            None
+        );
+
+        // Nor is letting go after the pointer left the decoration...
+        assert_eq!(confirmed_button(Some(HeaderButton::Close), None, width), None);
+        // ...nor a release with no press on a button behind it.
+        assert_eq!(confirmed_button(None, close, width), None);
     }
 
     #[test]

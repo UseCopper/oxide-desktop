@@ -367,8 +367,11 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
             self.0
                 .decoration_state()
                 .header_bar
-                .clicked(seat, data, &self.0, event.serial);
+                .clicked(seat, data, &self.0, event.serial, event.button);
         } else if event.state == ButtonState::Released {
+            if event.button == BTN_LEFT {
+                self.0.decoration_state().header_bar.released(data, &self.0);
+            }
             data.end_ssd_drag();
         }
     }
@@ -610,8 +613,15 @@ impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
         event: &smithay::input::tablet::tool::ButtonEvent,
     ) {
         let mut state = self.0.decoration_state();
-        if state.is_ssd && event.state == ButtonState::Pressed {
-            state.header_bar.clicked(seat, data, &self.0, event.serial);
+        if state.is_ssd {
+            match event.state {
+                ButtonState::Pressed => {
+                    state
+                        .header_bar
+                        .clicked(seat, data, &self.0, event.serial, event.button)
+                }
+                ButtonState::Released => state.header_bar.released(data, &self.0),
+            }
         }
     }
 
