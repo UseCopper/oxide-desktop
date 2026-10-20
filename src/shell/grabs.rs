@@ -56,10 +56,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         let new_location = match self.anchor {
             // An unmaximize drag keeps the grabbed titlebar spot under the
             // pointer, adapting to the size the client actually committed.
-            Some(anchor) => anchor.locate(
-                event.location,
-                data.space.element_geometry(&self.window).map(|g| g.size).unwrap_or_default(),
-            ),
+            Some(anchor) => anchor.locate(event.location),
             None => {
                 let delta = event.location - self.start_data.location;
                 (self.initial_window_location.to_f64() + delta).to_i32_round()
@@ -276,12 +273,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         }
 
         let new_location = match self.anchor {
-            Some(anchor) => {
-                anchor.locate(
-                    event.location,
-                    data.space.element_geometry(&self.window).map(|g| g.size).unwrap_or_default(),
-                )
-            }
+            Some(anchor) => anchor.locate(event.location),
             None => {
                 let delta = event.location - self.start_data.location;
                 (self.initial_window_location.to_f64() + delta).to_i32_round()

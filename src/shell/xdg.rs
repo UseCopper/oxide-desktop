@@ -1000,12 +1000,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let expected = intended
                     .map(|content| decorated_content_size(content, false))
                     .unwrap_or(decorated_size);
+                // The size the window is going *back* to, not the one it is being dragged
+                // out of: the client has not chosen yet, so the window is still maximized,
+                // and anchoring against that aims at the far-left edge of a full-width
+                // window.
                 let captured = DragAnchor::capture(
                     initial_window_location,
                     decorated_size,
+                    expected,
                     start_data.location,
                 );
-                initial_window_location = captured.locate(start_data.location, expected);
+                initial_window_location = captured.locate(start_data.location);
                 anchor = Some(captured);
                 client_unmaximize = true;
             }
@@ -1136,12 +1141,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let expected = intended
                     .map(|content| decorated_content_size(content, false))
                     .unwrap_or(decorated_size);
+                // The size the window is going *back* to, not the one it is being dragged
+                // out of: the client has not chosen yet, so the window is still maximized,
+                // and anchoring against that aims at the far-left edge of a full-width
+                // window.
                 let captured = DragAnchor::capture(
                     initial_window_location,
                     decorated_size,
+                    expected,
                     start_data.location,
                 );
-                initial_window_location = captured.locate(start_data.location, expected);
+                initial_window_location = captured.locate(start_data.location);
                 anchor = Some(captured);
                 client_unmaximize = true;
             }
