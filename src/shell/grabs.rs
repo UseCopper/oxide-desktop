@@ -67,13 +67,11 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        // A transition in flight owns the window's position and is aimed at
-        // where the drag wants it, so the window travels out of the corner it
-        // was in rather than being teleported under the pointer.
-        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
-            data.space
-                .map_element(self.window.clone(), new_location, true);
-        }
+        // The drag owns the position: the window is under the hand from the first
+        // motion, not eased towards it. A transition still in flight keeps the *size*,
+        // which is the part nobody can see to aim.
+        data.space
+            .map_element(self.window.clone(), new_location, true);
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());
@@ -289,12 +287,9 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         };
         let new_location =
             super::clamp_window_position(&data.space, &self.window, event.location, new_location);
-        // See `PointerMoveSurfaceGrab::motion`: the transition in flight owns
-        // the position and is aimed at where the finger wants the window.
-        if !data.aim_restore_animation(&self.window, new_location.to_f64()) {
-            data.space
-                .map_element(self.window.clone(), new_location, true);
-        }
+        // See `PointerMoveSurfaceGrab::motion`: the drag owns the position.
+        data.space
+            .map_element(self.window.clone(), new_location, true);
 
         let target = data.snap_zone_at(event.location, Some(&self.window));
         data.note_snap_target(target.clone());
