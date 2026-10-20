@@ -175,14 +175,25 @@ pub struct DragAnchor {
     pub fraction: f64,
     /// Vertical offset (from the window top) the pointer grabbed at.
     pub rel_y: f64,
+    /// The size the fraction is applied to: the size the window is going *back* to, not the
+    /// size it is being dragged out of.
+    ///
+    /// This is the whole of it. While a client-decorated window is being dragged out of
+    /// maximize, the size the window *is* is still the maximized one — the client has not
+    /// answered yet — so anchoring against that put the window at the far-left position of a
+    /// full-width window: the fraction of 1284 pixels from a grab at 1010 is the left edge.
+    /// It then only found the right place after the client had shrunk and the pointer moved
+    /// again, which is a window that jumps left and creeps back while the hand wiggles.
+    pub size: Size<i32, Logical>,
 }
 
 impl DragAnchor {
-    /// Capture the anchor from a grab on a window of `decorated_size` at
-    /// `window_loc`.
+    /// Capture the anchor from a grab on a window of `decorated_size` at `window_loc`, for a
+    /// window that is going back to `size`.
     pub fn capture(
         window_loc: Point<i32, Logical>,
         decorated_size: Size<i32, Logical>,
+        size: Size<i32, Logical>,
         grab: Point<f64, Logical>,
     ) -> Self {
         let rel_x = grab.x - window_loc.x as f64;
@@ -191,20 +202,18 @@ impl DragAnchor {
         Self {
             fraction: if width > 0.0 { rel_x / width } else { 0.5 },
             rel_y,
+            size,
         }
     }
 
-    /// The window origin that keeps the anchored titlebar spot under the
-    /// pointer for a window of `decorated` size. `pointer` is the current
-    /// pointer position, so the window follows it while adapting to any size
-    /// the client committed.
-    pub fn locate(
-        &self,
-        pointer: Point<f64, Logical>,
-        decorated: Size<i32, Logical>,
-    ) -> Point<i32, Logical> {
+    /// The window origin that keeps the anchored titlebar spot under the pointer.
+    ///
+    /// The size is fixed at capture — see [`DragAnchor::size`] — so this does not depend on
+    /// what the window happens to be mid-transition, and the same pointer always gives the
+    /// same place.
+    pub fn locate(&self, pointer: Point<f64, Logical>) -> Point<i32, Logical> {
         Point::from((
-            (pointer.x - self.fraction * decorated.w as f64).round() as i32,
+            (pointer.x - self.fraction * self.size.w as f64).round() as i32,
             (pointer.y - self.rel_y).round() as i32,
         ))
     }
@@ -1767,27 +1776,47 @@ mod tests {
     }
 
     #[test]
-    fn drag_anchor_adapts_to_committed_size() {
+    fn drag_anchor_aims_at_the_size_the_window_is_going_back_to() {
         // Grabbing the titlebar at 1/4 of a 1000px-wide maximized window, 15px
-        // down from the top.
+        // down from the top, for a window that is going back to 500px.
         let loc = Point::from((100, 50));
-        let size = Size::from((1000, 600));
         let grab = Point::from((350.0, 65.0));
-        let anchor = DragAnchor::capture(loc, size, grab);
+        let anchor = DragAnchor::capture(loc, Size::from((1000, 600)), Size::from((500, 400)), grab);
         assert!((anchor.fraction - 0.25).abs() < 1e-9);
         assert!((anchor.rel_y - 15.0).abs() < 1e-9);
 
-        // The client chose half the width; the pointer must stay at 25% of it.
-        let located = anchor.locate(grab, Size::from((500, 400)));
+        // The pointer must stay at 25% of the width it is going to, not of the
+        // width the window still is — which is what put it at the left edge of a
+        // full-width window.
+        let located = anchor.locate(grab);
         assert_eq!(located, Point::from((225, 50)));
         assert!((grab.x - (located.x as f64 + 0.25 * 500.0)).abs() < 1.0);
         assert!((grab.y - (located.y as f64 + 15.0)).abs() < 1.0);
 
-        // The window keeps following the pointer, so the anchored spot stays
-        // under it as it moves.
+        // And it follows the pointer, from one place, whatever the window is
+        // doing mid-transition.
         let moved = Point::from((450.0, 165.0));
-        let located = anchor.locate(moved, Size::from((500, 400)));
-        assert_eq!(located, Point::from((325, 150)));
+        assert_eq!(anchor.locate(moved), Point::from((325, 150)));
+    }
+
+    #[test]
+    fn a_maximized_window_is_dragged_towards_the_size_it_returns_to() {
+        // The screencast's numbers: a 1284-wide maximized window, grabbed 1010px along its
+        // titlebar, coming back to a 550-wide one, its hand then moved down to 160.
+        //
+        // Anchoring at the maximized width put this at x=0 — an animated jump to the far
+        // left of the screen — and the right place only came back once the client had shrunk
+        // *and* the hand moved again, which is the creeping the recording shows.
+        let anchor = DragAnchor::capture(
+            Point::from((0, 40)),
+            Size::from((1284, 786)),
+            Size::from((550, 325)),
+            Point::from((1010.0, 70.0)),
+        );
+        let at_rest = anchor.locate(Point::from((1010.0, 70.0)));
+        assert_eq!(at_rest, Point::from((577, 40)));
+        // And with the hand moved down, the window is under it — not left behind at 0.
+        assert_eq!(anchor.locate(Point::from((1010.0, 160.0))), Point::from((577, 130)));
     }
 
     #[test]
@@ -1795,6 +1824,7 @@ mod tests {
         let anchor = DragAnchor::capture(
             Point::from((0, 0)),
             Size::from((0, 0)),
+            Size::from((500, 400)),
             Point::from((10.0, 10.0)),
         );
         assert!((anchor.fraction - 0.5).abs() < 1e-9);

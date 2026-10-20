@@ -354,6 +354,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// the given content size and location. The client keeps drawing at its own
     /// pace; the frame and content are stretched to the animated rect until it
     /// catches up.
+    /// A transition created while the window is being dragged never crossfades: the hand is
+    /// on the window and its content is live under it, so there is nothing to fade *from* —
+    /// and the frame a crossfade would capture is the one being replaced. A client can
+    /// answer the configure before the next draw, which leaves that "before" picture holding
+    /// the *after* content, stretched to the old size: a magnified ghost of the window
+    /// drawn beside the real one. That is what a dragged window used to show.
     pub fn animate_window(
         &mut self,
         window: &WindowElement,
@@ -367,6 +373,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let end = WindowRect::from_geometry(target_loc, target_content);
         if start.loc == end.loc && start.content == end.content {
             return;
+        }
+        let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
+        if self.dragging_window.as_ref() == Some(window) {
+            animation.set_snapshot_unavailable();
         }
         window.decoration_state().animation =
             Some(WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION));
@@ -459,9 +469,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         };
         let content = window.resize_content_size();
         let start = WindowRect::from_geometry(start_loc, content);
+        // The size is the window's own until the client picks another: it travels at the size
+        // it is, and shrinks once, when the client says what it is going to be. Guessing the
+        // size it is coming back to made it shrink twice — towards a size nobody had chosen
+        // yet, and then to the real one.
         let end = WindowRect::from_geometry(target_loc, content);
         let mut animation = WindowAnimation::new(start, end, WINDOW_ANIMATION_DURATION);
         animation.wait_for_content();
+        if self.dragging_window.as_ref() == Some(window) {
+            animation.set_snapshot_unavailable();
+        }
         // Raise/activate without moving: the animation drives the location once
         // the client has chosen its size.
         self.space.map_element(window.clone(), start_loc, true);
@@ -736,9 +753,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 // The dragged window's own min is already applied to its size.
                 continue;
             }
-            let (min_size, _) = self::grabs::toplevel_min_max_size(member);
-            let is_ssd = member.is_ssd();
-            let deco = if is_ssd {
+            // The client's minimum and, for an SSD window, the chrome's: a cell has to fit
+            // a window, and a window is never smaller than its own titlebar.
+            let min_size = self::grabs::minimum_content_size(member);
+            let deco = if member.is_ssd() {
                 self::xdg::decorated_content_size(Size::from((0, 0)), true)
             } else {
                 Size::from((0, 0))
@@ -986,7 +1004,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             if pending_timed_out {
                 let committed = window.resize_content_size();
                 if let Some(animation) = window.decoration_state().animation.as_mut() {
-                    animation.resolve_content(committed);
+                    animation.resolve_content(committed, now);
                 }
             }
 
