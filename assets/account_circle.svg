@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
-  <!--
-    Google Material Symbols, "account_circle" (filled).
-    Copyright Google LLC, licensed under the Apache License 2.0.
-    Changed: recoloured for the panel, and used as the mark that stands in for
-    the user's picture when there is no picture to show.
-  -->
-  <path fill="#e8e8e8" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22 3.39-1.39 6.09-1.39 9.6 0-1.29 1.94-3.5 3.22-6 3.22z"/>
-</svg>

@@ -2982,8 +2982,8 @@ const PIN_SVG: &[u8] = include_bytes!("../assets/pin.svg");
 const UNPIN_SVG: &[u8] = include_bytes!("../assets/unpin.svg");
 /// The app menu's own square: Material's three-by-three grid.
 const APPS_SVG: &[u8] = include_bytes!("../assets/apps.svg");
-/// Material's account mark, which stands in for a picture of the user.
-const ACCOUNT_CIRCLE_SVG: &[u8] = include_bytes!("../assets/account_circle.svg");
+/// Material's person, which stands in for a picture of the user.
+const PERSON_SVG: &[u8] = include_bytes!("../assets/person.svg");
 /// Material's log out.
 const LOGOUT_SVG: &[u8] = include_bytes!("../assets/logout.svg");
 /// Material's power.
@@ -3868,7 +3868,7 @@ fn picture_surface(path: &Path) -> Option<gtk4::cairo::ImageSurface> {
 
 /// Material's account mark, as pixels cairo can paint.
 fn material_avatar() -> Option<gtk4::cairo::ImageSurface> {
-    let texture = drawn_texture(ACCOUNT_CIRCLE_SVG)?;
+    let texture = drawn_texture(PERSON_SVG)?;
     let (width, height) = (texture.width(), texture.height());
     if width <= 0 || height <= 0 {
         return None;
@@ -5138,6 +5138,13 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     let cell_radius = CELL_RADIUS.round() as i32;
     format!(
         "
+/* The accent, named. The theme draws a few things in its own accent -- the
+   ring around a focused field is the one that shows -- and that accent is
+   the theme's, which is a blue that has nothing to do with this desktop.
+   Naming it here points the theme's own accent at the desktop's, so the
+   parts the panel does not draw are the panel's too. */
+@define-color accent_bg_color rgb({r}, {g}, {b});
+@define-color accent_color rgb({r}, {g}, {b});
 window.panel-window {{
     /* Transparent: the surface spans the output, so any background here would
        paint edge to edge as soon as the menu makes the window taller. The bar
@@ -5321,6 +5328,18 @@ button.context-row label {{
     background-image: none;
     border: 1px solid rgba(255, 255, 255, {cell_edge_a});
     color: #e8e8e8;
+}}
+/* The theme's focus ring is a hard-coded blue -- the theme draws it as an
+   outline on a focused field, and the colour is in the theme rather than in
+   anything the desktop says. The ring is the panel's accent, like everything
+   else that says where the typing goes. The theme draws it on
+   :focus-within, because the field's text is what takes the focus, so this
+   has to answer that and not :focus. */
+.launcher-search:focus-within,
+.launcher-search:focus {{
+    outline-color: rgba({r}, {g}, {b}, 0.55);
+    outline-width: 2px;
+    outline-offset: -2px;
 }}
 .launcher-search text {{
     color: #e8e8e8;
@@ -10709,6 +10728,31 @@ mod tests {
             !still_on_the_bar("thunderbird", &barred),
             "an app nobody pinned and nobody has open has left the panel"
         );
+    }
+
+    #[test]
+    fn every_panel_icon_is_an_svg_the_loader_can_read() {
+        // An SVG with a mistake in it is an icon that is not there: the loader
+        // says no and the panel draws nothing, quietly. The mistake this
+        // catches is a comment with a double hyphen in it, which is not legal
+        // XML, and which cost the user's mark a whole release.
+        for (name, svg) in [
+            ("apps", APPS_SVG),
+            ("person", PERSON_SVG),
+            ("logout", LOGOUT_SVG),
+            ("power", POWER_SVG),
+            ("close", CLOSE_SVG),
+            ("pin", PIN_SVG),
+            ("unpin", UNPIN_SVG),
+        ] {
+            let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(svg));
+            let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE)
+                .unwrap_or_else(|err| panic!("{name}.svg did not load: {err}"));
+            assert!(
+                pixbuf.width() > 0 && pixbuf.height() > 0,
+                "{name}.svg loaded but is empty"
+            );
+        }
     }
 
     #[test]
