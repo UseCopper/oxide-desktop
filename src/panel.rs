@@ -2988,8 +2988,6 @@ const PERSON_SVG: &[u8] = include_bytes!("../assets/person.svg");
 const LOGOUT_SVG: &[u8] = include_bytes!("../assets/logout.svg");
 /// Material's power.
 const POWER_SVG: &[u8] = include_bytes!("../assets/power.svg");
-/// Material's close, for the way out of a question.
-const CLOSE_SVG: &[u8] = include_bytes!("../assets/close.svg");
 
 /// One of those drawn icons, rasterised into the texture a row puts beside its label.
 ///
@@ -3389,7 +3387,9 @@ const LAUNCHER_WIDTH: i32 = 360;
 /// strip with a hole in it. The list scrolls inside this instead.
 const LAUNCHER_HEIGHT: i32 = 560;
 /// The size of the user's picture in the foot of the menu.
-const AVATAR_SIZE: i32 = 32;
+///
+/// Small: it is a mark beside a name, not a portrait.
+const AVATAR_SIZE: i32 = 24;
 /// The air between the bar and the menu's plate.
 const LAUNCHER_GAP: i32 = 6;
 
@@ -3418,19 +3418,10 @@ struct Launcher {
     closing: Cell<bool>,
     /// Which visible row the keyboard is on.
     selected: Cell<usize>,
-    /// The foot, and the foot that asks whether it should.
-    ///
-    /// Both are built; one is shown. The two ways out of the session are the
-    /// two things in a desktop that cannot be taken back, and a foot that
-    /// ended the session on one click was a foot that could end it by accident.
-    asking: Cell<Option<Confirm>>,
-    logout_button: Button,
-    shutdown_button: Button,
+    /// The question the two ways out ask before they happen.
+    dialog: Rc<Dialog>,
     /// The user's picture, in the foot.
     avatar: gtk4::DrawingArea,
-    ask: GtkBox,
-    question: Label,
-    confirm_button: Button,
     /// Bumped by every fade, so only the newest one touches the window.
     token: Cell<u64>,
 }
@@ -3449,6 +3440,7 @@ fn build_launcher(
     app: &Application,
     monitor: &gdk::Monitor,
     stream: Channel,
+    dialog: Rc<Dialog>,
 ) -> (Rc<Launcher>, Button) {
     let shield = build_context_shield(app, monitor);
 
@@ -3523,25 +3515,13 @@ fn build_launcher(
     // question that stands in front of one of them.
     let logout = action_button(LOGOUT_SVG, "Log out");
     let shutdown = action_button(POWER_SVG, "Shut down");
-    let ask = GtkBox::new(Orientation::Horizontal, 6);
-    ask.add_css_class("launcher-ask");
-    let question = Label::new(Some("Shut down?"));
-    question.add_css_class("launcher-question");
-    ask.append(&question);
-    let cancel = action_button(CLOSE_SVG, "Cancel");
-    let confirm = action_button(POWER_SVG, "Shut down");
-    // The answer, in the accent: it is the one that does it.
-    confirm.add_css_class("launcher-confirm");
-    ask.append(&cancel);
-    ask.append(&confirm);
-    ask.set_visible(false);
     footer.append(&logout);
     footer.append(&shutdown);
-    footer.append(&ask);
 
     plate.append(&search);
     plate.append(&scroller);
-    plate.append(&empty);
+    // The empty line is in the list, not here: a widget with a parent cannot
+    // be given another one.
     plate.append(&footer);
     window.set_child(Some(&plate));
 
@@ -3558,13 +3538,8 @@ fn build_launcher(
         closing: Cell::new(false),
         selected: Cell::new(0),
         token: Cell::new(0),
-        asking: Cell::new(None),
-        logout_button: logout.clone(),
-        shutdown_button: shutdown.clone(),
         avatar: avatar.clone(),
-        ask: ask.clone(),
-        question: question.clone(),
-        confirm_button: confirm.clone(),
+        dialog: dialog.clone(),
     });
 
     // The shield dismisses the menu it was built for, held weakly so it does not
@@ -3618,33 +3593,17 @@ fn build_launcher(
     });
     launcher.search.add_controller(keys);
 
-    // The two ways out of the session. Both ask first: the button in the foot
-    // asks, and the answer is what does it. The compositor carries it out --
-    // the panel asks, and the compositor does it.
+    // The two ways out of the session. Both ask first, in a popup over the
+    // whole screen: the button in the foot asks, and the answer is what does
+    // it. The compositor carries it out -- the panel asks, and the compositor
+    // does it.
     let asking = launcher.clone();
     logout.connect_clicked(move |_| {
-        asking.asking.set(Some(Confirm::Logout));
-        update_foot(&asking);
+        dialog_ask(&asking.dialog, Confirm::Logout, &Rc::downgrade(&asking));
     });
     let asking = launcher.clone();
     shutdown.connect_clicked(move |_| {
-        asking.asking.set(Some(Confirm::Shutdown));
-        update_foot(&asking);
-    });
-    let asking = launcher.clone();
-    cancel.connect_clicked(move |_| {
-        asking.asking.set(None);
-        update_foot(&asking);
-    });
-    let sender = launcher.stream.clone();
-    let owned = launcher.clone();
-    confirm.connect_clicked(move |_| {
-        match owned.asking.get() {
-            Some(Confirm::Logout) => sender.send("logout"),
-            Some(Confirm::Shutdown) => sender.send("shutdown"),
-            None => {}
-        }
-        launcher_close(&owned);
+        dialog_ask(&asking.dialog, Confirm::Shutdown, &Rc::downgrade(&asking));
     });
 
     // The square on the bar. It wears the task square's class so it is the same
@@ -3663,6 +3622,193 @@ fn build_launcher(
     (launcher, button)
 }
 
+/// The question the app menu asks before it ends the session.
+///
+/// A popup over everything, with the screen behind it dimmed. The two ways
+/// out of a session are the two things in a desktop that cannot be taken
+/// back, so they are asked about away from the foot that holds them: here
+/// the question is the only thing on screen, and the answer has to be said
+/// out loud.
+struct Dialog {
+    window: gtk4::Window,
+    question: Label,
+    confirm: Button,
+    /// Which of the two ways out is being asked about.
+    asking: Cell<Option<Confirm>>,
+    /// The menu the question was asked from, so that answering it can put the
+    /// menu away as well.
+    launcher: RefCell<std::rc::Weak<Launcher>>,
+    /// Bumped by every fade, so only the newest one touches the window.
+    token: Cell<u64>,
+    stream: Channel,
+}
+
+fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<Dialog> {
+    let window = gtk4::Window::builder().application(app).build();
+    window.set_decorated(false);
+    window.add_css_class("panel-window");
+    window.init_layer_shell();
+    window.set_namespace(Some("oxide-panel-dialog"));
+    window.set_layer(Layer::Top);
+    window.set_monitor(Some(monitor));
+    for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+        window.set_anchor(edge, true);
+    }
+    window.set_exclusive_zone(-1);
+    // While the question is up the keyboard belongs to it: Escape is how a
+    // question is answered no.
+    window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+    window.set_opacity(0.0);
+
+    // The dimming, and the click that takes the question back. One surface
+    // behind the dialog, dark enough to see the dialog by and light enough
+    // that the desktop is still there behind it.
+    let dim = DrawingArea::new();
+    dim.set_hexpand(true);
+    dim.set_vexpand(true);
+    dim.set_draw_func(|_, context, width, height| {
+        let _ = context.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+        let _ = context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
+        let _ = context.fill();
+    });
+
+    let question = Label::new(Some("Log out now?"));
+    question.add_css_class("dialog-question");
+    let cancel = Button::new();
+    cancel.add_css_class("dialog-button");
+    cancel.set_label("Cancel");
+    let confirm = Button::new();
+    confirm.add_css_class("dialog-button");
+    confirm.add_css_class("dialog-confirm");
+    confirm.set_label("Log out");
+
+    let plate = GtkBox::new(Orientation::Horizontal, 14);
+    plate.add_css_class("dialog-plate");
+    plate.append(&question);
+    plate.append(&cancel);
+    plate.append(&confirm);
+
+    // The dialog over the dimming, so a click on the dimming is a click on
+    // nothing in particular and the question is taken back.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&dim));
+    overlay.add_overlay(&plate);
+    plate.set_halign(gtk4::Align::Center);
+    plate.set_valign(gtk4::Align::Center);
+    window.set_child(Some(&overlay));
+
+    let dialog = Rc::new(Dialog {
+        window: window.clone(),
+        question,
+        confirm: confirm.clone(),
+        asking: Cell::new(None),
+        launcher: RefCell::new(std::rc::Weak::new()),
+        token: Cell::new(0),
+        stream,
+    });
+
+    let dismissed = dialog.clone();
+    let dim_click = gtk4::GestureClick::new();
+    dim_click.connect_pressed(glib::clone!(
+        #[weak]
+        dismissed,
+        #[upgrade_or]
+        return,
+        move |_, _, _, _| {
+            dialog_close(&dismissed);
+        }
+    ));
+    dim.add_controller(dim_click);
+
+    let cancelled = dialog.clone();
+    cancel.connect_clicked(move |_| {
+        dialog_close(&cancelled);
+    });
+
+    let confirmed = dialog.clone();
+    confirm.connect_clicked(move |_| {
+        let what = confirmed.asking.get();
+        confirmed.asking.set(None);
+        if let Some(what) = what {
+            match what {
+                Confirm::Logout => confirmed.stream.send("logout"),
+                Confirm::Shutdown => confirmed.stream.send("shutdown"),
+            }
+        }
+        // The question is answered, and the menu it was asked from has
+        // nothing left to say.
+        if let Some(launcher) = confirmed.launcher.borrow().upgrade() {
+            launcher_close(&launcher);
+        }
+        dialog_close(&confirmed);
+    });
+
+    let escaped = dialog.clone();
+    let keys = gtk4::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            dialog_close(&escaped);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
+
+    dialog
+}
+
+/// Ask the question, over the top of everything.
+fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launcher>) {
+    *dialog.launcher.borrow_mut() = launcher.clone();
+    dialog.asking.set(Some(what));
+    let (question, answer) = match what {
+        Confirm::Logout => ("Log out now?", "Log out"),
+        Confirm::Shutdown => ("Shut down now?", "Shut down"),
+    };
+    dialog.question.set_text(question);
+    dialog.confirm.set_label(answer);
+    dialog.window.set_opacity(0.0);
+    dialog.window.present();
+    dialog_fade(dialog, true);
+}
+
+/// Take the question away.
+fn dialog_close(dialog: &Rc<Dialog>) {
+    if !dialog.window.is_visible() {
+        return;
+    }
+    dialog.asking.set(None);
+    dialog_fade(dialog, false);
+}
+
+/// The question's arrival and departure: the dimming comes up and goes down.
+fn dialog_fade(dialog: &Rc<Dialog>, showing: bool) {
+    let token = dialog.token.get().wrapping_add(1);
+    dialog.token.set(token);
+    let window = dialog.window.clone();
+    let owned = dialog.clone();
+    let start = Instant::now();
+    let from = window.opacity();
+    let to = if showing { 1.0 } else { 0.0 };
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let eased = if showing { ease_out(t) } else { ease_in(t) };
+        window.set_opacity(from + (to - from) * eased);
+        if t >= 1.0 {
+            window.set_opacity(to);
+            if !showing {
+                window.set_visible(false);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 /// A button in the foot of the app menu: an icon, and what it does in a tooltip.
 fn action_button(svg: &'static [u8], tip: &str) -> Button {
     let button = Button::new();
@@ -3679,23 +3825,6 @@ fn icon_widget(svg: &'static [u8]) -> Image {
     let icon = drawn_icon(svg);
     icon.set_pixel_size(CONTEXT_ICON_SIZE);
     icon
-}
-
-/// Show the foot, or the question that stands in front of one of its buttons.
-fn update_foot(launcher: &Rc<Launcher>) {
-    let asking = launcher.asking.get();
-    launcher.logout_button.set_visible(asking.is_none());
-    launcher.shutdown_button.set_visible(asking.is_none());
-    launcher.ask.set_visible(asking.is_some());
-    let Some(what) = asking else {
-        return;
-    };
-    let (question, icon) = match what {
-        Confirm::Logout => ("Log out?", icon_widget(LOGOUT_SVG)),
-        Confirm::Shutdown => ("Shut down?", icon_widget(POWER_SVG)),
-    };
-    launcher.question.set_text(question);
-    launcher.confirm_button.set_child(Some(&icon));
 }
 
 /// The user's picture, in a circle, or Material's account mark when there is no
@@ -3959,9 +4088,6 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     // The picture is read now, not when the panel started: a face that has
     // changed since the session began is the face on show.
     refresh_avatar(&launcher.avatar);
-    // A question left over from last time is not a question any more.
-    launcher.asking.set(None);
-    update_foot(launcher);
     // Emptying the field filters back to everything; a stale query from last time
     // would open onto a list the user did not ask for.
     launcher.search.set_text("");
@@ -5431,16 +5557,41 @@ scrollbar slider:active {{
     background-color: rgba(255, 255, 255, 0.55);
     background-image: none;
 }}
-/* The question, and the answer to it. */
-.launcher-question {{
+/* The question the app menu asks before it ends the session: a plate over a
+   dimmed screen. The plate is the bar's own fill, like the two menus, so the
+   three of them are one panel in three places. */
+.dialog-plate {{
+    padding: 14px 18px;
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, 0.95);
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, {menu_edge_a});
+    border-radius: {menu_radius}px;
+}}
+.dialog-question {{
     color: #e8e8e8;
     font-weight: 500;
-    margin-right: 4px;
 }}
-button.launcher-action.launcher-confirm {{
+button.dialog-button {{
+    background: transparent;
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, {cell_edge_a});
+    border-radius: {cell_radius}px;
+    color: #e8e8e8;
+    padding: 6px 14px;
+    font-weight: 500;
+    transition: none;
+}}
+button.dialog-button:hover {{
+    background-color: rgba(255, 255, 255, {task_hover});
+    background-image: none;
+}}
+/* The answer, in the accent: it is the one that does it. */
+button.dialog-button.dialog-confirm {{
     background-color: rgba({r}, {g}, {b}, {task_focused});
+    border-color: rgba({r}, {g}, {b}, {task_focused});
+    color: #ffffff;
 }}
-button.launcher-action.launcher-confirm:hover {{
+button.dialog-button.dialog-confirm:hover {{
     background-color: rgba({r}, {g}, {b}, {task_focused});
 }}
 "
@@ -5698,7 +5849,10 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // The app menu: the application list, opened from the square at the left of the
     // bar. A fourth surface, for the same reason as the two menus — an unpainted
     // region of a surface still takes clicks.
-    let (launcher, launcher_button) = build_launcher(app, &monitor, channel.clone());
+    // The question the two ways out of the session ask, and the launcher that
+    // holds them.
+    let dialog = build_dialog(app, &monitor, channel.clone());
+    let (launcher, launcher_button) = build_launcher(app, &monitor, channel.clone(), dialog);
     bar_row.prepend(&launcher_button);
     let hover = Rc::new(Hover::default());
 
@@ -10774,7 +10928,6 @@ mod tests {
             ("person", PERSON_SVG),
             ("logout", LOGOUT_SVG),
             ("power", POWER_SVG),
-            ("close", CLOSE_SVG),
             ("pin", PIN_SVG),
             ("unpin", UNPIN_SVG),
         ] {
@@ -10840,7 +10993,11 @@ mod tests {
             ".launcher-empty {",
             ".launcher-footer {",
             "button.launcher-action {",
-            ".launcher-question {",
+            // And the question the two ways out ask, which is a plate over a
+            // dimmed screen rather than a row in the foot.
+            ".dialog-plate {",
+            ".dialog-question {",
+            "button.dialog-button {",
             // The scrollbar is the panel's too: the theme fills it with its
             // own accent under the pointer, which is the last blue left.
             "scrollbar slider {",
