@@ -457,6 +457,18 @@ impl PanelIpc {
         }
     }
 
+    /// Ask the panel to open its app menu.
+    ///
+    /// A plain text frame at the back of the queue, not a priority one: the
+    /// priority slot belongs to the window list, and a menu that opened by
+    /// dropping the list would be a menu that opened a window list behind it.
+    pub fn open_menu(&mut self) {
+        if self.conn.is_none() {
+            return;
+        }
+        self.out.push_text("menu");
+    }
+
     /// Queue a window-list snapshot if it differs from the last one sent.
     ///
     /// It supersedes whatever is queued. A queued preview is stale the moment a window

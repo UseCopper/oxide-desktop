@@ -1,7 +1,9 @@
 #[cfg(feature = "xwayland")]
 use std::os::unix::io::OwnedFd;
 use std::{
+    cell::Cell,
     collections::HashMap,
+    rc::Rc,
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -134,6 +136,20 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// What the Super key is doing, while it is doing it.
+///
+/// The Super key on its own opens the app menu, and the Super key with
+/// another key is that key's shortcut. Which of the two it is cannot be known
+/// when the key goes down -- the other key may be a moment away -- so it is
+/// known when the key comes up.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SuperKey {
+    /// The Super key is down.
+    pub down: bool,
+    /// Another key was pressed while it was down.
+    pub combined: bool,
+}
+
 #[derive(Debug)]
 pub struct AnvilState<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
@@ -178,6 +194,14 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
+    /// What the Super key is doing.
+    ///
+    /// The Super key on its own opens the app menu, and the Super key with
+    /// another key is that key's shortcut. Which of the two it is cannot be
+    /// known when the key goes down -- the other key may be a moment away -- so
+    /// it is known when the key comes up, and only if nothing else joined it in
+    /// between.
+    pub super_key: Rc<Cell<SuperKey>>,
     pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<AnvilState<BackendData>>,
@@ -854,6 +878,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             xdg_toplevel_icon_manager,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
+            super_key: Rc::new(Cell::new(SuperKey::default())),
             cursor_status: CursorImageStatus::default_named(),
             seat_name,
             seat,

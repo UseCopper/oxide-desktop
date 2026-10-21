@@ -3508,7 +3508,7 @@ fn build_launcher(
     let keyed = launcher.clone();
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    keys.connect_key_pressed(move |_, key, _, _| {
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
         if key == gdk::Key::Escape {
             launcher_close(&keyed);
             glib::Propagation::Stop
@@ -3519,6 +3519,13 @@ fn build_launcher(
             launcher_move(&keyed, 1);
             glib::Propagation::Stop
         } else if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            // A key held down with the Super key is a combination, not a click on
+            // what is picked: the Super key is what opened the menu, and a
+            // combination that arrives while it is open belongs to whatever the
+            // combination means rather than to the list under the cursor.
+            if modifiers.contains(gdk::ModifierType::SUPER_MASK) {
+                return glib::Propagation::Stop;
+            }
             launcher_activate(&keyed);
             glib::Propagation::Stop
         } else {
@@ -3606,6 +3613,10 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     // would open onto a list the user did not ask for.
     launcher.search.set_text("");
     launcher_filter(launcher);
+    // The menu arrives from under the bar, the way the other one does, so it is
+    // mapped at the start of the slide rather than at the end of it.
+    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
+    launcher.window.set_margin(Edge::Top, resting - MENU_SLIDE);
     launcher.window.set_opacity(0.0);
     launcher.shown.set(true);
     launcher.closing.set(false);
@@ -3614,7 +3625,7 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     launcher.shield.set_visible(true);
     launcher.window.present();
     launcher.search.grab_focus();
-    launcher_fade(launcher, true);
+    launcher_ease(launcher, 0.0, 1.0, resting - MENU_SLIDE, resting);
 }
 
 fn launcher_close(launcher: &Rc<Launcher>) {
@@ -3625,36 +3636,68 @@ fn launcher_close(launcher: &Rc<Launcher>) {
     // The catcher's work is done the moment the menu starts leaving: a click
     // during the fade belongs where it was aimed.
     launcher.shield.set_visible(false);
-    launcher_fade(launcher, false);
+    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
+    let token = launcher_ease(launcher, 1.0, 0.0, resting, resting - MENU_SLIDE);
+    let fading = launcher.clone();
+    // `shown` is not cleared here: it is cleared when the slide lands, so a
+    // second Super key in the next 180ms cannot put a menu on screen that is
+    // already on its way out.
+    glib::timeout_add_local(MENU_FADE, move || {
+        if fading.token.get() != token {
+            // Superseded by an opening.
+            return glib::ControlFlow::Break;
+        }
+        fading.window.set_visible(false);
+        fading.shown.set(false);
+        fading.closing.set(false);
+        glib::ControlFlow::Break
+    });
 }
 
-fn launcher_fade(launcher: &Rc<Launcher>, showing: bool) {
+/// The app menu's arrival and departure.
+///
+/// The same slide out of the bar and the same fade as the menu on the right of
+/// the bar: one panel, one way of coming and going. The slide is the plate's
+/// top edge moving down out from under the panel, and the fade is the whole
+/// surface arriving with it.
+fn launcher_ease(
+    launcher: &Rc<Launcher>,
+    from_opacity: f64,
+    to_opacity: f64,
+    from_top: i32,
+    to_top: i32,
+) -> u64 {
     let token = launcher.token.get().wrapping_add(1);
     launcher.token.set(token);
-    let window = launcher.window.clone();
-    let shield = launcher.shield.clone();
+    let start = glib::monotonic_time();
     let owned = launcher.clone();
-    let start = Instant::now();
-    let from = window.opacity();
-    let to = if showing { 1.0 } else { 0.0 };
     glib::timeout_add_local(Duration::from_millis(16), move || {
         if owned.token.get() != token {
             return glib::ControlFlow::Break;
         }
-        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        let eased = if showing { ease_out(t) } else { ease_in(t) };
-        window.set_opacity(from + (to - from) * eased);
-        if t >= 1.0 {
-            if !showing {
-                window.set_visible(false);
-                shield.set_visible(false);
-                owned.shown.set(false);
-                owned.closing.set(false);
-            }
-            return glib::ControlFlow::Break;
+        let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
+        let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let curve: fn(f64) -> f64 = if to_opacity < from_opacity {
+            ease_in
+        } else {
+            ease_out
+        };
+        let eased = phase_value(curve, t).0;
+        owned
+            .window
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+        owned
+            .window
+            .set_margin(Edge::Top, ease_margin(from_top, to_top, eased));
+        if t < 1.0 {
+            return glib::ControlFlow::Continue;
         }
-        glib::ControlFlow::Continue
+        // Land exactly on the ends, so no rounding residue is left behind.
+        owned.window.set_opacity(to_opacity);
+        owned.window.set_margin(Edge::Top, to_top);
+        glib::ControlFlow::Break
     });
+    token
 }
 
 /// Show the rows that match the query and hide the rest.
@@ -4993,6 +5036,12 @@ enum PanelEvent {
     },
     /// The connection is gone. The panel starts over and reconnects.
     Disconnected,
+    /// The compositor wants the app menu opened.
+    ///
+    /// The Super key, on its own. The menu is the panel's, and the compositor
+    /// is a separate process, so this is a request rather than a thing the
+    /// compositor can draw.
+    OpenMenu,
 }
 
 /// Reads the compositor's byte stream into events.
@@ -5084,10 +5133,11 @@ fn parse_frame(frame: &[u8]) -> Option<PanelEvent> {
         });
     }
     let fields = panel_proto::parse_text(frame)?;
-    if fields.first().map(String::as_str) != Some("list") {
-        return None;
+    match fields.first().map(String::as_str) {
+        Some("list") => parse_snapshot(&fields).map(PanelEvent::Snapshot),
+        Some("menu") => Some(PanelEvent::OpenMenu),
+        _ => None,
     }
-    parse_snapshot(&fields).map(PanelEvent::Snapshot)
 }
 
 /// Write a message to the compositor.
@@ -5214,7 +5264,7 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // The app menu: the application list, opened from the square at the left of the
     // bar. A fourth surface, for the same reason as the two menus — an unpainted
     // region of a surface still takes clicks.
-    let (_launcher, launcher_button) = build_launcher(app, &monitor, channel.clone());
+    let (launcher, launcher_button) = build_launcher(app, &monitor, channel.clone());
     bar_row.prepend(&launcher_button);
     let hover = Rc::new(Hover::default());
 
@@ -5239,7 +5289,7 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // Polled whether or not there was a socket to begin with: a panel started before its
     // compositor is listening yet is the ordinary case on a login, and the reconnect in
     // the poll timer is what picks it up.
-    start_polling(&tasks, &menu, &channel, hover, &context);
+    start_polling(&tasks, &menu, &channel, hover, &context, &launcher);
 
     bar.present();
     // And then it slides down into place. A frame first, so the bar has been
@@ -5573,10 +5623,12 @@ fn start_polling(
     channel: &Channel,
     _hover: Rc<Hover>,
     context: &Rc<ContextMenu>,
+    launcher: &Rc<Launcher>,
 ) {
     let menu = menu.clone();
     let tasks = tasks.clone();
     let context = context.clone();
+    let launcher = launcher.clone();
     let reader = RefCell::new(PanelReader::default());
     let windows = Rc::new(RefCell::new(Vec::<WindowInfo>::new()));
     // Both timers below need this state, so hand each its own handle.
@@ -5641,6 +5693,11 @@ fn start_polling(
                     // never arrived and every later one was a frame stale, which is
                     // exactly what a preview that never seems to change looks like.
                     menu_set_image(&menu, id, width, height, pixels);
+                }
+                PanelEvent::OpenMenu => {
+                    // The Super key, on its own. The menu opens where it is:
+                    // the launcher is one thing, and it is the panel's.
+                    launcher_open(&launcher);
                 }
                 PanelEvent::Disconnected => {
                     // Forget the compositor's window list rather than leaving a stale one

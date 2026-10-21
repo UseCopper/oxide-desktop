@@ -1,4 +1,4 @@
-use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
+use std::{convert::TryInto, sync::atomic::Ordering};
 
 use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}};
 
@@ -36,7 +36,7 @@ use smithay::backend::input::AbsolutePositionEvent;
 
 #[cfg(any(feature = "winit", feature = "x11"))]
 use smithay::output::Output;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 /// Whether a named cursor is one of the resize arrows.
 fn is_resize_icon(icon: CursorIcon) -> bool {
@@ -88,25 +88,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 self.running.store(false, Ordering::SeqCst);
             }
 
-            KeyAction::Run(cmd) => {
-                info!(cmd, "Starting program");
-
-                if let Err(e) = Command::new(&cmd)
-                    .envs(
-                        self.socket_name
-                            .clone()
-                            .map(|v| ("WAYLAND_DISPLAY", v))
-                            .into_iter()
-                            .chain(
-                                #[cfg(feature = "xwayland")]
-                                self.xdisplay.map(|v| ("DISPLAY", format!(":{v}"))),
-                                #[cfg(not(feature = "xwayland"))]
-                                None,
-                            ),
-                    )
-                    .spawn()
-                {
-                    error!(cmd, err = %e, "Failed to start program");
+            KeyAction::OpenMenu => {
+                // The panel owns the app menu, so this is a message rather than
+                // something the compositor draws.
+                if let Some(panel) = self.panel_ipc.as_mut() {
+                    panel.open_menu();
                 }
             }
 
@@ -204,9 +190,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .map(|inhibitor| inhibitor.is_active())
             .unwrap_or(false);
 
+        // The Super key's own state, shared with the closure below: the closure
+        // cannot borrow the state it is delivering the key to.
+        let super_key = self.super_key.clone();
         let action = keyboard
             .input(self, keycode, state, serial, time, |_, modifiers, handle| {
                 let keysym = handle.modified_sym();
+                // The raw symbol is the one to ask about for a modifier key:
+                // `modified_sym` is what the key means with the modifiers held
+                // down, and a modifier key is its own symbol either way.
+                let is_super = handle.raw_syms().iter().any(|sym| {
+                    matches!(sym.raw(), xkb::KEY_Super_L | xkb::KEY_Super_R)
+                });
 
                 debug!(
                     ?state,
@@ -222,6 +217,30 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 // should be forwarded to the client or not.
                 if let KeyState::Pressed = state {
                     if !inhibited {
+                        if is_super {
+                            // The Super key on its own opens the app menu, and
+                            // the Super key with another key is that key's
+                            // shortcut. Which of the two this is cannot be known
+                            // while the key is down -- the other key may be a
+                            // moment away -- so nothing is opened here: the key
+                            // is only held, and the release decides.
+                            //
+                            // Suppressed, so the release is not handed to the
+                            // window underneath either.
+                            suppressed_keys.push(keysym);
+                            let mut held = super_key.get();
+                            held.down = true;
+                            held.combined = false;
+                            super_key.set(held);
+                            return FilterResult::Intercept(KeyAction::None);
+                        }
+                        // Another key while the Super key is down: a
+                        // combination, and a combination is not a tap.
+                        if super_key.get().down {
+                            let mut held = super_key.get();
+                            held.combined = true;
+                            super_key.set(held);
+                        }
                         let action = process_keyboard_shortcut(*modifiers, keysym);
 
                         if action.is_some() {
@@ -238,6 +257,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     let suppressed = suppressed_keys.contains(&keysym);
                     if suppressed {
                         suppressed_keys.retain(|k| *k != keysym);
+                        if is_super {
+                            // The Super key, let go. If nothing else joined it
+                            // while it was down, it was a tap, and a tap opens the
+                            // app menu.
+                            let mut held = super_key.get();
+                            let tap = held.down && !held.combined;
+                            held.down = false;
+                            held.combined = false;
+                            super_key.set(held);
+                            if tap {
+                                return FilterResult::Intercept(KeyAction::OpenMenu);
+                            }
+                        }
                         FilterResult::Intercept(KeyAction::None)
                     } else {
                         FilterResult::Forward
@@ -808,7 +840,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 action => match action {
                     KeyAction::None
                     | KeyAction::Quit
-                    | KeyAction::Run(_)
+                    | KeyAction::OpenMenu
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::Minimize
@@ -1035,7 +1067,7 @@ impl AnvilState<UdevData> {
                 action => match action {
                     KeyAction::None
                     | KeyAction::Quit
-                    | KeyAction::Run(_)
+                    | KeyAction::OpenMenu
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::Minimize
@@ -1525,8 +1557,12 @@ enum KeyAction {
     Quit,
     /// Trigger a vt-switch
     VtSwitch(i32),
-    /// run a command
-    Run(String),
+    /// Open the panel's app menu.
+    ///
+    /// The Super key on its own. It is a request to the panel rather than
+    /// something the compositor draws, because the panel is a separate process
+    /// and the menu is the panel's.
+    OpenMenu,
     /// Switch the current screen
     Screen(usize),
     ScaleUp,
@@ -1555,9 +1591,6 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::VtSwitch(
             (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32,
         ))
-    } else if modifiers.logo && keysym == Keysym::Return {
-        // run terminal
-        Some(KeyAction::Run("weston-terminal".into()))
     } else if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
         Some(KeyAction::Screen((keysym.raw() - xkb::KEY_1) as usize))
     // Shifted actions must be checked before unshifted ones sharing the same key,
