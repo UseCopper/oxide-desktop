@@ -3170,25 +3170,32 @@ fn context_ease(
         }
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        let curve: fn(f64) -> f64 = if to_opacity < from_opacity {
+        // Two curves, because two things are moving. The opacity is a fade,
+        // and a fade wants the smoothstep the panel has for exactly that: the
+        // cubic is still above 0.87 halfway through, so the fade sits there
+        // looking unchanged and then happens in the last few frames. The slide
+        // is a movement, and a movement should commit and settle, which is
+        // the cubic.
+        let move_curve: fn(f64) -> f64 = if to_opacity < from_opacity {
             ease_in
         } else {
             ease_out
         };
-        let eased = phase_value(curve, t).0;
+        let faded = phase_value(ease_in_out, t).0;
+        let moved = phase_value(move_curve, t).0;
         context
             .window
-            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * faded);
         // The width holds for the length of the slide; only it and the two
         // margins move.
         context.window.set_size_request(width.max(1), -1);
         context.window.set_default_size(width.max(1), -1);
         context
             .window
-            .set_margin(Edge::Left, ease_margin(from_left, to_left, eased));
+            .set_margin(Edge::Left, ease_margin(from_left, to_left, moved));
         context
             .window
-            .set_margin(Edge::Top, ease_margin(from_top, to_top, eased));
+            .set_margin(Edge::Top, ease_margin(from_top, to_top, moved));
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
@@ -3599,10 +3606,15 @@ fn build_launcher(
     // does it.
     let asking = launcher.clone();
     logout.connect_clicked(move |_| {
+        // The menu goes first: the question is over the whole screen, and a
+        // menu still standing behind the dimming is a menu with a question
+        // asked of it.
+        launcher_close(&asking);
         dialog_ask(&asking.dialog, Confirm::Logout, &Rc::downgrade(&asking));
     });
     let asking = launcher.clone();
     shutdown.connect_clicked(move |_| {
+        launcher_close(&asking);
         dialog_ask(&asking.dialog, Confirm::Shutdown, &Rc::downgrade(&asking));
     });
 
@@ -3674,6 +3686,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
 
     let question = Label::new(Some("Log out now?"));
     question.add_css_class("dialog-question");
+    question.set_xalign(0.0);
     let cancel = Button::new();
     cancel.add_css_class("dialog-button");
     cancel.set_label("Cancel");
@@ -3682,11 +3695,16 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     confirm.add_css_class("dialog-confirm");
     confirm.set_label("Log out");
 
-    let plate = GtkBox::new(Orientation::Horizontal, 14);
+    // The question on top of the answers, not beside them: a question and the
+    // buttons that answer it read as a sentence when they are on a line.
+    let answers = GtkBox::new(Orientation::Horizontal, 10);
+    answers.set_halign(gtk4::Align::End);
+    answers.append(&cancel);
+    answers.append(&confirm);
+    let plate = GtkBox::new(Orientation::Vertical, 12);
     plate.add_css_class("dialog-plate");
     plate.append(&question);
-    plate.append(&cancel);
-    plate.append(&confirm);
+    plate.append(&answers);
 
     // The dialog over the dimming, so a click on the dimming is a click on
     // nothing in particular and the question is taken back.
@@ -3796,7 +3814,9 @@ fn dialog_fade(dialog: &Rc<Dialog>, showing: bool) {
             return glib::ControlFlow::Break;
         }
         let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        let eased = if showing { ease_out(t) } else { ease_in(t) };
+        // The smoothstep, in both directions: the same motion played forwards
+        // and backwards, and the one that is always moving at a visible rate.
+        let eased = ease_in_out(t);
         window.set_opacity(from + (to - from) * eased);
         if t >= 1.0 {
             window.set_opacity(to);
@@ -4156,18 +4176,21 @@ fn launcher_ease(
         }
         let elapsed = (glib::monotonic_time() - start) as f64 / 1_000_000.0;
         let t: f64 = (elapsed / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        let curve: fn(f64) -> f64 = if to_opacity < from_opacity {
+        // The same two curves as the menu on the right of the bar: the fade is
+        // a fade, and the slide is a movement.
+        let move_curve: fn(f64) -> f64 = if to_opacity < from_opacity {
             ease_in
         } else {
             ease_out
         };
-        let eased = phase_value(curve, t).0;
+        let faded = phase_value(ease_in_out, t).0;
+        let moved = phase_value(move_curve, t).0;
         owned
             .window
-            .set_opacity(from_opacity + (to_opacity - from_opacity) * eased);
+            .set_opacity(from_opacity + (to_opacity - from_opacity) * faded);
         owned
             .window
-            .set_margin(Edge::Top, ease_margin(from_top, to_top, eased));
+            .set_margin(Edge::Top, ease_margin(from_top, to_top, moved));
         if t < 1.0 {
             return glib::ControlFlow::Continue;
         }
