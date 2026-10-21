@@ -28,8 +28,28 @@ use crate::{
     focus::KeyboardFocusTarget,
     panel_proto::{self, FrameWriter},
     shell::WindowElement,
-    state::{AnvilState, Backend},
+    state::{AnvilState, Backend, EndSession, PendingSessionEnd},
 };
+
+/// The windows that did not close, out of the ones that were asked to.
+///
+/// The asked-for and the still-there are both lists of the same ids, and the
+/// answer is the ones in both.
+fn windows_still_there(asked: &[u64], still_there: &[u64]) -> Vec<u64> {
+    asked
+        .iter()
+        .copied()
+        .filter(|id| still_there.contains(id))
+        .collect()
+}
+
+/// How long the apps are given to close before the ones that will not are
+/// named.
+///
+/// Long enough for an app to save what it is holding and close itself, short
+/// enough that the person who asked to log out is not left watching a menu
+/// that has not said anything yet.
+const SESSION_CLOSE_GRACE: Duration = Duration::from_millis(800);
 
 /// How many window previews may be rendered in a single frame.
 ///
@@ -126,10 +146,14 @@ pub enum PanelMessage {
     /// The desktop accent color, as linear-ish sRGB components.
     Accent([f32; 3]),
     /// End the session: the compositor is what is running it, so it is what
-    /// goes.
+    /// goes -- once the apps have been asked to close.
     Logout,
-    /// Power the machine off.
+    /// Power the machine off, once the apps have been asked to close.
     Shutdown,
+    /// End the session whatever the apps say.
+    Force,
+    /// Take the request back.
+    Cancel,
 }
 
 /// A window preview on its way to the panel.
@@ -462,6 +486,18 @@ impl PanelIpc {
         }
     }
 
+    /// Say something to the panel.
+    ///
+    /// A plain text frame at the back of the queue, not a priority one: the
+    /// priority slot belongs to the window list, and a message that went in
+    /// front of it would be read before the list it is about.
+    pub fn send_message(&mut self, message: &str) {
+        if self.conn.is_none() {
+            return;
+        }
+        self.out.push_text(message);
+    }
+
     /// Ask the panel to open its app menu.
     ///
     /// A plain text frame at the back of the queue, not a priority one: the
@@ -530,6 +566,8 @@ fn parse_frame(frame: &[u8]) -> Incoming {
         },
         Some("logout") => Incoming::Message(PanelMessage::Logout),
         Some("shutdown") => Incoming::Message(PanelMessage::Shutdown),
+        Some("force") => Incoming::Message(PanelMessage::Force),
+        Some("cancel") => Incoming::Message(PanelMessage::Cancel),
         Some("accent") => match parse_accent(&fields) {
             Some(rgb) => Incoming::Message(PanelMessage::Accent(rgb)),
             None => Incoming::Ignored,
@@ -628,28 +666,56 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // every tick and everything after them was never answered at all — one preview
         // updating and the rest frozen. Queued, each window waits its turn, and the whole
         // set settles at frame_rate / n fps.
+        // A session that was asked to end: the apps were asked to close, and
+        // the ones that would not are named for the panel, so the panel can
+        // name them for the person at the keyboard.
+        if let Some(mut pending) = self.pending_session_end.take() {
+            if !pending.reported && pending.asked_at.elapsed() >= SESSION_CLOSE_GRACE {
+                let still_there: Vec<u64> = self
+                    .space
+                    .elements()
+                    .filter_map(|window| window.with_state(|state| state.panel_id))
+                    .collect();
+                let refusing = windows_still_there(&pending.windows, &still_there);
+                if refusing.is_empty() {
+                    // They all closed: the session ends as it was asked to.
+                    self.end_session(pending.what);
+                } else {
+                    pending.reported = true;
+                    self.pending_session_end = Some(pending);
+                    let message = std::iter::once("refusing".to_string())
+                        .chain(refusing.iter().map(u64::to_string))
+                        .collect::<Vec<_>>()
+                        .join("\t");
+                    if let Some(ipc) = self.panel_ipc.as_mut() {
+                        ipc.send_message(&message);
+                    }
+                }
+            } else {
+                self.pending_session_end = Some(pending);
+            }
+        }
+
         for message in messages {
             match message {
                 PanelMessage::Focus(id) => self.focus_panel_window(id),
                 PanelMessage::Close(id) => self.close_panel_window(id),
                 PanelMessage::Launch(id) => self.launch_app(&id),
-                PanelMessage::Logout => {
-                    // The panel asked to end the session. The compositor is the
-                    // session, so the compositor is what stops.
-                    info!("panel asked to log out");
-                    self.running.store(false, Ordering::SeqCst);
-                }
-                PanelMessage::Shutdown => {
-                    // Asked through systemd, so the machine is brought down the
-                    // way it is meant to be brought down -- and so whatever
-                    // usually asks for permission to do it still gets to.
-                    info!("panel asked to shut down");
-                    if let Err(err) = std::process::Command::new("systemctl")
-                        .arg("poweroff")
-                        .spawn()
-                    {
-                        warn!(%err, "could not ask for the machine to power off");
+                PanelMessage::Logout => self.begin_session_end(EndSession::Logout),
+                PanelMessage::Shutdown => self.begin_session_end(EndSession::Shutdown),
+                PanelMessage::Force => {
+                    // The panel says anyway: the apps that said no are not
+                    // going to get a second chance at it.
+                    if let Some(pending) = self.pending_session_end.take() {
+                        info!("panel asked to go ahead anyway");
+                        self.end_session(pending.what);
                     }
+                }
+                PanelMessage::Cancel => {
+                    // The panel changed its mind. The apps that were asked to
+                    // close may still close: they were asked, and the answer
+                    // is theirs to give.
+                    self.pending_session_end = None;
                 }
                 PanelMessage::Accent(rgb) => crate::shell::set_preview_color(rgb),
                 PanelMessage::Preview {
@@ -884,6 +950,53 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         self.send_close(&window);
     }
 
+    /// Ask every app to close, and wait to see which of them will not.
+    ///
+    /// The client is told, and the client decides: an app with unsaved work
+    /// can say no. Nothing is killed here, and the session does not end until
+    /// the apps have had their say -- or until the person at the keyboard says
+    /// that they do not need to.
+    fn begin_session_end(&mut self, what: EndSession) {
+        info!(?what, "the panel asked to end the session");
+        let mut windows = Vec::new();
+        // The windows are collected first: asking one to close takes the
+        // state, and the list is still being walked.
+        let open: Vec<WindowElement> = self.space.elements().cloned().collect();
+        for window in open {
+            let Some(id) = window.with_state(|state| state.panel_id) else {
+                continue;
+            };
+            windows.push(id);
+            self.send_close(&window);
+        }
+        self.pending_session_end = Some(PendingSessionEnd {
+            what,
+            windows,
+            asked_at: Instant::now(),
+            reported: false,
+        });
+    }
+
+    /// End the session, or bring the machine down.
+    fn end_session(&mut self, what: EndSession) {
+        match what {
+            EndSession::Logout => {
+                // The compositor is the session, so the compositor is what stops.
+                info!("the session is ending");
+                self.running.store(false, Ordering::SeqCst);
+            }
+            EndSession::Shutdown => {
+                // Asked through systemd, so the machine is brought down the way
+                // it is meant to be brought down -- and so whatever usually
+                // asks for permission to do it still gets to.
+                info!("the machine is going down");
+                if let Err(err) = Command::new("systemctl").arg("poweroff").spawn() {
+                    warn!(%err, "could not ask for the machine to power off");
+                }
+            }
+        }
+    }
+
     /// Start the app the panel named, from its desktop entry.
     ///
     /// Spawned here rather than by the panel, for two reasons. The app becomes a child
@@ -1084,6 +1197,16 @@ mod tests {
 
     fn ignored(frame: &str) -> bool {
         parse_frame(&body(frame)).is_ignored()
+    }
+
+    #[test]
+    fn the_windows_that_did_not_close_are_the_ones_asked_for_that_are_still_there() {
+        assert_eq!(windows_still_there(&[1, 2, 3], &[2, 3]), vec![2, 3]);
+        assert_eq!(windows_still_there(&[1, 2, 3], &[3]), vec![3]);
+        // Everything closed: nothing is holding the session up.
+        assert!(windows_still_there(&[1, 2, 3], &[]).is_empty());
+        // And a window that was never asked for is not one of them.
+        assert!(windows_still_there(&[], &[7]).is_empty());
     }
 
     #[test]

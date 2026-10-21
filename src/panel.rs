@@ -3634,6 +3634,19 @@ fn build_launcher(
     (launcher, button)
 }
 
+/// What the question is about now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogState {
+    /// Nothing is being asked.
+    None,
+    /// The question: shall the session end.
+    Asking,
+    /// The apps are being asked to close.
+    Waiting,
+    /// The apps that would not close.
+    Refusing,
+}
+
 /// The question the app menu asks before it ends the session.
 ///
 /// A popup over everything, with the screen behind it dimmed. The two ways
@@ -3644,9 +3657,15 @@ fn build_launcher(
 struct Dialog {
     window: gtk4::Window,
     question: Label,
+    /// The apps that would not close, by their own marks and names.
+    apps: GtkBox,
     confirm: Button,
+    /// What the question is about now.
+    state: Cell<DialogState>,
+    /// How many apps are holding the session up.
+    refusing_count: Cell<usize>,
     /// Which of the two ways out is being asked about.
-    asking: Cell<Option<Confirm>>,
+    action: Cell<Option<Confirm>>,
     /// The menu the question was asked from, so that answering it can put the
     /// menu away as well.
     launcher: RefCell<std::rc::Weak<Launcher>>,
@@ -3687,6 +3706,10 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     let question = Label::new(Some("Log out now?"));
     question.add_css_class("dialog-question");
     question.set_xalign(0.0);
+    // The apps that would not close, named and marked, under the question.
+    let apps = GtkBox::new(Orientation::Vertical, 6);
+    apps.add_css_class("dialog-apps");
+    apps.set_visible(false);
     let cancel = Button::new();
     cancel.add_css_class("dialog-button");
     cancel.set_label("Cancel");
@@ -3701,9 +3724,10 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     answers.set_halign(gtk4::Align::End);
     answers.append(&cancel);
     answers.append(&confirm);
-    let plate = GtkBox::new(Orientation::Vertical, 12);
+    let plate = GtkBox::new(Orientation::Vertical, 18);
     plate.add_css_class("dialog-plate");
     plate.append(&question);
+    plate.append(&apps);
     plate.append(&answers);
 
     // The dialog over the dimming, so a click on the dimming is a click on
@@ -3718,8 +3742,11 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     let dialog = Rc::new(Dialog {
         window: window.clone(),
         question,
+        apps,
         confirm: confirm.clone(),
-        asking: Cell::new(None),
+        state: Cell::new(DialogState::None),
+        refusing_count: Cell::new(0),
+        action: Cell::new(None),
         launcher: RefCell::new(std::rc::Weak::new()),
         token: Cell::new(0),
         stream,
@@ -3733,39 +3760,31 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         #[upgrade_or]
         return,
         move |_, _, _, _| {
-            dialog_close(&dismissed);
+            dialog_cancel(&dismissed);
         }
     ));
     dim.add_controller(dim_click);
 
     let cancelled = dialog.clone();
     cancel.connect_clicked(move |_| {
-        dialog_close(&cancelled);
+        dialog_cancel(&cancelled);
     });
 
     let confirmed = dialog.clone();
     confirm.connect_clicked(move |_| {
-        let what = confirmed.asking.get();
-        confirmed.asking.set(None);
-        if let Some(what) = what {
-            match what {
-                Confirm::Logout => confirmed.stream.send("logout"),
-                Confirm::Shutdown => confirmed.stream.send("shutdown"),
-            }
-        }
+        dialog_confirm(&confirmed);
         // The question is answered, and the menu it was asked from has
         // nothing left to say.
         if let Some(launcher) = confirmed.launcher.borrow().upgrade() {
             launcher_close(&launcher);
         }
-        dialog_close(&confirmed);
     });
 
     let escaped = dialog.clone();
     let keys = gtk4::EventControllerKey::new();
     keys.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
-            dialog_close(&escaped);
+            dialog_cancel(&escaped);
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
@@ -3779,16 +3798,136 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
 /// Ask the question, over the top of everything.
 fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launcher>) {
     *dialog.launcher.borrow_mut() = launcher.clone();
-    dialog.asking.set(Some(what));
-    let (question, answer) = match what {
-        Confirm::Logout => ("Log out now?", "Log out"),
-        Confirm::Shutdown => ("Shut down now?", "Shut down"),
-    };
-    dialog.question.set_text(question);
-    dialog.confirm.set_label(answer);
+    dialog.action.set(Some(what));
+    dialog.state.set(DialogState::Asking);
+    dialog_update(dialog);
     dialog.window.set_opacity(0.0);
     dialog.window.present();
     dialog_fade(dialog, true);
+}
+
+/// The answer to the question: go ahead.
+///
+/// The apps are asked to close first, and the session waits for them: the
+/// client is told, and the client decides, and an app with unsaved work can
+/// say no.
+fn dialog_confirm(dialog: &Rc<Dialog>) {
+    let Some(action) = dialog.action.get() else {
+        return;
+    };
+    match dialog.state.get() {
+        DialogState::Asking => {
+            dialog.state.set(DialogState::Waiting);
+            match action {
+                Confirm::Logout => dialog.stream.send("logout"),
+                Confirm::Shutdown => dialog.stream.send("shutdown"),
+            }
+            dialog_update(dialog);
+        }
+        DialogState::Refusing => {
+            // Any way: the apps that said no do not get a second say.
+            dialog.stream.send("force");
+            dialog_close(dialog);
+        }
+        _ => {}
+    }
+}
+
+/// The question is called off.
+fn dialog_cancel(dialog: &Rc<Dialog>) {
+    if dialog.state.get() == DialogState::Waiting {
+        // The compositor is waiting for the apps: tell it to stop waiting.
+        dialog.stream.send("cancel");
+    }
+    dialog.state.set(DialogState::None);
+    dialog_close(dialog);
+}
+
+/// The apps that would not close, named and marked.
+fn dialog_refusing(
+    dialog: &Rc<Dialog>,
+    apps: Vec<(String, Option<crate::desktop::DesktopApp>)>,
+) {
+    while let Some(child) = dialog.apps.first_child() {
+        dialog.apps.remove(&child);
+    }
+    let count = apps.len();
+    for (name, entry) in apps {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        // The app's own mark, and a generic one for an app that is not an
+        // installed application.
+        let icon = match &entry {
+            Some(app) => app_icon(app),
+            None => themed_icon(FALLBACK_ICON),
+        };
+        row.append(&icon);
+        let label = Label::new(Some(&name));
+        label.add_css_class("dialog-app");
+        row.append(&label);
+        dialog.apps.append(&row);
+    }
+    dialog.refusing_count.set(count);
+    dialog.state.set(DialogState::Refusing);
+    dialog_update(dialog);
+}
+
+/// The apps behind these windows, by name and by mark.
+///
+/// The window list is what says which app a window belongs to, and the
+/// desktop entry is what gives the app its name and its picture. A window
+/// whose app is not an installed application is named by its title, which is
+/// better than nothing and better than a number.
+fn refusing_apps(ids: &[u64]) -> Vec<(String, Option<crate::desktop::DesktopApp>)> {
+    let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
+    let mut apps = Vec::new();
+    for id in ids {
+        let Some(info) = snapshot.iter().find(|info| info.id == *id) else {
+            continue;
+        };
+        let entry = crate::desktop::cached(&info.app_id);
+        let name = entry
+            .as_ref()
+            .map(|app| app.label().to_string())
+            .unwrap_or_else(|| info.title.clone());
+        apps.push((name, entry));
+    }
+    apps
+}
+
+/// The question, as it is now.
+fn dialog_update(dialog: &Rc<Dialog>) {
+    let state = dialog.state.get();
+    let action = dialog.action.get();
+    let one = dialog.refusing_count.get() == 1;
+    let (question, answer) = match (state, action) {
+        (DialogState::Asking, Some(Confirm::Logout)) => ("Log out now?", "Log out"),
+        (DialogState::Asking, Some(Confirm::Shutdown)) => ("Shut down now?", "Shut down"),
+        (DialogState::Waiting, _) => ("Asking the apps to close…", ""),
+        (DialogState::Refusing, Some(Confirm::Logout)) => (
+            if one {
+                "This app is preventing Log out."
+            } else {
+                "These apps are preventing Log out."
+            },
+            "Log out anyway",
+        ),
+        (DialogState::Refusing, Some(Confirm::Shutdown)) => (
+            if one {
+                "This app is preventing Shut down."
+            } else {
+                "These apps are preventing Shut down."
+            },
+            "Shut down anyway",
+        ),
+        _ => ("", ""),
+    };
+    dialog.question.set_text(question);
+    if !answer.is_empty() {
+        dialog.confirm.set_label(answer);
+    }
+    // While the apps are being asked there is nothing to answer yet.
+    dialog.confirm.set_sensitive(state != DialogState::Waiting);
+    dialog.apps.set_visible(state == DialogState::Refusing);
 }
 
 /// Take the question away.
@@ -3796,7 +3935,7 @@ fn dialog_close(dialog: &Rc<Dialog>) {
     if !dialog.window.is_visible() {
         return;
     }
-    dialog.asking.set(None);
+    dialog.state.set(DialogState::None);
     dialog_fade(dialog, false);
 }
 
@@ -5594,6 +5733,14 @@ scrollbar slider:active {{
     color: #e8e8e8;
     font-weight: 500;
 }}
+/* The apps that are holding the session up, by their own marks and names. */
+.dialog-apps {{
+    background: transparent;
+}}
+.dialog-app {{
+    color: #e8e8e8;
+    font-weight: 500;
+}}
 button.dialog-button {{
     background: transparent;
     background-image: none;
@@ -5644,6 +5791,8 @@ enum PanelEvent {
     },
     /// The connection is gone. The panel starts over and reconnects.
     Disconnected,
+    /// The apps that would not close, by the compositor's window ids.
+    Refusing(Vec<u64>),
     /// The compositor wants the app menu opened.
     ///
     /// The Super key, on its own. The menu is the panel's, and the compositor
@@ -5744,6 +5893,12 @@ fn parse_frame(frame: &[u8]) -> Option<PanelEvent> {
     match fields.first().map(String::as_str) {
         Some("list") => parse_snapshot(&fields).map(PanelEvent::Snapshot),
         Some("menu") => Some(PanelEvent::OpenMenu),
+        Some("refusing") => Some(PanelEvent::Refusing(
+            fields[1..]
+                .iter()
+                .filter_map(|field| field.parse().ok())
+                .collect(),
+        )),
         _ => None,
     }
 }
@@ -5875,7 +6030,7 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // The question the two ways out of the session ask, and the launcher that
     // holds them.
     let dialog = build_dialog(app, &monitor, channel.clone());
-    let (launcher, launcher_button) = build_launcher(app, &monitor, channel.clone(), dialog);
+    let (launcher, launcher_button) = build_launcher(app, &monitor, channel.clone(), dialog.clone());
     bar_row.prepend(&launcher_button);
     let hover = Rc::new(Hover::default());
 
@@ -5900,7 +6055,7 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // Polled whether or not there was a socket to begin with: a panel started before its
     // compositor is listening yet is the ordinary case on a login, and the reconnect in
     // the poll timer is what picks it up.
-    start_polling(&tasks, &menu, &channel, hover, &context, &launcher);
+    start_polling(&tasks, &menu, &channel, hover, &context, &launcher, &dialog);
 
     bar.present();
     // And then it slides down into place. A frame first, so the bar has been
@@ -6235,11 +6390,13 @@ fn start_polling(
     _hover: Rc<Hover>,
     context: &Rc<ContextMenu>,
     launcher: &Rc<Launcher>,
+    dialog: &Rc<Dialog>,
 ) {
     let menu = menu.clone();
     let tasks = tasks.clone();
     let context = context.clone();
     let launcher = launcher.clone();
+    let dialog = dialog.clone();
     let reader = RefCell::new(PanelReader::default());
     let windows = Rc::new(RefCell::new(Vec::<WindowInfo>::new()));
     // Both timers below need this state, so hand each its own handle.
@@ -6304,6 +6461,10 @@ fn start_polling(
                     // never arrived and every later one was a frame stale, which is
                     // exactly what a preview that never seems to change looks like.
                     menu_set_image(&menu, id, width, height, pixels);
+                }
+                PanelEvent::Refusing(ids) => {
+                    // The apps that would not close, by name and by mark.
+                    dialog_refusing(&dialog, refusing_apps(&ids));
                 }
                 PanelEvent::OpenMenu => {
                     // The Super key, on its own. The menu opens where it is:
@@ -10938,6 +11099,53 @@ mod tests {
             !still_on_the_bar("thunderbird", &barred),
             "an app nobody pinned and nobody has open has left the panel"
         );
+    }
+
+    #[test]
+    fn the_apps_that_would_not_close_arrive_by_their_window_ids() {
+        // The compositor names the windows that refused; the panel turns them
+        // into the apps they belong to.
+        match parse_frame(b"refusing\t3\t4") {
+            Some(PanelEvent::Refusing(ids)) => assert_eq!(ids, vec![3, 4]),
+            other => panic!("expected the windows that refused, got {other:?}"),
+        }
+        // And one that is not a number is not an id.
+        match parse_frame(b"refusing\tthree") {
+            Some(PanelEvent::Refusing(ids)) => assert!(ids.is_empty()),
+            other => panic!("expected the windows that refused, got {other:?}"),
+        }
+
+        // A window whose app is not an installed application is named by its
+        // title, which is better than nothing. (The other half of it -- an app
+        // that is installed being named by its entry -- depends on what the
+        // machine has installed, so it is the desktop module's business and not
+        // this one's.)
+        SNAPSHOT.with(|cell| {
+            *cell.borrow_mut() = vec![
+                WindowInfo {
+                    id: 7,
+                    focused: false,
+                    minimized: false,
+                    app_id: "not-an-installed-app".into(),
+                    title: "a terminal".into(),
+                },
+                WindowInfo {
+                    id: 8,
+                    focused: false,
+                    minimized: false,
+                    app_id: "not-an-installed-app-either".into(),
+                    title: "some other window".into(),
+                },
+            ]
+        });
+        let apps = refusing_apps(&[7, 8]);
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].0, "a terminal");
+        assert_eq!(apps[1].0, "some other window");
+        // And neither of them has an entry, so neither has a mark of its own.
+        assert!(apps[0].1.is_none());
+        assert!(apps[1].1.is_none());
+        SNAPSHOT.with(|cell| cell.borrow_mut().clear());
     }
 
     #[test]

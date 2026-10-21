@@ -25,7 +25,7 @@ session through winit or X11, and handles both server-side and client-side decor
 - An app menu at the left of the bar, or on the Super key: every installed application,
   searchable by name, started with a click or with the keyboard. Its foot has the
   user's picture and name on one side, and log out and shut down on the other — both of
-  which ask first.
+  which ask first, and then ask every app to close itself.
 - Live window previews, and a per-app menu with pin, quit and launch.
 - The bar slides in, squares trade places over 250 ms, and the wallpaper fades up behind
   everything.

@@ -136,6 +136,32 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// What the panel asked the session to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndSession {
+    /// End the session.
+    Logout,
+    /// Power the machine off.
+    Shutdown,
+}
+
+/// A session the panel asked to end, and how it is going.
+///
+/// The apps are asked to close rather than told to, so an app with unsaved
+/// work can say no; the ones that say no are named for the panel, and the
+/// person at the keyboard decides what happens to them.
+#[derive(Debug)]
+pub struct PendingSessionEnd {
+    /// What was asked for.
+    pub what: EndSession,
+    /// The windows that were asked to close.
+    pub windows: Vec<u64>,
+    /// When they were asked.
+    pub asked_at: Instant,
+    /// Whether the panel has been told which of them refused.
+    pub reported: bool,
+}
+
 /// What the Super key is doing, while it is doing it.
 ///
 /// The Super key on its own opens the app menu, and the Super key with
@@ -194,6 +220,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
+    /// A session the panel asked to end, and the apps that would not close.
+    pub pending_session_end: Option<PendingSessionEnd>,
     /// What the Super key is doing.
     ///
     /// The Super key on its own opens the app menu, and the Super key with
@@ -879,6 +907,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             super_key: Rc::new(Cell::new(SuperKey::default())),
+            pending_session_end: None,
             cursor_status: CursorImageStatus::default_named(),
             seat_name,
             seat,
