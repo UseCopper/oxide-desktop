@@ -2982,6 +2982,14 @@ const PIN_SVG: &[u8] = include_bytes!("../assets/pin.svg");
 const UNPIN_SVG: &[u8] = include_bytes!("../assets/unpin.svg");
 /// The app menu's own square: Material's three-by-three grid.
 const APPS_SVG: &[u8] = include_bytes!("../assets/apps.svg");
+/// Material's account mark, which stands in for a picture of the user.
+const ACCOUNT_CIRCLE_SVG: &[u8] = include_bytes!("../assets/account_circle.svg");
+/// Material's log out.
+const LOGOUT_SVG: &[u8] = include_bytes!("../assets/logout.svg");
+/// Material's power.
+const POWER_SVG: &[u8] = include_bytes!("../assets/power.svg");
+/// Material's close, for the way out of a question.
+const CLOSE_SVG: &[u8] = include_bytes!("../assets/close.svg");
 
 /// One of those drawn icons, rasterised into the texture a row puts beside its label.
 ///
@@ -3374,11 +3382,25 @@ fn context_close(context: &Rc<ContextMenu>) {
 /// clicks — and it asks for the keyboard exclusively while it is up, so typing goes
 /// into the search field rather than into the window underneath.
 const LAUNCHER_WIDTH: i32 = 360;
-/// How tall the list may grow before it scrolls. A full application list is taller
-/// than any output worth filling with a menu.
-const LAUNCHER_MAX_HEIGHT: i32 = 520;
+/// How tall the menu is, always.
+///
+/// One size: a menu that grew and shrank with the list moved under the pointer
+/// every time a letter was typed, and a list filtered down to nothing left a
+/// strip with a hole in it. The list scrolls inside this instead.
+const LAUNCHER_HEIGHT: i32 = 560;
+/// The size of the user's picture in the foot of the menu.
+const AVATAR_SIZE: i32 = 32;
 /// The air between the bar and the menu's plate.
 const LAUNCHER_GAP: i32 = 6;
+
+/// Which of the two ways out of the session the foot is asking about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    /// Ending the session.
+    Logout,
+    /// Powering the machine off.
+    Shutdown,
+}
 
 struct Launcher {
     window: gtk4::Window,
@@ -3396,6 +3418,19 @@ struct Launcher {
     closing: Cell<bool>,
     /// Which visible row the keyboard is on.
     selected: Cell<usize>,
+    /// The foot, and the foot that asks whether it should.
+    ///
+    /// Both are built; one is shown. The two ways out of the session are the
+    /// two things in a desktop that cannot be taken back, and a foot that
+    /// ended the session on one click was a foot that could end it by accident.
+    asking: Cell<Option<Confirm>>,
+    logout_button: Button,
+    shutdown_button: Button,
+    /// The user's picture, in the foot.
+    avatar: gtk4::DrawingArea,
+    ask: GtkBox,
+    question: Label,
+    confirm_button: Button,
     /// Bumped by every fade, so only the newest one touches the window.
     token: Cell<u64>,
 }
@@ -3438,7 +3473,7 @@ fn build_launcher(
 
     let plate = GtkBox::new(Orientation::Vertical, 0);
     plate.add_css_class("launcher");
-    plate.set_size_request(LAUNCHER_WIDTH, -1);
+    plate.set_size_request(LAUNCHER_WIDTH, LAUNCHER_HEIGHT);
 
     let search = gtk4::SearchEntry::new();
     search.add_css_class("launcher-search");
@@ -3452,20 +3487,57 @@ fn build_launcher(
 
     let rows = GtkBox::new(Orientation::Vertical, 2);
     rows.add_css_class("launcher-rows");
-
-    let scroller = gtk4::ScrolledWindow::new();
-    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scroller.set_max_content_height(LAUNCHER_MAX_HEIGHT);
-    scroller.set_propagate_natural_height(true);
-    scroller.set_child(Some(&rows));
-
+    // The "nothing matches" line is part of the list, not a panel of its own:
+    // the list is what gives way, and the foot stays where it is.
     let empty = Label::new(Some("No applications match"));
     empty.add_css_class("launcher-empty");
     empty.set_visible(false);
+    rows.append(&empty);
+
+    // The list takes the space between the field and the foot, and scrolls inside
+    // it: the menu is a fixed size, so the list is the part that gives way.
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&rows));
+
+    // The foot: who is at the keyboard, and the two ways out of the session.
+    let footer = GtkBox::new(Orientation::Horizontal, 8);
+    footer.add_css_class("launcher-footer");
+    let who = GtkBox::new(Orientation::Horizontal, 10);
+    who.set_hexpand(true);
+    let avatar = avatar_area();
+    who.append(&avatar);
+    let name = Label::new(Some(&user_name()));
+    name.add_css_class("launcher-user");
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    who.append(&name);
+    footer.append(&who);
+    // The right of the foot holds the two ways out of the session, or the
+    // question that stands in front of one of them.
+    let logout = action_button(LOGOUT_SVG, "Log out");
+    let shutdown = action_button(POWER_SVG, "Shut down");
+    let ask = GtkBox::new(Orientation::Horizontal, 6);
+    ask.add_css_class("launcher-ask");
+    let question = Label::new(Some("Shut down?"));
+    question.add_css_class("launcher-question");
+    ask.append(&question);
+    let cancel = action_button(CLOSE_SVG, "Cancel");
+    let confirm = action_button(POWER_SVG, "Shut down");
+    // The answer, in the accent: it is the one that does it.
+    confirm.add_css_class("launcher-confirm");
+    ask.append(&cancel);
+    ask.append(&confirm);
+    ask.set_visible(false);
+    footer.append(&logout);
+    footer.append(&shutdown);
+    footer.append(&ask);
 
     plate.append(&search);
     plate.append(&scroller);
     plate.append(&empty);
+    plate.append(&footer);
     window.set_child(Some(&plate));
 
     let launcher = Rc::new(Launcher {
@@ -3481,6 +3553,13 @@ fn build_launcher(
         closing: Cell::new(false),
         selected: Cell::new(0),
         token: Cell::new(0),
+        asking: Cell::new(None),
+        logout_button: logout.clone(),
+        shutdown_button: shutdown.clone(),
+        avatar: avatar.clone(),
+        ask: ask.clone(),
+        question: question.clone(),
+        confirm_button: confirm.clone(),
     });
 
     // The shield dismisses the menu it was built for, held weakly so it does not
@@ -3534,6 +3613,35 @@ fn build_launcher(
     });
     launcher.search.add_controller(keys);
 
+    // The two ways out of the session. Both ask first: the button in the foot
+    // asks, and the answer is what does it. The compositor carries it out --
+    // the panel asks, and the compositor does it.
+    let asking = launcher.clone();
+    logout.connect_clicked(move |_| {
+        asking.asking.set(Some(Confirm::Logout));
+        update_foot(&asking);
+    });
+    let asking = launcher.clone();
+    shutdown.connect_clicked(move |_| {
+        asking.asking.set(Some(Confirm::Shutdown));
+        update_foot(&asking);
+    });
+    let asking = launcher.clone();
+    cancel.connect_clicked(move |_| {
+        asking.asking.set(None);
+        update_foot(&asking);
+    });
+    let sender = launcher.stream.clone();
+    let owned = launcher.clone();
+    confirm.connect_clicked(move |_| {
+        match owned.asking.get() {
+            Some(Confirm::Logout) => sender.send("logout"),
+            Some(Confirm::Shutdown) => sender.send("shutdown"),
+            None => {}
+        }
+        launcher_close(&owned);
+    });
+
     // The square on the bar. It wears the task square's class so it is the same
     // square as the rest, not a second kind of button beside them.
     let button = Button::new();
@@ -3548,6 +3656,236 @@ fn build_launcher(
     button.connect_clicked(move |_| launcher_open(&opener));
 
     (launcher, button)
+}
+
+/// A button in the foot of the app menu: an icon, and what it does in a tooltip.
+fn action_button(svg: &'static [u8], tip: &str) -> Button {
+    let button = Button::new();
+    button.add_css_class("launcher-action");
+    // The first click must activate, not grab focus.
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some(tip));
+    button.set_child(Some(&icon_widget(svg)));
+    button
+}
+
+/// An icon, at the size the panel's icons are.
+fn icon_widget(svg: &'static [u8]) -> Image {
+    let icon = drawn_icon(svg);
+    icon.set_pixel_size(CONTEXT_ICON_SIZE);
+    icon
+}
+
+/// Show the foot, or the question that stands in front of one of its buttons.
+fn update_foot(launcher: &Rc<Launcher>) {
+    let asking = launcher.asking.get();
+    launcher.logout_button.set_visible(asking.is_none());
+    launcher.shutdown_button.set_visible(asking.is_none());
+    launcher.ask.set_visible(asking.is_some());
+    let Some(what) = asking else {
+        return;
+    };
+    let (question, icon) = match what {
+        Confirm::Logout => ("Log out?", icon_widget(LOGOUT_SVG)),
+        Confirm::Shutdown => ("Shut down?", icon_widget(POWER_SVG)),
+    };
+    launcher.question.set_text(question);
+    launcher.confirm_button.set_child(Some(&icon));
+}
+
+/// The user's picture, in a circle, or Material's account mark when there is no
+/// picture to show.
+fn avatar_area() -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::new();
+    area.set_content_width(AVATAR_SIZE);
+    area.set_content_height(AVATAR_SIZE);
+    refresh_avatar(&area);
+    area
+}
+
+/// Give the avatar whatever picture there is now.
+///
+/// The picture is read when the menu opens rather than when the panel starts,
+/// so a picture that has changed since the session began is the one on show.
+fn refresh_avatar(area: &gtk4::DrawingArea) {
+    let picture = user_picture().or_else(material_avatar);
+    area.set_draw_func(move |_, context, width, height| {
+        let Some(picture) = picture.as_ref() else {
+            return;
+        };
+        // A circle, because a picture in a rectangle is a picture of something.
+        let radius = f64::from(width.min(height)) / 2.0;
+        let _ = context.save();
+        let _ = context.arc(
+            f64::from(width) / 2.0,
+            f64::from(height) / 2.0,
+            radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        let _ = context.clip();
+        // Cover, so the picture fills the circle rather than fitting inside it.
+        let scale = (f64::from(width) / f64::from(picture.width()))
+            .max(f64::from(height) / f64::from(picture.height()));
+        let wide = f64::from(picture.width()) * scale;
+        let tall = f64::from(picture.height()) * scale;
+        let _ = context.set_source_surface(
+            picture,
+            (f64::from(width) - wide) / 2.0,
+            (f64::from(height) - tall) / 2.0,
+        );
+        let _ = context.paint();
+        let _ = context.restore();
+    });
+}
+
+/// The user's picture, if there is one to show.
+///
+/// Remembered, with the file and the moment it was read: a picture is a
+/// photograph, and reading one is not free, so a picture that has not changed
+/// is not read again -- and one that has is.
+fn user_picture() -> Option<gtk4::cairo::ImageSurface> {
+    AVATAR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        for path in avatar_paths() {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let modified = meta.modified().ok();
+            if let Some((cached, when, surface)) = slot.as_ref()
+                && cached == &path
+                && when == &modified
+            {
+                return surface.clone();
+            }
+            let surface = picture_surface(&path);
+            *slot = Some((path, modified, surface.clone()));
+            return surface;
+        }
+        None
+    })
+}
+
+thread_local! {
+    /// The picture on show, the file it came from, and when it was read.
+    static AVATAR: RefCell<Option<(PathBuf, Option<std::time::SystemTime>, Option<gtk4::cairo::ImageSurface>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Where the user's picture is looked for, in order.
+///
+/// The desktop's own setting first, then the convention some setups use, then
+/// the copy AccountsService keeps. A path that is not there is not a problem:
+/// it is one more place that is not the picture.
+fn avatar_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home_dir() {
+        let config = config_home(&home).join("oxide-desktop");
+        for extension in ["png", "jpg", "jpeg", "webp"] {
+            paths.push(config.join(format!("face.{extension}")));
+        }
+        paths.push(home.join(".face"));
+    }
+    if let Some(home) = home_dir() {
+        paths.push(data_home(&home).join("accounts").join("user").join("face"));
+    }
+    paths
+}
+
+/// The name of the person at the keyboard.
+///
+/// The session's own name for it, and the home directory's name for it when the
+/// session has none: a panel with no name in the corner of it is a panel that
+/// has forgotten who is using it.
+fn user_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            home_dir()
+                .and_then(|home| home.file_name().map(|name| name.to_string_lossy().to_string()))
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "user".to_string())
+}
+
+/// The user's home directory, if the session has one.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// The user's configuration directory.
+fn config_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+/// The user's data directory.
+fn data_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".local").join("share"))
+}
+
+/// A picture from a file, as pixels cairo can paint.
+///
+/// The middle square of the picture, scaled to the size of the avatar: a
+/// portrait and a landscape are cropped the same way, so the circle is filled
+/// rather than letterboxed.
+fn picture_surface(path: &Path) -> Option<gtk4::cairo::ImageSurface> {
+    let image = image::open(path).ok()?.into_rgba8();
+    let side = image.width().min(image.height());
+    if side == 0 {
+        return None;
+    }
+    let x = (image.width() - side) / 2;
+    let y = (image.height() - side) / 2;
+    let square = image::imageops::crop_imm(&image, x, y, side, side).to_image();
+    let square = image::imageops::resize(
+        &square,
+        AVATAR_SIZE as u32,
+        AVATAR_SIZE as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let (width, height) = square.dimensions();
+    let mut pixels = square.into_raw();
+    to_cairo_rgba(&mut pixels);
+    gtk4::cairo::ImageSurface::create_for_data(
+        pixels,
+        gtk4::cairo::Format::ARgb32,
+        width as i32,
+        height as i32,
+        width as i32 * 4,
+    )
+    .ok()
+}
+
+/// Material's account mark, as pixels cairo can paint.
+fn material_avatar() -> Option<gtk4::cairo::ImageSurface> {
+    let texture = drawn_texture(ACCOUNT_CIRCLE_SVG)?;
+    let (width, height) = (texture.width(), texture.height());
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    // A texture's pixels come down in cairo's own order, which is the order
+    // cairo wants, so nothing is converted here.
+    let stride = width as usize * 4;
+    let mut pixels = vec![0u8; stride * height as usize];
+    texture.download(&mut pixels, stride);
+    gtk4::cairo::ImageSurface::create_for_data(
+        pixels,
+        gtk4::cairo::Format::ARgb32,
+        width,
+        height,
+        stride as i32,
+    )
+    .ok()
 }
 
 /// Put every installed application in the menu, ready for the search to hide the ones
@@ -3609,6 +3947,12 @@ fn launcher_open(launcher: &Rc<Launcher>) {
         return;
     }
     launcher_build(launcher);
+    // The picture is read now, not when the panel started: a face that has
+    // changed since the session began is the face on show.
+    refresh_avatar(&launcher.avatar);
+    // A question left over from last time is not a question any more.
+    launcher.asking.set(None);
+    update_foot(launcher);
     // Emptying the field filters back to everything; a stale query from last time
     // would open onto a list the user did not ask for.
     launcher.search.set_text("");
@@ -3712,7 +4056,6 @@ fn launcher_filter(launcher: &Rc<Launcher>) {
         }
     }
     launcher.empty.set_visible(visible == 0);
-    launcher.scroller.set_visible(visible > 0);
     launcher.selected.set(0);
     launcher_highlight(launcher);
 }
@@ -5008,6 +5351,45 @@ button.launcher-row.picked {{
 .launcher-empty {{
     color: rgba(232, 232, 232, 0.6);
     padding: 12px 10px;
+}}
+/* The foot of the app menu: who is at the keyboard on the left, and the two
+   ways out of the session on the right. A line above it, because it is a
+   different thing from the list above it. */
+.launcher-footer {{
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, {cell_edge_a});
+}}
+.launcher-user {{
+    color: #e8e8e8;
+    font-weight: 500;
+}}
+/* The two buttons are the panel's own: a filled square would be a square on
+   the bar, and these are not on the bar. */
+button.launcher-action {{
+    background: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 4px;
+    border-radius: {cell_radius}px;
+    min-width: 28px;
+    min-height: 28px;
+}}
+button.launcher-action:hover {{
+    background-color: rgba(255, 255, 255, {task_hover});
+}}
+/* The question, and the answer to it. */
+.launcher-question {{
+    color: #e8e8e8;
+    font-weight: 500;
+    margin-right: 4px;
+}}
+button.launcher-action.launcher-confirm {{
+    background-color: rgba({r}, {g}, {b}, {task_focused});
+}}
+button.launcher-action.launcher-confirm:hover {{
+    background-color: rgba({r}, {g}, {b}, {task_focused});
 }}
 "
     )
@@ -10379,6 +10761,9 @@ mod tests {
             ".launcher-search text {",
             "button.launcher-row {",
             ".launcher-empty {",
+            ".launcher-footer {",
+            "button.launcher-action {",
+            ".launcher-question {",
         ] {
             assert!(sheet.contains(head), "missing from the sheet: {head}");
         }

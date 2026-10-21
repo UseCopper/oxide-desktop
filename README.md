@@ -23,7 +23,8 @@ session through winit or X11, and handles both server-side and client-side decor
 
 - Pinned apps and a task bar, reorderable by dragging a square.
 - An app menu at the left of the bar, or on the Super key: every installed application,
-  searchable by name, started with a click or with the keyboard.
+  searchable by name, started with a click or with the keyboard. Its foot has the
+  user's picture and name on one side, and log out and shut down on the other.
 - Live window previews, and a per-app menu with pin, quit and launch.
 - The bar slides in, squares trade places over 250 ms, and the wallpaper fades up behind
   everything.
@@ -67,6 +68,10 @@ without logind also works. The panel is a child process of the compositor
 
 The panel remembers pins and bar order in `~/.config/oxide-desktop/panel.conf`. A missing
 or malformed file means no pins, never a bar that refuses to start.
+
+The app menu's foot shows the user's picture if there is one: `~/.config/oxide-desktop/face.png`
+(or `.jpg`, `.jpeg`, `.webp`), `~/.face`, or the copy AccountsService keeps. Without one it
+shows Material's account mark.
 
 The wallpaper is the first of these that exists, unless `$OXIDE_WALLPAPER` names a file
 outright:

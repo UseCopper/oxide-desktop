@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    Google Material Symbols, "power_settings_new" (filled).
+    Copyright Google LLC, licensed under the Apache License 2.0.
+    Changed: recoloured for the panel.
+  -->
+  <path fill="#e8e8e8" d="M13 3h-2v10h2V3zm4.83 1.17l-1.42 1.42C17.99 7.15 19 8.77 19 10.5c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-1.73 1.01-3.35 2.59-4.91L6.17 4.17C4.23 5.82 3 7.99 3 10.5 3 15.54 7.03 19.5 12 19.5s9-3.96 9-9c0-2.51-1.23-4.68-3.17-6.33z"/>
+</svg>

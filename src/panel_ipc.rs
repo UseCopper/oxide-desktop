@@ -18,11 +18,11 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     focus::KeyboardFocusTarget,
@@ -125,6 +125,11 @@ pub enum PanelMessage {
     },
     /// The desktop accent color, as linear-ish sRGB components.
     Accent([f32; 3]),
+    /// End the session: the compositor is what is running it, so it is what
+    /// goes.
+    Logout,
+    /// Power the machine off.
+    Shutdown,
 }
 
 /// A window preview on its way to the panel.
@@ -523,6 +528,8 @@ fn parse_frame(frame: &[u8]) -> Incoming {
             }
             _ => Incoming::Ignored,
         },
+        Some("logout") => Incoming::Message(PanelMessage::Logout),
+        Some("shutdown") => Incoming::Message(PanelMessage::Shutdown),
         Some("accent") => match parse_accent(&fields) {
             Some(rgb) => Incoming::Message(PanelMessage::Accent(rgb)),
             None => Incoming::Ignored,
@@ -626,6 +633,24 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 PanelMessage::Focus(id) => self.focus_panel_window(id),
                 PanelMessage::Close(id) => self.close_panel_window(id),
                 PanelMessage::Launch(id) => self.launch_app(&id),
+                PanelMessage::Logout => {
+                    // The panel asked to end the session. The compositor is the
+                    // session, so the compositor is what stops.
+                    info!("panel asked to log out");
+                    self.running.store(false, Ordering::SeqCst);
+                }
+                PanelMessage::Shutdown => {
+                    // Asked through systemd, so the machine is brought down the
+                    // way it is meant to be brought down -- and so whatever
+                    // usually asks for permission to do it still gets to.
+                    info!("panel asked to shut down");
+                    if let Err(err) = std::process::Command::new("systemctl")
+                        .arg("poweroff")
+                        .spawn()
+                    {
+                        warn!(%err, "could not ask for the machine to power off");
+                    }
+                }
                 PanelMessage::Accent(rgb) => crate::shell::set_preview_color(rgb),
                 PanelMessage::Preview {
                     id,
