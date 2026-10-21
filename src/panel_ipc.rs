@@ -670,12 +670,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // the ones that would not are named for the panel, so the panel can
         // name them for the person at the keyboard.
         if let Some(mut pending) = self.pending_session_end.take() {
+            let still_there: Vec<u64> = self
+                .space
+                .elements()
+                .filter_map(|window| window.with_state(|state| state.panel_id))
+                .collect();
             if !pending.reported && pending.asked_at.elapsed() >= SESSION_CLOSE_GRACE {
-                let still_there: Vec<u64> = self
-                    .space
-                    .elements()
-                    .filter_map(|window| window.with_state(|state| state.panel_id))
-                    .collect();
                 let refusing = windows_still_there(&pending.windows, &still_there);
                 if refusing.is_empty() {
                     // They all closed: the session ends as it was asked to.
@@ -692,6 +692,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     }
                 }
             } else {
+                // The apps that are still open, as they close: the panel shows
+                // them going, so the wait is a list getting shorter rather than
+                // a question with nothing behind it.
+                if still_there != pending.sent {
+                    pending.sent = still_there.clone();
+                    let message = std::iter::once("closing".to_string())
+                        .chain(still_there.iter().map(u64::to_string))
+                        .collect::<Vec<_>>()
+                        .join("\t");
+                    if let Some(ipc) = self.panel_ipc.as_mut() {
+                        ipc.send_message(&message);
+                    }
+                }
                 self.pending_session_end = Some(pending);
             }
         }
@@ -974,6 +987,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             windows,
             asked_at: Instant::now(),
             reported: false,
+            sent: Vec::new(),
         });
     }
 

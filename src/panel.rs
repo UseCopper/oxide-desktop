@@ -3656,6 +3656,9 @@ enum DialogState {
 /// out loud.
 struct Dialog {
     window: gtk4::Window,
+    /// The plate the question is on. Its size is eased when the question
+    /// changes shape, so the popup does not jump.
+    plate: GtkBox,
     question: Label,
     /// The apps that would not close, by their own marks and names.
     apps: GtkBox,
@@ -3671,6 +3674,8 @@ struct Dialog {
     launcher: RefCell<std::rc::Weak<Launcher>>,
     /// Bumped by every fade, so only the newest one touches the window.
     token: Cell<u64>,
+    /// Bumped by every resize, so only the newest one touches the plate.
+    size_token: Cell<u64>,
     stream: Channel,
 }
 
@@ -3724,11 +3729,18 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     answers.set_halign(gtk4::Align::End);
     answers.append(&cancel);
     answers.append(&confirm);
-    let plate = GtkBox::new(Orientation::Vertical, 18);
+    let content = GtkBox::new(Orientation::Vertical, 18);
+    content.append(&question);
+    content.append(&apps);
+    content.append(&answers);
+    // The plate is the thing that is resized when the question changes shape,
+    // so what is on it is centred inside it rather than packed at its top: a
+    // plate that grows has to grow around the question, not below it.
+    let plate = GtkBox::new(Orientation::Vertical, 0);
     plate.add_css_class("dialog-plate");
-    plate.append(&question);
-    plate.append(&apps);
-    plate.append(&answers);
+    plate.append(&content);
+    content.set_halign(gtk4::Align::Center);
+    content.set_valign(gtk4::Align::Center);
 
     // The dialog over the dimming, so a click on the dimming is a click on
     // nothing in particular and the question is taken back.
@@ -3741,6 +3753,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
 
     let dialog = Rc::new(Dialog {
         window: window.clone(),
+        plate: plate.clone(),
         question,
         apps,
         confirm: confirm.clone(),
@@ -3749,6 +3762,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         action: Cell::new(None),
         launcher: RefCell::new(std::rc::Weak::new()),
         token: Cell::new(0),
+        size_token: Cell::new(0),
         stream,
     });
 
@@ -3843,8 +3857,35 @@ fn dialog_cancel(dialog: &Rc<Dialog>) {
     dialog_close(dialog);
 }
 
+/// The apps that are still open, as they close.
+///
+/// The question is not waiting on nothing: the apps that are still up are
+/// named while they go, so the wait is a list that is getting shorter.
+fn dialog_closing(
+    dialog: &Rc<Dialog>,
+    apps: Vec<(String, Option<crate::desktop::DesktopApp>)>,
+) {
+    if dialog.state.get() != DialogState::Waiting {
+        return;
+    }
+    dialog_fill_apps(dialog, apps);
+    dialog_update(dialog);
+    dialog_resize(dialog);
+}
+
 /// The apps that would not close, named and marked.
 fn dialog_refusing(
+    dialog: &Rc<Dialog>,
+    apps: Vec<(String, Option<crate::desktop::DesktopApp>)>,
+) {
+    dialog_fill_apps(dialog, apps);
+    dialog.state.set(DialogState::Refusing);
+    dialog_update(dialog);
+    dialog_resize(dialog);
+}
+
+/// The apps on the plate: their own marks and their own names.
+fn dialog_fill_apps(
     dialog: &Rc<Dialog>,
     apps: Vec<(String, Option<crate::desktop::DesktopApp>)>,
 ) {
@@ -3867,8 +3908,49 @@ fn dialog_refusing(
         dialog.apps.append(&row);
     }
     dialog.refusing_count.set(count);
-    dialog.state.set(DialogState::Refusing);
-    dialog_update(dialog);
+}
+
+/// Ease the plate from the size it has to the size it needs.
+///
+/// The question changes shape as the apps go: one line becomes two, a list
+/// gets shorter, a refusal is a different sentence from a wait. A popup that
+/// jumps between its sizes is a popup that is being somewhere else for a
+/// frame, so the size is eased: in and out, so it is the same motion whether
+/// it is growing or shrinking.
+fn dialog_resize(dialog: &Rc<Dialog>) {
+    let (_, natural_width, _, _) = dialog.plate.measure(gtk4::Orientation::Horizontal, -1);
+    let (_, natural_height, _, _) = dialog
+        .plate
+        .measure(gtk4::Orientation::Vertical, dialog.plate.width());
+    let from_width = dialog.plate.width();
+    let from_height = dialog.plate.height();
+    if from_width == natural_width && from_height == natural_height {
+        return;
+    }
+    let token = dialog.size_token.get().wrapping_add(1);
+    dialog.size_token.set(token);
+    let plate = dialog.plate.clone();
+    let owned = dialog.clone();
+    let start = Instant::now();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.size_token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let eased = ease_in_out(t);
+        let width = (f64::from(from_width)
+            + (f64::from(natural_width) - f64::from(from_width)) * eased)
+            .round() as i32;
+        let height = (f64::from(from_height)
+            + (f64::from(natural_height) - f64::from(from_height)) * eased)
+            .round() as i32;
+        plate.set_size_request(width.max(1), height.max(1));
+        if t >= 1.0 {
+            plate.set_size_request(natural_width.max(1), natural_height.max(1));
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// The apps behind these windows, by name and by mark.
@@ -3877,7 +3959,7 @@ fn dialog_refusing(
 /// desktop entry is what gives the app its name and its picture. A window
 /// whose app is not an installed application is named by its title, which is
 /// better than nothing and better than a number.
-fn refusing_apps(ids: &[u64]) -> Vec<(String, Option<crate::desktop::DesktopApp>)> {
+fn apps_behind(ids: &[u64]) -> Vec<(String, Option<crate::desktop::DesktopApp>)> {
     let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
     let mut apps = Vec::new();
     for id in ids {
@@ -3902,20 +3984,21 @@ fn dialog_update(dialog: &Rc<Dialog>) {
     let (question, answer) = match (state, action) {
         (DialogState::Asking, Some(Confirm::Logout)) => ("Log out now?", "Log out"),
         (DialogState::Asking, Some(Confirm::Shutdown)) => ("Shut down now?", "Shut down"),
-        (DialogState::Waiting, _) => ("Asking the apps to close…", ""),
+        (DialogState::Waiting, Some(Confirm::Logout)) => ("Logging out…", ""),
+        (DialogState::Waiting, Some(Confirm::Shutdown)) => ("Shutting down…", ""),
         (DialogState::Refusing, Some(Confirm::Logout)) => (
             if one {
-                "This app is preventing Log out."
+                "This app is preventing logout."
             } else {
-                "These apps are preventing Log out."
+                "These apps are preventing logout."
             },
             "Log out anyway",
         ),
         (DialogState::Refusing, Some(Confirm::Shutdown)) => (
             if one {
-                "This app is preventing Shut down."
+                "This app is preventing shutdown."
             } else {
-                "These apps are preventing Shut down."
+                "These apps are preventing shutdown."
             },
             "Shut down anyway",
         ),
@@ -3927,7 +4010,9 @@ fn dialog_update(dialog: &Rc<Dialog>) {
     }
     // While the apps are being asked there is nothing to answer yet.
     dialog.confirm.set_sensitive(state != DialogState::Waiting);
-    dialog.apps.set_visible(state == DialogState::Refusing);
+    // The apps are on show whenever there are any: the ones that are closing
+    // while they close, and the ones that would not afterwards.
+    dialog.apps.set_visible(dialog.refusing_count.get() > 0);
 }
 
 /// Take the question away.
@@ -5791,6 +5876,8 @@ enum PanelEvent {
     },
     /// The connection is gone. The panel starts over and reconnects.
     Disconnected,
+    /// The apps that are still open, by the compositor's window ids.
+    Closing(Vec<u64>),
     /// The apps that would not close, by the compositor's window ids.
     Refusing(Vec<u64>),
     /// The compositor wants the app menu opened.
@@ -5893,6 +5980,12 @@ fn parse_frame(frame: &[u8]) -> Option<PanelEvent> {
     match fields.first().map(String::as_str) {
         Some("list") => parse_snapshot(&fields).map(PanelEvent::Snapshot),
         Some("menu") => Some(PanelEvent::OpenMenu),
+        Some("closing") => Some(PanelEvent::Closing(
+            fields[1..]
+                .iter()
+                .filter_map(|field| field.parse().ok())
+                .collect(),
+        )),
         Some("refusing") => Some(PanelEvent::Refusing(
             fields[1..]
                 .iter()
@@ -6462,9 +6555,13 @@ fn start_polling(
                     // exactly what a preview that never seems to change looks like.
                     menu_set_image(&menu, id, width, height, pixels);
                 }
+                PanelEvent::Closing(ids) => {
+                    // The apps that are still up, as they go.
+                    dialog_closing(&dialog, apps_behind(&ids));
+                }
                 PanelEvent::Refusing(ids) => {
                     // The apps that would not close, by name and by mark.
-                    dialog_refusing(&dialog, refusing_apps(&ids));
+                    dialog_refusing(&dialog, apps_behind(&ids));
                 }
                 PanelEvent::OpenMenu => {
                     // The Super key, on its own. The menu opens where it is:
@@ -11138,7 +11235,7 @@ mod tests {
                 },
             ]
         });
-        let apps = refusing_apps(&[7, 8]);
+        let apps = apps_behind(&[7, 8]);
         assert_eq!(apps.len(), 2);
         assert_eq!(apps[0].0, "a terminal");
         assert_eq!(apps[1].0, "some other window");

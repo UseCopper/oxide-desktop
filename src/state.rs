@@ -160,6 +160,8 @@ pub struct PendingSessionEnd {
     pub asked_at: Instant,
     /// Whether the panel has been told which of them refused.
     pub reported: bool,
+    /// The windows the panel was last told were still open.
+    pub sent: Vec<u64>,
 }
 
 /// What the Super key is doing, while it is doing it.
