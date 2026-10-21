@@ -3507,10 +3507,15 @@ fn build_launcher(
     let who = GtkBox::new(Orientation::Horizontal, 10);
     who.set_hexpand(true);
     let avatar = avatar_area();
+    // Both on the middle of the foot: the mark is a picture of the user and
+    // the name is the user's, and a name sitting below a picture is a caption
+    // rather than a name.
+    avatar.set_valign(gtk4::Align::Center);
     who.append(&avatar);
     let name = Label::new(Some(&user_name()));
     name.add_css_class("launcher-user");
     name.set_xalign(0.0);
+    name.set_valign(gtk4::Align::Center);
     name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     who.append(&name);
     footer.append(&who);
@@ -3725,15 +3730,19 @@ fn refresh_avatar(area: &gtk4::DrawingArea) {
         );
         let _ = context.clip();
         // Cover, so the picture fills the circle rather than fitting inside it.
+        // The mark is drawn the same way, so the two are the same size and the
+        // same place: a mark that sits in a corner of the circle it is in is
+        // not a mark in a circle.
         let scale = (f64::from(width) / f64::from(picture.width()))
             .max(f64::from(height) / f64::from(picture.height()));
         let wide = f64::from(picture.width()) * scale;
         let tall = f64::from(picture.height()) * scale;
-        let _ = context.set_source_surface(
-            picture,
+        let _ = context.translate(
             (f64::from(width) - wide) / 2.0,
             (f64::from(height) - tall) / 2.0,
         );
+        let _ = context.scale(scale, scale);
+        let _ = context.set_source_surface(picture, 0.0, 0.0);
         let _ = context.paint();
         let _ = context.restore();
     });
@@ -5397,6 +5406,30 @@ button.launcher-action {{
 }}
 button.launcher-action:hover {{
     background-color: rgba(255, 255, 255, {task_hover});
+}}
+/* The scrollbar is the panel's too. The theme fills it with its own accent
+   when the pointer is on it, which is the last place a blue can turn up. */
+scrollbar {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    padding: 0;
+}}
+scrollbar slider {{
+    background-color: rgba(255, 255, 255, 0.22);
+    background-image: none;
+    border: none;
+    border-radius: 3px;
+    min-width: 6px;
+    min-height: 6px;
+}}
+scrollbar slider:hover {{
+    background-color: rgba(255, 255, 255, 0.42);
+    background-image: none;
+}}
+scrollbar slider:active {{
+    background-color: rgba(255, 255, 255, 0.55);
+    background-image: none;
 }}
 /* The question, and the answer to it. */
 .launcher-question {{
@@ -10808,6 +10841,10 @@ mod tests {
             ".launcher-footer {",
             "button.launcher-action {",
             ".launcher-question {",
+            // The scrollbar is the panel's too: the theme fills it with its
+            // own accent under the pointer, which is the last blue left.
+            "scrollbar slider {",
+            "scrollbar slider:hover {",
         ] {
             assert!(sheet.contains(head), "missing from the sheet: {head}");
         }
