@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    Google Material Symbols, "apps" (filled): a three-by-three grid.
+    Copyright Google LLC, licensed under the Apache License 2.0.
+    Changed: recoloured for the panel, and its squares rounded a little so they sit
+    alongside the bar's own square corners rather than looking like a spreadsheet.
+  -->
+  <g fill="#e8e8e8">
+    <rect x="3" y="3" width="4" height="4" rx="1"/>
+    <rect x="10" y="3" width="4" height="4" rx="1"/>
+    <rect x="17" y="3" width="4" height="4" rx="1"/>
+    <rect x="3" y="10" width="4" height="4" rx="1"/>
+    <rect x="10" y="10" width="4" height="4" rx="1"/>
+    <rect x="17" y="10" width="4" height="4" rx="1"/>
+    <rect x="3" y="17" width="4" height="4" rx="1"/>
+    <rect x="10" y="17" width="4" height="4" rx="1"/>
+    <rect x="17" y="17" width="4" height="4" rx="1"/>
+  </g>
+</svg>

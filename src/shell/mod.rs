@@ -174,6 +174,42 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
         on_commit_buffer_handler::<Self>(surface);
         self.backend_data.early_import(surface);
 
+        // A layer surface that is hidden rather than destroyed — the panel's app
+        // menu closing itself — commits with no buffer and lives on as a protocol
+        // object. The keyboard must not stay on a surface nobody can see, or the
+        // next keystroke is swallowed by an invisible window instead of going to
+        // the one in front.
+        let holds_keyboard = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .map(|focus| {
+                matches!(
+                    focus,
+                    KeyboardFocusTarget::LayerSurface(layer) if layer.wl_surface() == surface
+                )
+            })
+            .unwrap_or(false);
+        if holds_keyboard
+            && !with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .buffer
+                    .is_some()
+            })
+        {
+            match self.space.elements().last().cloned() {
+                Some(window) => self.focus_window(&window),
+                None => {
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                    }
+                }
+            }
+        }
+
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -298,6 +334,21 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        // A layer that holds the keyboard — an exclusive one, like the panel's app
+        // menu — must hand it back when it goes, or the keyboard is left pointing at
+        // a surface that no longer exists and the next keystroke goes nowhere.
+        let held_keyboard = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .map(|focus| {
+                matches!(
+                    focus,
+                    KeyboardFocusTarget::LayerSurface(layer)
+                        if layer.wl_surface() == surface.wl_surface()
+                )
+            })
+            .unwrap_or(false);
         if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
@@ -307,6 +358,19 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
             layer.map(|layer| (map, layer))
         }) {
             map.unmap_layer(&layer);
+        }
+        if held_keyboard {
+            // The window at the front is the one the hand was last working in, and
+            // focusing it also raises it, so this is the same door every other focus
+            // takes.
+            match self.space.elements().last().cloned() {
+                Some(window) => self.focus_window(&window),
+                None => {
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                    }
+                }
+            }
         }
     }
 }

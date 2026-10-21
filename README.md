@@ -22,7 +22,9 @@ session through winit or X11, and handles both server-side and client-side decor
 **The panel.** A GTK4 layer-shell bar, started by the compositor:
 
 - Pinned apps and a task bar, reorderable by dragging a square.
-- Live window previews, an app menu, and right-click menus.
+- An app menu at the left of the bar: every installed application, searchable by name,
+  started with a click or with the keyboard.
+- Live window previews, and a per-app menu with pin, quit and launch.
 - The bar slides in, squares trade places over 250 ms, and the wallpaper fades up behind
   everything.
 - Pins and bar order survive a restart.

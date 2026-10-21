@@ -2980,6 +2980,8 @@ fn themed_icon(name: &str) -> gtk4::Image {
 /// has to be installed beside the binary.
 const PIN_SVG: &[u8] = include_bytes!("../assets/pin.svg");
 const UNPIN_SVG: &[u8] = include_bytes!("../assets/unpin.svg");
+/// The app menu's own square: Material's three-by-three grid.
+const APPS_SVG: &[u8] = include_bytes!("../assets/apps.svg");
 
 /// One of those drawn icons, rasterised into the texture a row puts beside its label.
 ///
@@ -3361,6 +3363,365 @@ fn context_close(context: &Rc<ContextMenu>) {
         }
         glib::ControlFlow::Break
     });
+}
+
+/// The app menu: every installed application, opened from the square at the left of
+/// the bar.
+///
+/// A launcher, not a list of windows: the bar already says what is running, and this
+/// is how something that is not running gets started. It is a layer surface of its
+/// own, like the two menus, because an unpainted part of a surface still takes
+/// clicks — and it asks for the keyboard exclusively while it is up, so typing goes
+/// into the search field rather than into the window underneath.
+const LAUNCHER_WIDTH: i32 = 360;
+/// How tall the list may grow before it scrolls. A full application list is taller
+/// than any output worth filling with a menu.
+const LAUNCHER_MAX_HEIGHT: i32 = 520;
+/// The air between the bar and the menu's plate.
+const LAUNCHER_GAP: i32 = 6;
+
+struct Launcher {
+    window: gtk4::Window,
+    shield: gtk4::Window,
+    search: gtk4::SearchEntry,
+    scroller: gtk4::ScrolledWindow,
+    rows: GtkBox,
+    empty: Label,
+    stream: Channel,
+    /// The rows that are built, each with the lowercased label the search matches.
+    entries: RefCell<Vec<(Button, String)>>,
+    /// Up, or on its way up. Cleared when the leave lands in `launcher_fade`.
+    shown: Cell<bool>,
+    /// Whether the leave is running.
+    closing: Cell<bool>,
+    /// Which visible row the keyboard is on.
+    selected: Cell<usize>,
+    /// Bumped by every fade, so only the newest one touches the window.
+    token: Cell<u64>,
+}
+
+/// Whether an application called `label` matches what has been typed.
+///
+/// A case-insensitive substring, and nothing cleverer: the list is short, it is
+/// already in front of you, and a query language in a menu is a menu you have to
+/// learn. Trimming means a space typed before a word does not empty the list.
+fn launcher_matches(query: &str, label: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || label.to_lowercase().contains(&query)
+}
+
+fn build_launcher(
+    app: &Application,
+    monitor: &gdk::Monitor,
+    stream: Channel,
+) -> (Rc<Launcher>, Button) {
+    let shield = build_context_shield(app, monitor);
+
+    let window = gtk4::Window::builder().application(app).build();
+    window.set_decorated(false);
+    window.add_css_class("panel-window");
+    window.init_layer_shell();
+    window.set_namespace(Some("oxide-panel-launcher"));
+    window.set_layer(Layer::Top);
+    window.set_monitor(Some(monitor));
+    window.set_anchor(Edge::Top, true);
+    window.set_anchor(Edge::Left, true);
+    window.set_margin(Edge::Top, PANEL_HEIGHT + LAUNCHER_GAP);
+    window.set_margin(Edge::Left, 8);
+    window.set_exclusive_zone(-1);
+    // While the app menu is up the keyboard belongs to it: a launcher you have to
+    // click into before typing is a launcher that has already made you use the
+    // pointer twice. The compositor hands the keys to the focused widget, which is
+    // the search field.
+    window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+    window.set_opacity(0.0);
+
+    let plate = GtkBox::new(Orientation::Vertical, 0);
+    plate.add_css_class("launcher");
+    plate.set_size_request(LAUNCHER_WIDTH, -1);
+
+    let search = gtk4::SearchEntry::new();
+    search.add_css_class("launcher-search");
+    search.set_placeholder_text(Some("Search applications"));
+    search.set_hexpand(true);
+    // GtkSearchEntry holds `search-changed` back for 150ms by default, and that
+    // delay is visible twice: the list lags a word behind, and a selection made
+    // in that window snaps back to the top when the signal finally fires. The
+    // list is local, so there is nothing to debounce.
+    search.set_property("search-delay", 0u32);
+
+    let rows = GtkBox::new(Orientation::Vertical, 2);
+    rows.add_css_class("launcher-rows");
+
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_max_content_height(LAUNCHER_MAX_HEIGHT);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_child(Some(&rows));
+
+    let empty = Label::new(Some("No applications match"));
+    empty.add_css_class("launcher-empty");
+    empty.set_visible(false);
+
+    plate.append(&search);
+    plate.append(&scroller);
+    plate.append(&empty);
+    window.set_child(Some(&plate));
+
+    let launcher = Rc::new(Launcher {
+        window,
+        shield,
+        search,
+        scroller,
+        rows,
+        empty,
+        stream,
+        entries: RefCell::new(Vec::new()),
+        shown: Cell::new(false),
+        closing: Cell::new(false),
+        selected: Cell::new(0),
+        token: Cell::new(0),
+    });
+
+    // The shield dismisses the menu it was built for, held weakly so it does not
+    // keep the whole launcher alive on its own.
+    let closer = launcher.clone();
+    let shield_click = gtk4::GestureClick::new();
+    shield_click.connect_pressed(glib::clone!(
+        #[weak]
+        closer,
+        #[upgrade_or]
+        return,
+        move |_, _, _, _| {
+            launcher_close(&closer);
+        }
+    ));
+    launcher.shield.add_controller(shield_click);
+
+    let changed = launcher.clone();
+    launcher.search.connect_search_changed(move |_| {
+        launcher_filter(&changed);
+    });
+
+    // Escape and the arrows are decided before the entry sees them: an entry that
+    // moves its cursor on Up would otherwise never get to the list.
+    let keyed = launcher.clone();
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            launcher_close(&keyed);
+            glib::Propagation::Stop
+        } else if key == gdk::Key::Up {
+            launcher_move(&keyed, -1);
+            glib::Propagation::Stop
+        } else if key == gdk::Key::Down {
+            launcher_move(&keyed, 1);
+            glib::Propagation::Stop
+        } else if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            launcher_activate(&keyed);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    launcher.search.add_controller(keys);
+
+    // The square on the bar. It wears the task square's class so it is the same
+    // square as the rest, not a second kind of button beside them.
+    let button = Button::new();
+    button.add_css_class("task");
+    button.add_css_class("launcher-button");
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some("Applications"));
+    let icon = drawn_icon(APPS_SVG);
+    icon.set_pixel_size(ICON_SIZE);
+    button.set_child(Some(&icon));
+    let opener = launcher.clone();
+    button.connect_clicked(move |_| launcher_open(&opener));
+
+    (launcher, button)
+}
+
+/// Put every installed application in the menu, ready for the search to hide the ones
+/// that do not match.
+fn launcher_build(launcher: &Rc<Launcher>) {
+    while let Some(child) = launcher.rows.first_child() {
+        launcher.rows.remove(&child);
+    }
+    let mut entries = Vec::new();
+    for app in crate::desktop::apps() {
+        let row = launcher_row(&app);
+        let sender = launcher.stream.clone();
+        let owned = launcher.clone();
+        let id = app.id.clone();
+        row.connect_clicked(move |_| {
+            sender.send(&format!("launch\t{id}"));
+            launcher_close(&owned);
+        });
+        launcher.rows.append(&row);
+        entries.push((row, app.label().to_lowercase()));
+    }
+    *launcher.entries.borrow_mut() = entries;
+}
+
+fn launcher_row(app: &crate::desktop::DesktopApp) -> Button {
+    let row = context_row(app_icon(app), app.label());
+    row.add_css_class("launcher-row");
+    // The row fills the plate, and the label fills what the icon leaves: a name
+    // that is too long is shortened at the plate's edge, not at an arbitrary 28
+    // characters in the middle of the menu.
+    if let Some(content) = row.child().and_then(|child| child.downcast::<GtkBox>().ok()) {
+        content.set_hexpand(true);
+        if let Some(label) = content.last_child().and_then(|l| l.downcast::<Label>().ok()) {
+            label.set_hexpand(true);
+            label.set_max_width_chars(-1);
+        }
+    }
+    row
+}
+
+/// An app's icon, out of its entry: a path loaded from disk, a bare name from the
+/// theme, and a generic mark for an entry that names neither.
+fn app_icon(app: &crate::desktop::DesktopApp) -> Image {
+    let (name, path) = crate::desktop::icon_name(&app.icon);
+    if let Some(path) = path {
+        let icon = Image::from_file(path);
+        icon.set_pixel_size(CONTEXT_ICON_SIZE);
+        return icon;
+    }
+    themed_icon(if name.is_empty() { FALLBACK_ICON } else { &name })
+}
+
+fn launcher_open(launcher: &Rc<Launcher>) {
+    if launcher.shown.get() {
+        return;
+    }
+    if !launcher.stream.is_connected() {
+        // A menu that cannot start anything is worse than no menu.
+        return;
+    }
+    launcher_build(launcher);
+    // Emptying the field filters back to everything; a stale query from last time
+    // would open onto a list the user did not ask for.
+    launcher.search.set_text("");
+    launcher_filter(launcher);
+    launcher.window.set_opacity(0.0);
+    launcher.shown.set(true);
+    launcher.closing.set(false);
+    // The catcher goes up first so the menu is above it in the same layer, and a
+    // click aimed anywhere else lands on the catcher.
+    launcher.shield.set_visible(true);
+    launcher.window.present();
+    launcher.search.grab_focus();
+    launcher_fade(launcher, true);
+}
+
+fn launcher_close(launcher: &Rc<Launcher>) {
+    if !launcher.shown.get() || launcher.closing.get() {
+        return;
+    }
+    launcher.closing.set(true);
+    // The catcher's work is done the moment the menu starts leaving: a click
+    // during the fade belongs where it was aimed.
+    launcher.shield.set_visible(false);
+    launcher_fade(launcher, false);
+}
+
+fn launcher_fade(launcher: &Rc<Launcher>, showing: bool) {
+    let token = launcher.token.get().wrapping_add(1);
+    launcher.token.set(token);
+    let window = launcher.window.clone();
+    let shield = launcher.shield.clone();
+    let owned = launcher.clone();
+    let start = Instant::now();
+    let from = window.opacity();
+    let to = if showing { 1.0 } else { 0.0 };
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let eased = if showing { ease_out(t) } else { ease_in(t) };
+        window.set_opacity(from + (to - from) * eased);
+        if t >= 1.0 {
+            if !showing {
+                window.set_visible(false);
+                shield.set_visible(false);
+                owned.shown.set(false);
+                owned.closing.set(false);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Show the rows that match the query and hide the rest.
+fn launcher_filter(launcher: &Rc<Launcher>) {
+    let query = launcher.search.text().to_string();
+    let mut visible = 0;
+    for (row, label) in launcher.entries.borrow().iter() {
+        let show = launcher_matches(&query, label);
+        row.set_visible(show);
+        if show {
+            visible += 1;
+        }
+    }
+    launcher.empty.set_visible(visible == 0);
+    launcher.scroller.set_visible(visible > 0);
+    launcher.selected.set(0);
+    launcher_highlight(launcher);
+}
+
+fn launcher_visible(launcher: &Launcher) -> Vec<Button> {
+    launcher
+        .entries
+        .borrow()
+        .iter()
+        .filter(|(row, _)| row.is_visible())
+        .map(|(row, _)| row.clone())
+        .collect()
+}
+
+fn launcher_highlight(launcher: &Rc<Launcher>) {
+    for (row, _) in launcher.entries.borrow().iter() {
+        row.remove_css_class("picked");
+    }
+    let rows = launcher_visible(launcher);
+    let Some(row) = rows.get(launcher.selected.get()).cloned() else {
+        return;
+    };
+    row.add_css_class("picked");
+    // Keep the picked row inside the list. `compute_bounds` is in the scroller's
+    // coordinates, which is exactly what its adjustment is in.
+    if let Some(bounds) = row.compute_bounds(&launcher.scroller) {
+        let adjustment = launcher.scroller.vadjustment();
+        let top = f64::from(bounds.y());
+        let bottom = top + f64::from(bounds.height());
+        if top < adjustment.value() {
+            adjustment.set_value(top);
+        } else if bottom > adjustment.value() + adjustment.page_size() {
+            adjustment.set_value(bottom - adjustment.page_size());
+        }
+    }
+}
+
+fn launcher_move(launcher: &Rc<Launcher>, delta: isize) {
+    let count = launcher_visible(launcher).len();
+    if count == 0 {
+        return;
+    }
+    let next = (launcher.selected.get() as isize + delta).clamp(0, count as isize - 1);
+    launcher.selected.set(next as usize);
+    launcher_highlight(launcher);
+}
+
+fn launcher_activate(launcher: &Rc<Launcher>) {
+    let rows = launcher_visible(launcher);
+    if let Some(row) = rows.get(launcher.selected.get()) {
+        row.emit_clicked();
+    }
 }
 
 thread_local! {
@@ -4552,6 +4913,59 @@ button.context-row label {{
     color: #e8e8e8;
     background: transparent;
 }}
+
+/* The app menu. Same plate as the two menus above -- the bar's own fill, the
+   previews' radius -- because it is the same panel in a third place, and one of
+   them drifting a shade would be visible with two of them on screen at once. */
+.launcher {{
+    padding: 8px;
+    background-color: rgba({panel_r}, {panel_g}, {panel_b}, {panel_a});
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, {menu_edge_a});
+    border-radius: {menu_radius}px;
+}}
+/* The search field is a row like the rows below it: a plate on the plate, not a
+   sunken well the theme chose. The text is the panel's, the placeholder is the
+   same colour sitting back. */
+.launcher-search {{
+    margin: 0 0 6px 0;
+    min-height: 32px;
+    border-radius: {cell_radius}px;
+    background-color: rgba(255, 255, 255, {cell_fill_a});
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, {cell_edge_a});
+    color: #e8e8e8;
+}}
+.launcher-search text {{
+    color: #e8e8e8;
+    background: transparent;
+}}
+.launcher-search placeholder {{
+    color: rgba(232, 232, 232, 0.55);
+}}
+.launcher-rows {{
+    background: transparent;
+}}
+/* The rows themselves are the app menu's rows -- same plate, same hover, same
+   label colour -- made wide: the plate is a list, and a list's rows reach its
+   edges. */
+button.launcher-row {{
+    padding: 6px 8px;
+    border-radius: {cell_radius}px;
+}}
+/* Picked by the keyboard. The accent, at the strength the bar gives the app in
+   use: the picked row is the one the keyboard is on, which is the same thing the
+   bar says with that fill, and a row the keyboard has chosen has to be findable
+   at a glance -- a shade of the plate's own grey is not. Written after the hover
+   so a row that is both keeps the accent. */
+button.launcher-row.picked {{
+    background-color: rgba({r}, {g}, {b}, {task_focused});
+    background-image: none;
+}}
+.launcher-empty {{
+    color: rgba(232, 232, 232, 0.6);
+    padding: 12px 10px;
+}}
 "
     )
 }
@@ -4797,6 +5211,11 @@ fn build_ui(app: &Application, socket: Option<Rc<UnixStream>>) {
     // It is dismissed by clicks only — a row of its own, a square, another right
     // click — not by the pointer leaving it.
     let context = build_context_menu(app, &monitor, channel.clone());
+    // The app menu: the application list, opened from the square at the left of the
+    // bar. A fourth surface, for the same reason as the two menus — an unpainted
+    // region of a surface still takes clicks.
+    let (_launcher, launcher_button) = build_launcher(app, &monitor, channel.clone());
+    bar_row.prepend(&launcher_button);
     let hover = Rc::new(Hover::default());
 
 
@@ -9851,6 +10270,61 @@ mod tests {
             !still_on_the_bar("thunderbird", &barred),
             "an app nobody pinned and nobody has open has left the panel"
         );
+    }
+
+    #[test]
+    fn the_launcher_matches_a_name_and_nothing_else() {
+        // What the field does: a case-insensitive substring of the name. Empty is
+        // everything, whitespace is everything, and a query in two words is not a
+        // query language.
+        assert!(launcher_matches("", "Firefox"));
+        assert!(launcher_matches("   ", "Firefox"));
+        assert!(launcher_matches("fire", "Firefox"));
+        assert!(launcher_matches("FIRE", "firefox"));
+        assert!(launcher_matches("fox", "Firefox"));
+        assert!(!launcher_matches("chrom", "Firefox"));
+        assert!(!launcher_matches("firefox browser", "Firefox"));
+    }
+
+    #[test]
+    fn the_app_menu_has_a_plate_and_a_field_that_reach_the_stylesheet() {
+        let sheet = style_sheet((1, 2, 3));
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("missing from the sheet: {head}"))
+                .to_string()
+        };
+        // The same plate as the other two menus, to the byte: one panel, three
+        // places.
+        let (r, g, b) = BAR_PANEL;
+        let body = format!("rgba({r}, {g}, {b}, {BAR_PANEL_ALPHA})");
+        let plate = rule(".launcher {");
+        assert!(
+            plate.contains(&body),
+            "the app menu's plate is not the bar's: {plate}"
+        );
+        assert!(
+            plate.contains("background-image: none"),
+            "the theme's window background is over the app menu's plate: {plate}"
+        );
+        // A picked row takes the accent, at the strength the bar gives the app in
+        // use: the same fill, saying the same thing.
+        let picked = rule("button.launcher-row.picked {");
+        assert!(
+            picked.contains(&format!("rgba(1, 2, 3, {TASK_FOCUSED_ALPHA})")),
+            "a picked row is not the panel's accent: {picked}"
+        );
+        for head in [
+            ".launcher-search {",
+            ".launcher-search text {",
+            "button.launcher-row {",
+            ".launcher-empty {",
+        ] {
+            assert!(sheet.contains(head), "missing from the sheet: {head}");
+        }
     }
 
     #[test]

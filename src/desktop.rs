@@ -18,7 +18,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -198,6 +198,75 @@ pub fn lookup_in(dir: &Path, id: &str) -> Option<DesktopApp> {
         }
     }
     None
+}
+
+/// Every visible application on the search path, one entry per id, sorted by name.
+///
+/// This is the app menu's list: what [`lookup`] does for one id, done for all of
+/// them. Ids are deduplicated in search-path order, so a user's own entry wins over
+/// the system one exactly as it does in [`lookup`], and an entry that asks not to be
+/// shown suppresses the one behind it rather than letting it reappear.
+pub fn apps() -> Vec<DesktopApp> {
+    apps_in(&search_dirs())
+}
+
+/// [`apps`] over an explicit list of application directories.
+///
+/// Same shape as [`lookup_in`], for the same reason: a caller can hand it a
+/// directory of its own without touching the process's environment.
+pub fn apps_in(dirs: &[PathBuf]) -> Vec<DesktopApp> {
+    let mut seen = HashSet::new();
+    let mut apps = Vec::new();
+    for dir in dirs {
+        collect_apps(dir, 0, &mut seen, &mut apps);
+    }
+    apps.sort_by(|a, b| {
+        a.label()
+            .to_lowercase()
+            .cmp(&b.label().to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    apps
+}
+
+fn collect_apps(dir: &Path, depth: u32, seen: &mut HashSet<String>, apps: &mut Vec<DesktopApp>) {
+    // The same bound as `find_in_dir`: deep enough for `kde4/` and `gnome/`, and
+    // nowhere near a filesystem walk that could hang the panel.
+    const MAX_DEPTH: u32 = 2;
+    let Ok(children) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = children
+        .filter_map(|child| child.ok().map(|c| c.path()))
+        .collect();
+    // Sorted, so which of two entries with the same id wins is the same on every
+    // run rather than whatever the filesystem hands over first.
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            if depth < MAX_DEPTH {
+                collect_apps(&path, depth + 1, seen, apps);
+            }
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("desktop") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        // First one wins, shown or not: a user's override that hides an app is
+        // meant to hide it, not to uncover the system entry behind it.
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(app) = parse_entry(id, &text) {
+            apps.push(app);
+        }
+    }
 }
 
 /// Find a file of this name anywhere in the search path, or in a subdirectory of one.
@@ -597,6 +666,84 @@ Icon=document-new
         // An id that already carries the extension is the file name itself.
         assert_eq!(candidate_names("firefox.desktop"), ["firefox.desktop"]);
         assert_eq!(candidate_names("firefox"), ["firefox.desktop"]);
+    }
+
+    #[test]
+    fn every_visible_app_is_listed_once_and_in_name_order() {
+        // A throwaway pair of application directories: the first one is the user's,
+        // the second the system's.
+        let root = std::env::temp_dir().join(format!(
+            "oxide-desktop-apps-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let user = root.join("user");
+        let system = root.join("system");
+        std::fs::create_dir_all(&user).expect("user dir");
+        std::fs::create_dir_all(&system).expect("system dir");
+        std::fs::write(
+            user.join("firefox.desktop"),
+            "[Desktop Entry]\nName=Firefox\nExec=firefox\nType=Application\n",
+        )
+        .expect("firefox");
+        std::fs::write(
+            user.join("zathura.desktop"),
+            "[Desktop Entry]\nName=zathura\nExec=zathura\nType=Application\n",
+        )
+        .expect("zathura");
+        std::fs::write(
+            user.join("hideme.desktop"),
+            "[Desktop Entry]\nName=Hide Me\nExec=hideme\nType=Application\nNoDisplay=true\n",
+        )
+        .expect("hidden");
+        std::fs::write(
+            user.join("notapp.desktop"),
+            "[Desktop Entry]\nName=A Link\nType=Link\nURL=https://example.com/\n",
+        )
+        .expect("link");
+        std::fs::write(
+            user.join("notes.txt"),
+            "not a desktop entry at all",
+        )
+        .expect("notes");
+        // The same id in the system directory must not appear twice, and the user's
+        // entry must be the one that is kept.
+        std::fs::write(
+            system.join("firefox.desktop"),
+            "[Desktop Entry]\nName=Firefox (system)\nExec=firefox\nType=Application\n",
+        )
+        .expect("system firefox");
+        std::fs::write(
+            system.join("mpv.desktop"),
+            "[Desktop Entry]\nName=mpv\nExec=mpv\nType=Application\n",
+        )
+        .expect("mpv");
+        // A hidden override in the user's directory hides the system entry rather
+        // than uncovering it.
+        std::fs::write(
+            system.join("hideme.desktop"),
+            "[Desktop Entry]\nName=Hide Me\nExec=hideme\nType=Application\n",
+        )
+        .expect("system hidden");
+        // Entries may live one directory down.
+        std::fs::create_dir_all(system.join("kde4")).expect("kde4");
+        std::fs::write(
+            system.join("kde4").join("dolphin.desktop"),
+            "[Desktop Entry]\nName=Dolphin\nExec=dolphin\nType=Application\n",
+        )
+        .expect("dolphin");
+
+        let apps = apps_in(&[user.clone(), system.clone()]);
+        let names: Vec<&str> = apps.iter().map(|app| app.label()).collect();
+        // Case-insensitive by name, one entry per id, hidden and non-application
+        // entries left out, the user's override first.
+        assert_eq!(names, ["Dolphin", "Firefox", "mpv", "zathura"]);
+        assert_eq!(
+            apps.iter().find(|app| app.id == "firefox").map(|app| app.name.as_str()),
+            Some("Firefox")
+        );
+
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
