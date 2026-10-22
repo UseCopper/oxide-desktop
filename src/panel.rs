@@ -294,6 +294,11 @@ const MENU_FADE: Duration = Duration::from_millis(180);
 const TASK_HOVER_ALPHA: f64 = 0.10;
 /// The accent's strength behind a focused app's square.
 const TASK_FOCUSED_ALPHA: f64 = 0.28;
+/// How much lighter the dialog's answer goes under the pointer.
+///
+/// The panel's own hover is a tenth of white, which reads clearly over a grey
+/// plate and as nothing at all inside a colour. The answer is a colour.
+const ANSWER_HOVER_WASH: f64 = TASK_HOVER_ALPHA * 2.0;
 /// How far below its resting place the menu starts, so it slides out from the bar
 /// as it fades up.
 const MENU_SLIDE: i32 = 10;
@@ -3734,6 +3739,9 @@ struct Dialog {
     /// Bumped by every fade of what is on the plate, so only the newest one
     /// touches its opacity.
     content_token: Cell<u64>,
+    /// Bumped by every fade of the answer that arrives late, so only the newest
+    /// one touches its opacity.
+    answer_token: Cell<u64>,
     /// When the dialog opened, which is when the "anyway" button's wait
     /// started.
     opened_at: Cell<Instant>,
@@ -3844,6 +3852,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         token: Cell::new(0),
         size_token: Cell::new(0),
         content_token: Cell::new(0),
+        answer_token: Cell::new(0),
         opened_at: Cell::new(Instant::now()),
         stream,
     });
@@ -3905,6 +3914,7 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     let (width, height) = dialog_measure(dialog, DialogState::Asking);
     dialog.sizer.set_size_request(width.max(1), height.max(1));
     dialog.content.set_opacity(1.0);
+    dialog.confirm.set_opacity(1.0);
     dialog.window.set_opacity(0.0);
     dialog.window.present();
     dialog_fade(dialog, true);
@@ -3920,7 +3930,35 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
         if ready.state.get() != DialogState::Closing {
             return;
         }
+        // The answer arrives: the plate makes room for it and it fades into the
+        // room. It is put on at no opacity first, so the plate is told to make
+        // space for a button that is not there to be seen yet.
+        ready.confirm.set_opacity(0.0);
         dialog_resize(&ready, DialogState::Closing);
+        dialog_fade_answer(&ready);
+    });
+}
+
+/// Fade an answer in as the plate makes room for it.
+///
+/// No easing, like the other fades: a thing arriving is a thing arriving, and
+/// a curve on it is a curve nobody sees.
+fn dialog_fade_answer(dialog: &Rc<Dialog>) {
+    let token = dialog.answer_token.get().wrapping_add(1);
+    dialog.answer_token.set(token);
+    let owned = dialog.clone();
+    let start = Instant::now();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.answer_token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        owned.confirm.set_opacity(t);
+        if t >= 1.0 {
+            owned.confirm.set_opacity(1.0);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
     });
 }
 
@@ -5729,6 +5767,14 @@ fn style_sheet((r, g, b): (u8, u8, u8)) -> String {
     // sheet, so the order can be asserted instead of eyeballed.
     let task_hover = TASK_HOVER_ALPHA;
     let task_focused = TASK_FOCUSED_ALPHA;
+    // The accent under the pointer: the wash the other buttons take, mixed
+    // into the colour rather than laid over it, and twice as much of it. A
+    // tenth of white over a grey plate reads clearly; a tenth of white in a
+    // colour reads as nothing at all.
+    let mix = |channel: u8| -> u8 {
+        (f64::from(channel) + (255.0 - f64::from(channel)) * ANSWER_HOVER_WASH).round() as u8
+    };
+    let (answer_hover_r, answer_hover_g, answer_hover_b) = (mix(r), mix(g), mix(b));
     // Both menus' bodies are the bar's own fill, read off the same constants the
     // bar's rule below and the cairo drawing read, so the panel, the two menus
     // and their two engines agree by construction rather than by three careful
@@ -6094,8 +6140,12 @@ button.dialog-button.dialog-confirm {{
     border-color: rgba({r}, {g}, {b}, {task_focused});
     color: #ffffff;
 }}
+/* The answer under the pointer: the same wash the other buttons take, mixed
+   into the accent rather than laid over it, because a button is one colour and
+   not two. Without it the answer had no hover at all: its hover was written
+   in the colour it already was. */
 button.dialog-button.dialog-confirm:hover {{
-    background-color: rgba({r}, {g}, {b}, {task_focused});
+    background-color: rgba({answer_hover_r}, {answer_hover_g}, {answer_hover_b}, {task_focused});
 }}
 /* Greyed out: the button that overrules the apps, before its seconds are up.
    The theme's own disabled colours would do, but the accent above wins over
