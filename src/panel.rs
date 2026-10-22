@@ -3401,6 +3401,15 @@ const AVATAR_SIZE: i32 = 24;
 /// The air between the bar and the menu's plate.
 const LAUNCHER_GAP: i32 = 6;
 
+/// How long the "anyway" button is greyed out for.
+///
+/// The two ways out of a session ask every app to close first, and an app
+/// with unsaved work is entitled to the moment it takes to save it. The
+/// button that overrules that is not there to be hit in the first three
+/// seconds: a session that ended that fast ended because somebody was
+/// clicking, not because they had read anything.
+const ANYWAY_DELAY: Duration = Duration::from_secs(3);
+
 /// Which of the two ways out of the session the foot is asking about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
@@ -3722,6 +3731,9 @@ struct Dialog {
     /// Bumped by every fade of what is on the plate, so only the newest one
     /// touches its opacity.
     content_token: Cell<u64>,
+    /// When the dialog opened, which is when the "anyway" button's wait
+    /// started.
+    opened_at: Cell<Instant>,
     stream: Channel,
 }
 
@@ -3826,6 +3838,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         token: Cell::new(0),
         size_token: Cell::new(0),
         content_token: Cell::new(0),
+        opened_at: Cell::new(Instant::now()),
         stream,
     });
 
@@ -3877,6 +3890,7 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     *dialog.launcher.borrow_mut() = launcher.clone();
     dialog.action.set(Some(what));
     dialog.state.set(DialogState::Asking);
+    dialog.opened_at.set(Instant::now());
     dialog.closing.borrow_mut().clear();
     while let Some(child) = dialog.apps.first_child() {
         dialog.apps.remove(&child);
@@ -3888,6 +3902,12 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     dialog.window.set_opacity(0.0);
     dialog.window.present();
     dialog_fade(dialog, true);
+    // And the "anyway" button comes back on its own, three seconds after the
+    // dialog opened -- or after the wait it is already in the middle of.
+    let ready = dialog.clone();
+    glib::timeout_add_local_once(ANYWAY_DELAY, move || {
+        dialog_show(&ready, ready.state.get());
+    });
 }
 
 /// The answer to the question: go ahead.
@@ -4013,10 +4033,10 @@ fn dialog_closing(dialog: &Rc<Dialog>, open: &[u64]) {
     if dialog.state.get() != DialogState::Closing {
         return;
     }
+    // Only the words change, and they are one column wide, so the plate has
+    // nothing to do: it was moved to the size of this list when the list
+    // arrived.
     dialog.still_open(open);
-    // The words do not change the size -- they are one column -- so this is
-    // usually nothing at all.
-    dialog_resize(dialog, DialogState::Closing);
 }
 
 /// The apps that would not close.
@@ -4025,7 +4045,6 @@ fn dialog_refusing(dialog: &Rc<Dialog>, refusing: &[u64]) {
         return;
     }
     dialog.refusing(refusing);
-    dialog_resize(dialog, DialogState::Closing);
 }
 
 /// Move the dialog to a new shape.
@@ -4089,37 +4108,13 @@ fn dialog_fade_content(dialog: &Rc<Dialog>) {
     });
 }
 
-/// Ease the plate to the size a shape needs, without touching what is on it.
+/// Whether the "anyway" button is available yet.
 ///
-/// For the changes that move the plate without changing what it says: the
-/// words in the list, which are one column wide, and so usually nothing.
-fn dialog_resize(dialog: &Rc<Dialog>, to: DialogState) {
-    let (target_width, target_height) = dialog_measure(dialog, to);
-    let from_width = dialog.sizer.width();
-    let from_height = dialog.sizer.height();
-    if from_width == target_width && from_height == target_height {
-        return;
-    }
-    let token = dialog.size_token.get().wrapping_add(1);
-    dialog.size_token.set(token);
-    let owned = dialog.clone();
-    let start = Instant::now();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
-        if owned.size_token.get() != token {
-            return glib::ControlFlow::Break;
-        }
-        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        let eased = ease_in_out(t);
-        owned.sizer.set_size_request(
-            lerp_size(from_width, target_width, eased),
-            lerp_size(from_height, target_height, eased),
-        );
-        if t >= 1.0 {
-            owned.sizer.set_size_request(target_width.max(1), target_height.max(1));
-            return glib::ControlFlow::Break;
-        }
-        glib::ControlFlow::Continue
-    });
+/// It is the button that overrules the apps, so it is not available until the
+/// dialog has been up for [`ANYWAY_DELAY`]: the question's own answer is
+/// available at once, and so is Cancel.
+fn anyway_ready(state: DialogState, opened: Instant, now: Instant) -> bool {
+    state != DialogState::Closing || now.duration_since(opened) >= ANYWAY_DELAY
 }
 
 /// One step of a size, rounded to a whole pixel.
@@ -4145,6 +4140,13 @@ fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
     dialog.apps.set_visible(
         state == DialogState::Closing && !dialog.closing.borrow().is_empty(),
     );
+    // The button that overrules the apps is greyed out for the first few
+    // seconds, so that a session cannot be ended by somebody who is still
+    // clicking. The question's own answer is not: that is what the dialog is
+    // for.
+    dialog
+        .confirm
+        .set_sensitive(anyway_ready(state, dialog.opened_at.get(), Instant::now()));
 }
 
 /// The size the plate needs for a shape, measured without showing it.
@@ -6034,6 +6036,20 @@ button.dialog-button.dialog-confirm {{
 }}
 button.dialog-button.dialog-confirm:hover {{
     background-color: rgba({r}, {g}, {b}, {task_focused});
+}}
+/* Greyed out: the button that overrules the apps, before its seconds are up.
+   The theme's own disabled colours would do, but the accent above wins over
+   them, so the disabled state has to be written here as well. */
+button.dialog-button:disabled {{
+    background-color: rgba(255, 255, 255, 0.05);
+    background-image: none;
+    border-color: rgba(255, 255, 255, {cell_edge_a});
+    color: rgba(232, 232, 232, 0.4);
+}}
+button.dialog-button.dialog-confirm:disabled {{
+    background-color: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, {cell_edge_a});
+    color: rgba(232, 232, 232, 0.4);
 }}
 "
     )
@@ -11382,6 +11398,31 @@ mod tests {
             !still_on_the_bar("thunderbird", &barred),
             "an app nobody pinned and nobody has open has left the panel"
         );
+    }
+
+    #[test]
+    fn the_anyway_button_waits_three_seconds_and_the_question_does_not() {
+        let opened = Instant::now();
+        // The question's own answer is there at once.
+        assert!(anyway_ready(DialogState::Asking, opened, opened));
+        assert!(anyway_ready(DialogState::None, opened, opened));
+        // The one that overrules the apps is not.
+        assert!(!anyway_ready(DialogState::Closing, opened, opened));
+        assert!(!anyway_ready(
+            DialogState::Closing,
+            opened,
+            opened + ANYWAY_DELAY - Duration::from_millis(1)
+        ));
+        assert!(anyway_ready(
+            DialogState::Closing,
+            opened,
+            opened + ANYWAY_DELAY
+        ));
+        assert!(anyway_ready(
+            DialogState::Closing,
+            opened,
+            opened + ANYWAY_DELAY * 2
+        ));
     }
 
     #[test]
