@@ -6270,21 +6270,25 @@ impl Channel {
 }
 
 pub fn run_panel() {
-    // One panel per compositor, which means one D-Bus application id per
-    // compositor. A shared id makes the session bus treat a second panel as a
-    // remote instance of the first: it forwards its activation to the panel that
-    // is already running and then exits, so the second compositor gets no panel
-    // and the first grows a second window — on its own output, since that
-    // panel's Wayland connection is the one it was started with.
+    // One panel per compositor, and every one of them its own process.
     //
-    // The compositor hands its socket name to us in `WAYLAND_DISPLAY`, which is
-    // unique per instance (`bind_auto` never reuses a name), so keying the id off
-    // it keeps the panels independent without any extra plumbing.
+    // The id is keyed off the compositor's socket name so that two panels are
+    // two panels on the session bus as well as on the screen. The socket name
+    // is *not* unique across sessions, though — `bind_auto` hands out the same
+    // name every time a compositor starts — so an id is not enough on its own:
+    // a panel left over from an earlier session, still holding the name, would
+    // make the bus treat this one as a remote instance of it, forward its
+    // activation and let it exit. That is what a respawning panel that exits
+    // with status zero on every attempt is. `NON_UNIQUE` is the flag that says
+    // a panel is never anybody's remote instance.
     let id = match std::env::var("WAYLAND_DISPLAY") {
         Ok(socket) if !socket.is_empty() => format!("dev.oxide.Panel.{socket}"),
         _ => "dev.oxide.Panel".to_string(),
     };
-    let app = Application::builder().application_id(&id).build();
+    let app = Application::builder()
+        .application_id(&id)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
 
     let stream = connect_panel();
     app.connect_activate(move |app| build_ui(app, stream.clone()));
