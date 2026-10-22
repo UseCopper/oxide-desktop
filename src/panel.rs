@@ -3910,15 +3910,17 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     dialog_fade(dialog, true);
     // And the "anyway" button comes back on its own, three seconds after the
     // dialog opened -- or after the wait it is already in the middle of. It is
-    // wider than the dialog was without it, so the dialog moves to the shape
-    // that has it on it: the same three steps every other change takes, and
-    // not a plate that was kept wide for a button that had not arrived.
+    // wider than the dialog was without it, so the plate makes room for it:
+    // only the plate moves, and what is on it is revealed as it moves. No
+    // fade -- nothing about the question changed, and a dialog that dissolves
+    // because a button arrived is a dialog that looks like it is doing
+    // something it is not.
     let ready = dialog.clone();
     glib::timeout_add_local_once(ANYWAY_DELAY, move || {
         if ready.state.get() != DialogState::Closing {
             return;
         }
-        dialog_transition(&ready, DialogState::Closing);
+        dialog_resize(&ready, DialogState::Closing);
     });
 }
 
@@ -4127,6 +4129,41 @@ fn dialog_fade_content(dialog: &Rc<Dialog>) {
 /// available at once, and so is Cancel.
 fn anyway_ready(state: DialogState, opened: Instant, now: Instant) -> bool {
     state != DialogState::Closing || now.duration_since(opened) >= ANYWAY_DELAY
+}
+
+/// Ease the plate to the size a shape needs, without touching what is on it.
+///
+/// For the changes that move the plate without changing what it says: a button
+/// arriving is one of those. What is on the plate is clipped to it while it
+/// moves, which is what makes the button look like it is arriving rather than
+/// like the dialog jumped.
+fn dialog_resize(dialog: &Rc<Dialog>, to: DialogState) {
+    let (target_width, target_height) = dialog_measure(dialog, to);
+    let from_width = dialog.sizer.width();
+    let from_height = dialog.sizer.height();
+    if from_width == target_width && from_height == target_height {
+        return;
+    }
+    let token = dialog.size_token.get().wrapping_add(1);
+    dialog.size_token.set(token);
+    let owned = dialog.clone();
+    let start = Instant::now();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.size_token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let eased = ease_in_out(t);
+        owned.sizer.set_size_request(
+            lerp_size(from_width, target_width, eased),
+            lerp_size(from_height, target_height, eased),
+        );
+        if t >= 1.0 {
+            owned.sizer.set_size_request(target_width.max(1), target_height.max(1));
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// One step of a size, rounded to a whole pixel.
