@@ -3398,6 +3398,9 @@ const LAUNCHER_HEIGHT: i32 = 560;
 /// Small: it is a mark beside a name, not a portrait.
 const AVATAR_SIZE: i32 = 24;
 
+/// The air between the bar and the menu's plate.
+const LAUNCHER_GAP: i32 = 6;
+
 /// Which of the two ways out of the session the foot is asking about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
@@ -3427,8 +3430,6 @@ struct Launcher {
     dialog: Rc<Dialog>,
     /// The user's picture, in the foot.
     avatar: gtk4::DrawingArea,
-    /// The output the menu is centred on.
-    monitor: gdk::Monitor,
     /// Bumped by every fade, so only the newest one touches the window.
     token: Cell<u64>,
 }
@@ -3441,19 +3442,6 @@ struct Launcher {
 fn launcher_matches(query: &str, label: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty() || label.to_lowercase().contains(&query)
-}
-
-/// Where the menu's edge goes so that the menu is centred on the output.
-///
-/// The menu is one size always, so this is arithmetic rather than a
-/// measurement: half of what is left over once the menu has taken its share.
-fn launcher_centre(monitor: &gdk::Monitor, orientation: Orientation) -> i32 {
-    let geometry = monitor.geometry();
-    let (screen, size) = match orientation {
-        Orientation::Vertical => (geometry.height(), LAUNCHER_HEIGHT),
-        _ => (geometry.width(), LAUNCHER_WIDTH),
-    };
-    ((screen - size) / 2).max(0)
 }
 
 fn build_launcher(
@@ -3473,11 +3461,10 @@ fn build_launcher(
     window.set_monitor(Some(monitor));
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Left, true);
-    // Centred on the output: the menu is a thing you look at, not a thing that
-    // hangs off the square that opened it, and its own size is fixed, so where
-    // the middle of it goes is arithmetic the panel can do.
-    window.set_margin(Edge::Top, launcher_centre(monitor, Orientation::Vertical));
-    window.set_margin(Edge::Left, launcher_centre(monitor, Orientation::Horizontal));
+    window.set_margin(Edge::Top, PANEL_HEIGHT + LAUNCHER_GAP);
+    // The same margin the bar's own squares have, so the menu starts where the
+    // square that opened it starts.
+    window.set_margin(Edge::Left, 10);
     window.set_exclusive_zone(-1);
     // While the app menu is up the keyboard belongs to it: a launcher you have to
     // click into before typing is a launcher that has already made you use the
@@ -3562,7 +3549,6 @@ fn build_launcher(
         selected: Cell::new(0),
         token: Cell::new(0),
         avatar: avatar.clone(),
-        monitor: monitor.clone(),
         dialog: dialog.clone(),
     });
 
@@ -3739,12 +3725,6 @@ struct Dialog {
     stream: Channel,
 }
 
-/// How far down the screen the question hangs, as a fraction of its height.
-///
-/// The plate keeps its top edge where it starts and grows downwards, so the
-/// list that appears does not push the question up the screen.
-const DIALOG_TOP: f64 = 0.22;
-
 fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> Rc<Dialog> {
     let window = gtk4::Window::builder().application(app).build();
     window.set_decorated(false);
@@ -3804,7 +3784,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     content.append(&apps);
     content.append(&answers);
     content.set_halign(gtk4::Align::Center);
-    content.set_valign(gtk4::Align::Start);
+    content.set_valign(gtk4::Align::Center);
 
     // The plate's size is the sizer's, not the content's: the content is an
     // overlay, so it is revealed into the plate as the plate grows instead of
@@ -3818,11 +3798,11 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     let plate = GtkBox::new(Orientation::Vertical, 0);
     plate.add_css_class("dialog-plate");
     plate.append(&inner);
-    // The plate hangs from a point above the middle of the screen and grows
-    // downwards, so the question stays where it was when the list arrives.
+    // The plate is centred on the screen, and what is on it is centred on the
+    // plate: the middle of the dialog is the middle of the screen, and it is
+    // the same middle whatever shape the dialog is in.
     plate.set_halign(gtk4::Align::Center);
-    plate.set_valign(gtk4::Align::Start);
-    plate.set_margin_top((f64::from(monitor.geometry().height()) * DIALOG_TOP) as i32);
+    plate.set_valign(gtk4::Align::Center);
 
     // The dialog over the dimming, so a click on the dimming is a click on
     // nothing in particular and the question is taken back.
@@ -4516,10 +4496,10 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     // would open onto a list the user did not ask for.
     launcher.search.set_text("");
     launcher_filter(launcher);
-    // The menu rises into place: it is mapped a little below where it belongs
-    // and eased up to it, so the arrival is a movement and not a jump.
-    let resting = launcher_centre(&launcher.monitor, Orientation::Vertical);
-    launcher.window.set_margin(Edge::Top, resting + MENU_SLIDE);
+    // The menu arrives from under the bar, the way the other one does, so it is
+    // mapped at the start of the slide rather than at the end of it.
+    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
+    launcher.window.set_margin(Edge::Top, resting - MENU_SLIDE);
     launcher.window.set_opacity(0.0);
     launcher.shown.set(true);
     launcher.closing.set(false);
@@ -4528,7 +4508,7 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     launcher.shield.set_visible(true);
     launcher.window.present();
     launcher.search.grab_focus();
-    launcher_ease(launcher, 0.0, 1.0, resting + MENU_SLIDE, resting);
+    launcher_ease(launcher, 0.0, 1.0, resting - MENU_SLIDE, resting);
 }
 
 fn launcher_close(launcher: &Rc<Launcher>) {
@@ -4539,8 +4519,8 @@ fn launcher_close(launcher: &Rc<Launcher>) {
     // The catcher's work is done the moment the menu starts leaving: a click
     // during the fade belongs where it was aimed.
     launcher.shield.set_visible(false);
-    let resting = launcher_centre(&launcher.monitor, Orientation::Vertical);
-    let token = launcher_ease(launcher, 1.0, 0.0, resting, resting + MENU_SLIDE);
+    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
+    let token = launcher_ease(launcher, 1.0, 0.0, resting, resting - MENU_SLIDE);
     let fading = launcher.clone();
     // `shown` is not cleared here: it is cleared when the slide lands, so a
     // second Super key in the next 180ms cannot put a menu on screen that is
