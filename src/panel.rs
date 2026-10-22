@@ -4149,6 +4149,14 @@ fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
     let ready = anyway_ready(state, dialog.opened_at.get(), Instant::now());
     dialog.confirm.set_visible(state != DialogState::Closing || ready);
     dialog.confirm.set_sensitive(ready);
+    // One answer on its own is centred; two answers sit at the ends of their
+    // row. A button left at the end of a row with nothing at the other end of
+    // it reads as a button that has lost something.
+    dialog.answers.set_halign(if dialog.confirm.is_visible() {
+        gtk4::Align::Fill
+    } else {
+        gtk4::Align::Center
+    });
 }
 
 /// The size the plate needs for a shape, measured without showing it.
