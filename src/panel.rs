@@ -3909,10 +3909,16 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     dialog.window.present();
     dialog_fade(dialog, true);
     // And the "anyway" button comes back on its own, three seconds after the
-    // dialog opened -- or after the wait it is already in the middle of.
+    // dialog opened -- or after the wait it is already in the middle of. It is
+    // wider than the dialog was without it, so the dialog moves to the shape
+    // that has it on it: the same three steps every other change takes, and
+    // not a plate that was kept wide for a button that had not arrived.
     let ready = dialog.clone();
     glib::timeout_add_local_once(ANYWAY_DELAY, move || {
-        dialog_show(&ready, ready.state.get());
+        if ready.state.get() != DialogState::Closing {
+            return;
+        }
+        dialog_transition(&ready, DialogState::Closing);
     });
 }
 
@@ -4170,18 +4176,10 @@ fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
 ///
 /// The shape is put on, measured and taken off again in one go: GTK measures
 /// on demand and draws on the next frame, so nothing of it is seen.
-///
-/// The answer that is waiting out its seconds is measured as if it were
-/// there: the plate is the size of the shape it is going to be, and not the
-/// size of the shape it is while one of its buttons is still to come. A
-/// plate measured without it clips it the moment it arrives.
 fn dialog_measure(dialog: &Rc<Dialog>, state: DialogState) -> (i32, i32) {
     let showing = dialog.state.get();
     dialog_show(dialog, state);
-    let waiting = dialog.confirm.is_visible();
-    dialog.confirm.set_visible(true);
     let (width, height) = dialog.content_size();
-    dialog.confirm.set_visible(waiting);
     dialog_show(dialog, showing);
     (width, height)
 }
