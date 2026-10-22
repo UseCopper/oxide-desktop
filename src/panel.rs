@@ -3712,8 +3712,11 @@ struct Dialog {
     question: Label,
     /// The apps that were asked to close, one row each.
     apps: GtkBox,
-    /// The answers: Cancel, and the one that does it.
+    /// The answers: Cancel, the space between them, and the one that does it.
     answers: GtkBox,
+    /// The space in the middle of the answers, which goes when the answer at
+    /// the end of them does.
+    gap: GtkBox,
     confirm: Button,
     /// What the question is about now.
     state: Cell<DialogState>,
@@ -3832,6 +3835,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         question,
         apps,
         answers: answers.clone(),
+        gap,
         confirm: confirm.clone(),
         state: Cell::new(DialogState::None),
         action: Cell::new(None),
@@ -4150,12 +4154,15 @@ fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
     dialog.confirm.set_visible(state != DialogState::Closing || ready);
     dialog.confirm.set_sensitive(ready);
     // One answer on its own is centred; two answers sit at the ends of their
-    // row. A button left at the end of a row with nothing at the other end of
-    // it reads as a button that has lost something.
-    dialog.answers.set_halign(if dialog.confirm.is_visible() {
-        gtk4::Align::Fill
-    } else {
+    // row. The space between them goes with the one at the end of it: a box
+    // keeps the gap its hidden child left behind, and that gap is what puts a
+    // lone button off the middle of the dialog.
+    let alone = !dialog.confirm.is_visible();
+    dialog.gap.set_visible(!alone);
+    dialog.answers.set_halign(if alone {
         gtk4::Align::Center
+    } else {
+        gtk4::Align::Fill
     });
 }
 
