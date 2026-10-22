@@ -3397,8 +3397,6 @@ const LAUNCHER_HEIGHT: i32 = 560;
 ///
 /// Small: it is a mark beside a name, not a portrait.
 const AVATAR_SIZE: i32 = 24;
-/// The air between the bar and the menu's plate.
-const LAUNCHER_GAP: i32 = 6;
 
 /// Which of the two ways out of the session the foot is asking about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3429,6 +3427,8 @@ struct Launcher {
     dialog: Rc<Dialog>,
     /// The user's picture, in the foot.
     avatar: gtk4::DrawingArea,
+    /// The output the menu is centred on.
+    monitor: gdk::Monitor,
     /// Bumped by every fade, so only the newest one touches the window.
     token: Cell<u64>,
 }
@@ -3441,6 +3441,19 @@ struct Launcher {
 fn launcher_matches(query: &str, label: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty() || label.to_lowercase().contains(&query)
+}
+
+/// Where the menu's edge goes so that the menu is centred on the output.
+///
+/// The menu is one size always, so this is arithmetic rather than a
+/// measurement: half of what is left over once the menu has taken its share.
+fn launcher_centre(monitor: &gdk::Monitor, orientation: Orientation) -> i32 {
+    let geometry = monitor.geometry();
+    let (screen, size) = match orientation {
+        Orientation::Vertical => (geometry.height(), LAUNCHER_HEIGHT),
+        _ => (geometry.width(), LAUNCHER_WIDTH),
+    };
+    ((screen - size) / 2).max(0)
 }
 
 fn build_launcher(
@@ -3460,10 +3473,11 @@ fn build_launcher(
     window.set_monitor(Some(monitor));
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Left, true);
-    window.set_margin(Edge::Top, PANEL_HEIGHT + LAUNCHER_GAP);
-    // The same margin the bar's own squares have, so the menu starts where the
-    // square that opened it starts.
-    window.set_margin(Edge::Left, 10);
+    // Centred on the output: the menu is a thing you look at, not a thing that
+    // hangs off the square that opened it, and its own size is fixed, so where
+    // the middle of it goes is arithmetic the panel can do.
+    window.set_margin(Edge::Top, launcher_centre(monitor, Orientation::Vertical));
+    window.set_margin(Edge::Left, launcher_centre(monitor, Orientation::Horizontal));
     window.set_exclusive_zone(-1);
     // While the app menu is up the keyboard belongs to it: a launcher you have to
     // click into before typing is a launcher that has already made you use the
@@ -3548,6 +3562,7 @@ fn build_launcher(
         selected: Cell::new(0),
         token: Cell::new(0),
         avatar: avatar.clone(),
+        monitor: monitor.clone(),
         dialog: dialog.clone(),
     });
 
@@ -3695,7 +3710,9 @@ struct Dialog {
     window: gtk4::Window,
     /// The plate's size: an empty box whose size request is what is animated.
     sizer: GtkBox,
-    /// What is on the plate, revealed into it as it grows.
+    /// What is on the plate. Its size does not decide the plate's -- the plate
+    /// is eased to the size the content needs -- and it is what fades when the
+    /// dialog changes shape.
     content: GtkBox,
     question: Label,
     /// The apps that were asked to close, one row each.
@@ -3716,6 +3733,9 @@ struct Dialog {
     token: Cell<u64>,
     /// Bumped by every resize, so only the newest one touches the plate.
     size_token: Cell<u64>,
+    /// Bumped by every fade of what is on the plate, so only the newest one
+    /// touches its opacity.
+    content_token: Cell<u64>,
     stream: Channel,
 }
 
@@ -3825,6 +3845,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         launcher: RefCell::new(std::rc::Weak::new()),
         token: Cell::new(0),
         size_token: Cell::new(0),
+        content_token: Cell::new(0),
         stream,
     });
 
@@ -3867,6 +3888,11 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
 }
 
 /// Ask the question, over the top of everything.
+///
+/// It arrives at the size it needs, with nothing on it faded: a question that
+/// animates itself into place is a question that made the person who asked it
+/// wait for the animation. The transitions are between the shapes it takes
+/// while it is up.
 fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launcher>) {
     *dialog.launcher.borrow_mut() = launcher.clone();
     dialog.action.set(Some(what));
@@ -3875,10 +3901,12 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     while let Some(child) = dialog.apps.first_child() {
         dialog.apps.remove(&child);
     }
-    dialog_update(dialog);
+    dialog_show(dialog, DialogState::Asking);
+    let (width, height) = dialog_measure(dialog, DialogState::Asking);
+    dialog.sizer.set_size_request(width.max(1), height.max(1));
+    dialog.content.set_opacity(1.0);
     dialog.window.set_opacity(0.0);
     dialog.window.present();
-    dialog_resize(dialog);
     dialog_fade(dialog, true);
 }
 
@@ -3896,14 +3924,12 @@ fn dialog_confirm(dialog: &Rc<Dialog>) {
             if let Some(launcher) = dialog.launcher.borrow().upgrade() {
                 launcher_close(&launcher);
             }
-            dialog.state.set(DialogState::Closing);
             dialog.start_closing(action);
             match action {
                 Confirm::Logout => dialog.stream.send("logout"),
                 Confirm::Shutdown => dialog.stream.send("shutdown"),
             }
-            dialog_update(dialog);
-            dialog_resize(dialog);
+            dialog_transition(dialog, DialogState::Closing);
         }
         DialogState::Closing => {
             // Any way: the apps that said no do not get a second say.
@@ -4003,15 +4029,14 @@ fn dialog_cancel(dialog: &Rc<Dialog>) {
 }
 
 /// The apps that are still open, as they close.
-fn dialog_closing(
-    dialog: &Rc<Dialog>,
-    open: &[u64],
-) {
+fn dialog_closing(dialog: &Rc<Dialog>, open: &[u64]) {
     if dialog.state.get() != DialogState::Closing {
         return;
     }
     dialog.still_open(open);
-    dialog_resize(dialog);
+    // The words do not change the size -- they are one column -- so this is
+    // usually nothing at all.
+    dialog_resize(dialog, DialogState::Closing);
 }
 
 /// The apps that would not close.
@@ -4020,18 +4045,76 @@ fn dialog_refusing(dialog: &Rc<Dialog>, refusing: &[u64]) {
         return;
     }
     dialog.refusing(refusing);
-    dialog_update(dialog);
-    dialog_resize(dialog);
+    dialog_resize(dialog, DialogState::Closing);
 }
 
-/// Ease the plate from the size it has to the size it needs.
+/// Move the dialog to a new shape.
 ///
-/// The question changes shape as the apps go, and a popup that jumps between
-/// its sizes is a popup that is being somewhere else for a frame. The size is
-/// the sizer's, so it can be eased both ways: growing is a reveal, shrinking
-/// is a fade, and both are the same curve.
-fn dialog_resize(dialog: &Rc<Dialog>) {
-    let (target_width, target_height) = dialog.content_size();
+/// The plate eases to the size the new shape needs while what is on it fades
+/// out -- with no easing, because it is leaving and a curve on the way out is
+/// a curve nobody sees -- and the new shape fades in once the plate has
+/// arrived. The size is the plate's own, so it can be eased in both
+/// directions: growing and shrinking are the same motion.
+fn dialog_transition(dialog: &Rc<Dialog>, to: DialogState) {
+    let (target_width, target_height) = dialog_measure(dialog, to);
+    let from_width = dialog.sizer.width();
+    let from_height = dialog.sizer.height();
+    let token = dialog.size_token.get().wrapping_add(1);
+    dialog.size_token.set(token);
+    let owned = dialog.clone();
+    let start = Instant::now();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.size_token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        let eased = ease_in_out(t);
+        owned.sizer.set_size_request(
+            lerp_size(from_width, target_width, eased),
+            lerp_size(from_height, target_height, eased),
+        );
+        owned.content.set_opacity(1.0 - t);
+        if t >= 1.0 {
+            owned.sizer.set_size_request(target_width.max(1), target_height.max(1));
+            owned.content.set_opacity(0.0);
+            // What was on the plate is gone; what goes on it is the new shape,
+            // and it is shown before it is faded in so that nothing is drawn
+            // at the old size.
+            dialog_show(&owned, to);
+            owned.state.set(to);
+            dialog_fade_content(&owned);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Fade what is on the plate back in.
+fn dialog_fade_content(dialog: &Rc<Dialog>) {
+    let token = dialog.content_token.get().wrapping_add(1);
+    dialog.content_token.set(token);
+    let owned = dialog.clone();
+    let start = Instant::now();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if owned.content_token.get() != token {
+            return glib::ControlFlow::Break;
+        }
+        let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
+        owned.content.set_opacity(t);
+        if t >= 1.0 {
+            owned.content.set_opacity(1.0);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Ease the plate to the size a shape needs, without touching what is on it.
+///
+/// For the changes that move the plate without changing what it says: the
+/// words in the list, which are one column wide, and so usually nothing.
+fn dialog_resize(dialog: &Rc<Dialog>, to: DialogState) {
+    let (target_width, target_height) = dialog_measure(dialog, to);
     let from_width = dialog.sizer.width();
     let from_height = dialog.sizer.height();
     if from_width == target_width && from_height == target_height {
@@ -4046,15 +4129,11 @@ fn dialog_resize(dialog: &Rc<Dialog>) {
             return glib::ControlFlow::Break;
         }
         let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        // The same smoothstep the fades use: one motion is one motion.
         let eased = ease_in_out(t);
-        let width = (f64::from(from_width)
-            + (f64::from(target_width) - f64::from(from_width)) * eased)
-            .round() as i32;
-        let height = (f64::from(from_height)
-            + (f64::from(target_height) - f64::from(from_height)) * eased)
-            .round() as i32;
-        owned.sizer.set_size_request(width.max(1), height.max(1));
+        owned.sizer.set_size_request(
+            lerp_size(from_width, target_width, eased),
+            lerp_size(from_height, target_height, eased),
+        );
         if t >= 1.0 {
             owned.sizer.set_size_request(target_width.max(1), target_height.max(1));
             return glib::ControlFlow::Break;
@@ -4063,21 +4142,13 @@ fn dialog_resize(dialog: &Rc<Dialog>) {
     });
 }
 
-impl Dialog {
-    /// The size the plate needs to show what is on it.
-    ///
-    /// Measured off the content, which is an overlay child and so is not the
-    /// thing the plate is sized by: it is what the plate has to grow into.
-    fn content_size(&self) -> (i32, i32) {
-        let (_, width, _, _) = self.content.measure(gtk4::Orientation::Horizontal, -1);
-        let (_, height, _, _) = self.content.measure(gtk4::Orientation::Vertical, width);
-        (width, height)
-    }
+/// One step of a size, rounded to a whole pixel.
+fn lerp_size(from: i32, to: i32, f: f64) -> i32 {
+    (f64::from(from) + (f64::from(to) - f64::from(from)) * f).round() as i32
 }
 
-/// The question, as it is now.
-fn dialog_update(dialog: &Rc<Dialog>) {
-    let state = dialog.state.get();
+/// Put a shape on the dialog: what it says, and what is on it.
+fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
     let action = dialog.action.get();
     let (question, answer) = match (state, action) {
         (DialogState::Asking, Some(Confirm::Logout)) => ("Log out now?", "Log out"),
@@ -4094,6 +4165,30 @@ fn dialog_update(dialog: &Rc<Dialog>) {
     dialog.apps.set_visible(
         state == DialogState::Closing && !dialog.closing.borrow().is_empty(),
     );
+}
+
+/// The size the plate needs for a shape, measured without showing it.
+///
+/// The shape is put on, measured and taken off again in one go: GTK measures
+/// on demand and draws on the next frame, so nothing of it is seen.
+fn dialog_measure(dialog: &Rc<Dialog>, state: DialogState) -> (i32, i32) {
+    let showing = dialog.state.get();
+    dialog_show(dialog, state);
+    let (width, height) = dialog.content_size();
+    dialog_show(dialog, showing);
+    (width, height)
+}
+
+impl Dialog {
+    /// The size the plate needs to show what is on it.
+    ///
+    /// Measured off the content, which is an overlay child and so is not the
+    /// thing the plate is sized by: it is what the plate has to grow into.
+    fn content_size(&self) -> (i32, i32) {
+        let (_, width, _, _) = self.content.measure(gtk4::Orientation::Horizontal, -1);
+        let (_, height, _, _) = self.content.measure(gtk4::Orientation::Vertical, width);
+        (width, height)
+    }
 }
 
 /// Take the question away.
@@ -4421,10 +4516,10 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     // would open onto a list the user did not ask for.
     launcher.search.set_text("");
     launcher_filter(launcher);
-    // The menu arrives from under the bar, the way the other one does, so it is
-    // mapped at the start of the slide rather than at the end of it.
-    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
-    launcher.window.set_margin(Edge::Top, resting - MENU_SLIDE);
+    // The menu rises into place: it is mapped a little below where it belongs
+    // and eased up to it, so the arrival is a movement and not a jump.
+    let resting = launcher_centre(&launcher.monitor, Orientation::Vertical);
+    launcher.window.set_margin(Edge::Top, resting + MENU_SLIDE);
     launcher.window.set_opacity(0.0);
     launcher.shown.set(true);
     launcher.closing.set(false);
@@ -4433,7 +4528,7 @@ fn launcher_open(launcher: &Rc<Launcher>) {
     launcher.shield.set_visible(true);
     launcher.window.present();
     launcher.search.grab_focus();
-    launcher_ease(launcher, 0.0, 1.0, resting - MENU_SLIDE, resting);
+    launcher_ease(launcher, 0.0, 1.0, resting + MENU_SLIDE, resting);
 }
 
 fn launcher_close(launcher: &Rc<Launcher>) {
@@ -4444,8 +4539,8 @@ fn launcher_close(launcher: &Rc<Launcher>) {
     // The catcher's work is done the moment the menu starts leaving: a click
     // during the fade belongs where it was aimed.
     launcher.shield.set_visible(false);
-    let resting = PANEL_HEIGHT + LAUNCHER_GAP;
-    let token = launcher_ease(launcher, 1.0, 0.0, resting, resting - MENU_SLIDE);
+    let resting = launcher_centre(&launcher.monitor, Orientation::Vertical);
+    let token = launcher_ease(launcher, 1.0, 0.0, resting, resting + MENU_SLIDE);
     let fading = launcher.clone();
     // `shown` is not cleared here: it is cleared when the slide lands, so a
     // second Super key in the next 180ms cannot put a menu on screen that is
