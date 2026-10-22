@@ -3784,11 +3784,13 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     confirm.add_css_class("dialog-confirm");
     confirm.set_label("Log out");
 
-    // The two answers at the ends of the row, the way a dialog puts them: the
-    // one that leaves on the left, the one that does it on the right.
+    // The answers are at the ends of their row, so the one that leaves is on
+    // the left and the one that does it is on the right.
     let answers = GtkBox::new(Orientation::Horizontal, 10);
-    answers.set_homogeneous(true);
+    let gap = GtkBox::new(Orientation::Horizontal, 0);
+    gap.set_hexpand(true);
     answers.append(&cancel);
+    answers.append(&gap);
     answers.append(&confirm);
 
     let content = GtkBox::new(Orientation::Vertical, 18);
@@ -4140,13 +4142,13 @@ fn dialog_show(dialog: &Rc<Dialog>, state: DialogState) {
     dialog.apps.set_visible(
         state == DialogState::Closing && !dialog.closing.borrow().is_empty(),
     );
-    // The button that overrules the apps is greyed out for the first few
-    // seconds, so that a session cannot be ended by somebody who is still
-    // clicking. The question's own answer is not: that is what the dialog is
-    // for.
-    dialog
-        .confirm
-        .set_sensitive(anyway_ready(state, dialog.opened_at.get(), Instant::now()));
+    // The button that overrules the apps is not on the dialog for the first
+    // few seconds, so that a session cannot be ended by somebody who is still
+    // clicking. The question's own answer is: that is what the dialog is for.
+    // And Cancel is always there, because leaving is always allowed.
+    let ready = anyway_ready(state, dialog.opened_at.get(), Instant::now());
+    dialog.confirm.set_visible(state != DialogState::Closing || ready);
+    dialog.confirm.set_sensitive(ready);
 }
 
 /// The size the plate needs for a shape, measured without showing it.
