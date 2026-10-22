@@ -3461,7 +3461,9 @@ fn build_launcher(
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Left, true);
     window.set_margin(Edge::Top, PANEL_HEIGHT + LAUNCHER_GAP);
-    window.set_margin(Edge::Left, 8);
+    // The same margin the bar's own squares have, so the menu starts where the
+    // square that opened it starts.
+    window.set_margin(Edge::Left, 10);
     window.set_exclusive_zone(-1);
     // While the app menu is up the keyboard belongs to it: a launcher you have to
     // click into before typing is a launcher that has already made you use the
@@ -3662,6 +3664,8 @@ struct Dialog {
     question: Label,
     /// The apps that would not close, by their own marks and names.
     apps: GtkBox,
+    /// The answers: Cancel, and the one that does it.
+    answers: GtkBox,
     confirm: Button,
     /// What the question is about now.
     state: Cell<DialogState>,
@@ -3710,10 +3714,16 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
 
     let question = Label::new(Some("Log out now?"));
     question.add_css_class("dialog-question");
-    question.set_xalign(0.0);
+    // A fixed width, so the plate is the same width whatever the question
+    // says: one sentence is short and the next is long, and a dialog that
+    // changes width between them is a dialog that moves under the hand.
+    question.set_width_chars(34);
+    question.set_max_width_chars(34);
+    question.set_xalign(0.5);
     // The apps that would not close, named and marked, under the question.
     let apps = GtkBox::new(Orientation::Vertical, 6);
     apps.add_css_class("dialog-apps");
+    apps.set_halign(gtk4::Align::Center);
     apps.set_visible(false);
     let cancel = Button::new();
     cancel.add_css_class("dialog-button");
@@ -3726,7 +3736,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     // The question on top of the answers, not beside them: a question and the
     // buttons that answer it read as a sentence when they are on a line.
     let answers = GtkBox::new(Orientation::Horizontal, 10);
-    answers.set_halign(gtk4::Align::End);
+    answers.set_halign(gtk4::Align::Center);
     answers.append(&cancel);
     answers.append(&confirm);
     let content = GtkBox::new(Orientation::Vertical, 18);
@@ -3756,6 +3766,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         plate: plate.clone(),
         question,
         apps,
+        answers: answers.clone(),
         confirm: confirm.clone(),
         state: Cell::new(DialogState::None),
         refusing_count: Cell::new(0),
@@ -3895,6 +3906,7 @@ fn dialog_fill_apps(
     let count = apps.len();
     for (name, entry) in apps {
         let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.set_halign(gtk4::Align::Center);
         // The app's own mark, and a generic one for an app that is not an
         // installed application.
         let icon = match &entry {
@@ -3904,6 +3916,10 @@ fn dialog_fill_apps(
         row.append(&icon);
         let label = Label::new(Some(&name));
         label.add_css_class("dialog-app");
+        // Shortened rather than allowed to make the plate wider than the
+        // question is.
+        label.set_max_width_chars(30);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         row.append(&label);
         dialog.apps.append(&row);
     }
@@ -3918,10 +3934,13 @@ fn dialog_fill_apps(
 /// frame, so the size is eased: in and out, so it is the same motion whether
 /// it is growing or shrinking.
 fn dialog_resize(dialog: &Rc<Dialog>) {
-    let (_, natural_width, _, _) = dialog.plate.measure(gtk4::Orientation::Horizontal, -1);
-    let (_, natural_height, _, _) = dialog
+    // Measured for the width the plate wants, not the width it happens to have:
+    // measuring a box for a width it does not fit in is how GTK ends up
+    // warning about a measurement it was never going to use.
+    let (min_width, natural_width, _, _) = dialog.plate.measure(gtk4::Orientation::Horizontal, -1);
+    let (min_height, natural_height, _, _) = dialog
         .plate
-        .measure(gtk4::Orientation::Vertical, dialog.plate.width());
+        .measure(gtk4::Orientation::Vertical, natural_width);
     let from_width = dialog.plate.width();
     let from_height = dialog.plate.height();
     if from_width == natural_width && from_height == natural_height {
@@ -3938,12 +3957,17 @@ fn dialog_resize(dialog: &Rc<Dialog>) {
         }
         let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
         let eased = ease_in_out(t);
-        let width = (f64::from(from_width)
+        // Never smaller than the content needs: a plate that is narrower than
+        // its question clips the question, and a clipped question is worse
+        // than one that moved.
+        let width = ((f64::from(from_width)
             + (f64::from(natural_width) - f64::from(from_width)) * eased)
-            .round() as i32;
-        let height = (f64::from(from_height)
+            .round() as i32)
+            .max(min_width);
+        let height = ((f64::from(from_height)
             + (f64::from(natural_height) - f64::from(from_height)) * eased)
-            .round() as i32;
+            .round() as i32)
+            .max(min_height);
         plate.set_size_request(width.max(1), height.max(1));
         if t >= 1.0 {
             plate.set_size_request(natural_width.max(1), natural_height.max(1));
@@ -3962,10 +3986,16 @@ fn dialog_resize(dialog: &Rc<Dialog>) {
 fn apps_behind(ids: &[u64]) -> Vec<(String, Option<crate::desktop::DesktopApp>)> {
     let snapshot = SNAPSHOT.with(|cell| cell.borrow().clone());
     let mut apps = Vec::new();
+    let mut seen = HashSet::new();
     for id in ids {
         let Some(info) = snapshot.iter().find(|info| info.id == *id) else {
             continue;
         };
+        // One app is one row, however many of its windows are in the way: two
+        // rows both called Firefox is one app written down twice.
+        if !seen.insert(info.app_id.clone()) {
+            continue;
+        }
         let entry = crate::desktop::cached(&info.app_id);
         let name = entry
             .as_ref()
@@ -4008,8 +4038,10 @@ fn dialog_update(dialog: &Rc<Dialog>) {
     if !answer.is_empty() {
         dialog.confirm.set_label(answer);
     }
-    // While the apps are being asked there is nothing to answer yet.
-    dialog.confirm.set_sensitive(state != DialogState::Waiting);
+    // While the apps are being asked there is nothing to answer yet, so the
+    // answers are not there either: a question nobody can answer is a row of
+    // buttons that do nothing, and two of them look like a choice.
+    dialog.answers.set_visible(state != DialogState::Waiting);
     // The apps are on show whenever there are any: the ones that are closing
     // while they close, and the ones that would not afterwards.
     dialog.apps.set_visible(dialog.refusing_count.get() > 0);
@@ -4302,7 +4334,11 @@ fn launcher_row(app: &crate::desktop::DesktopApp) -> Button {
         content.set_hexpand(true);
         if let Some(label) = content.last_child().and_then(|l| l.downcast::<Label>().ok()) {
             label.set_hexpand(true);
-            label.set_max_width_chars(-1);
+            // The name takes the room the row has, and is shortened at the end
+            // of it: a name that runs past the plate is a name that is cut off
+            // halfway through a word.
+            label.set_max_width_chars(34);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         }
     }
     row
