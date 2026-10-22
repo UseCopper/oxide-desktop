@@ -3717,8 +3717,11 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     // A fixed width, so the plate is the same width whatever the question
     // says: one sentence is short and the next is long, and a dialog that
     // changes width between them is a dialog that moves under the hand.
-    question.set_width_chars(34);
-    question.set_max_width_chars(34);
+    // Wide enough for the longest sentence the dialog says -- these apps are
+    // preventing shutdown -- and no wider, so the plate is the same width in
+    // every state.
+    question.set_width_chars(36);
+    question.set_max_width_chars(36);
     question.set_xalign(0.5);
     // The apps that would not close, named and marked, under the question.
     let apps = GtkBox::new(Orientation::Vertical, 6);
