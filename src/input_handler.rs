@@ -927,7 +927,7 @@ impl AnvilState<UdevData> {
                 KeyAction::VtSwitch(vt) => {
                     info!(to = vt, "Trying to switch vt");
                     if let Err(err) = self.backend_data.session.change_vt(vt) {
-                        error!(vt, "Error switching vt: {}", err);
+                        tracing::error!(vt, "Error switching vt: {}", err);
                     }
                 }
                 KeyAction::Screen(num) => {
