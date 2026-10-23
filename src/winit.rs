@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     sync::{Mutex, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "egl")]
@@ -405,6 +405,8 @@ pub fn run_winit() {
 
             crate::shell::capture_window_snapshots(&state.space, state.backend_data.backend.renderer());
 
+            let dim_alpha = state.dim_alpha(Instant::now());
+
             let backend = &mut state.backend_data.backend;
 
             // draw the cursor as relevant
@@ -427,9 +429,9 @@ pub fn run_winit() {
             #[cfg(feature = "debug")]
             fps_element.update_fps(fps);
 
+            let show_window_preview = state.show_window_preview;
             let space = &mut state.space;
             let damage_tracker = &mut state.backend_data.damage_tracker;
-            let show_window_preview = state.show_window_preview;
 
             let dnd_icon = state.dnd_icon.as_ref();
 
@@ -510,6 +512,7 @@ pub fn run_winit() {
                     damage_tracker,
                     age,
                     show_window_preview,
+                    dim_alpha,
                 )
                 .map_err(|err| match err {
                     OutputDamageTrackerError::Rendering(err) => err.into(),

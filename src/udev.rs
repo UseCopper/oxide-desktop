@@ -1470,6 +1470,8 @@ impl AnvilState<UdevData> {
         self.pre_repaint(&output, frame_target);
         self.tick_animations();
 
+        let dim_alpha = self.dim_alpha(Instant::now());
+
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
         } else {
@@ -1542,6 +1544,7 @@ impl AnvilState<UdevData> {
             &self.dnd_icon,
             &mut self.cursor_status,
             self.show_window_preview,
+            dim_alpha,
         );
         let reschedule = match result {
             Ok((has_rendered, states)) => {
@@ -1623,6 +1626,7 @@ fn render_surface<'a>(
     dnd_icon: &Option<DndIcon>,
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
+    dim_alpha: f32,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -1698,7 +1702,7 @@ fn render_surface<'a>(
     }
 
     let (elements, clear_color) =
-        output_elements(output, space, custom_elements, renderer, show_window_preview);
+        output_elements(output, space, custom_elements, renderer, show_window_preview, dim_alpha);
 
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()

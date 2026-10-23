@@ -261,6 +261,12 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// The preview is only shown once the pointer has dwelled here long enough.
     pub snap_candidate: Option<SnapTarget>,
     pub snap_candidate_since: Instant,
+    /// The darkening behind the panel's question, over every output.
+    ///
+    /// Drawn by the compositor rather than by the panel: a fullscreen client
+    /// surface has to re-upload the whole output for every step of a fade, and
+    /// a layer-shell window is on one output. See [`crate::dim`].
+    pub dim: crate::dim::Dim,
     /// The panel connection, when the panel feature is enabled and it bound
     /// successfully.
     pub panel_ipc: Option<crate::panel_ipc::PanelIpc>,
@@ -911,6 +917,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             super_key: Rc::new(Cell::new(SuperKey::default())),
             pending_session_end: None,
             cursor_status: CursorImageStatus::default_named(),
+            dim: crate::dim::Dim::off(),
             seat_name,
             seat,
             pointer,

@@ -1,6 +1,6 @@
 use std::{
     sync::{Mutex, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -346,6 +346,8 @@ pub fn run_x11() {
                     .unwrap_or_default();
             state.pre_repaint(&output, frame_target);
 
+            let dim_alpha = state.dim_alpha(Instant::now());
+
             crate::shell::capture_window_snapshots(&state.space, &mut state.backend_data.renderer);
 
             let backend_data = &mut state.backend_data;
@@ -442,6 +444,7 @@ pub fn run_x11() {
                 &mut backend_data.damage_tracker,
                 age.into(),
                 state.show_window_preview,
+                dim_alpha,
             );
 
             match render_res {

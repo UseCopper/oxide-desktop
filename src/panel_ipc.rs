@@ -152,6 +152,12 @@ pub enum PanelMessage {
     Shutdown,
     /// End the session whatever the apps say.
     Force,
+    /// Darken every output behind the panel's question, or take the dim off.
+    ///
+    /// The overlay is the compositor's to draw: it can cover every output and
+    /// animate at the output's own rate, which a fullscreen client surface
+    /// cannot (see [`crate::dim`]).
+    Dim(bool),
     /// Take the request back.
     Cancel,
 }
@@ -567,6 +573,11 @@ fn parse_frame(frame: &[u8]) -> Incoming {
         Some("logout") => Incoming::Message(PanelMessage::Logout),
         Some("shutdown") => Incoming::Message(PanelMessage::Shutdown),
         Some("force") => Incoming::Message(PanelMessage::Force),
+        Some("dim") => match fields.as_slice() {
+            [_, on] if on == "1" => Incoming::Message(PanelMessage::Dim(true)),
+            [_, on] if on == "0" => Incoming::Message(PanelMessage::Dim(false)),
+            _ => Incoming::Ignored,
+        },
         Some("cancel") => Incoming::Message(PanelMessage::Cancel),
         Some("accent") => match parse_accent(&fields) {
             Some(rgb) => Incoming::Message(PanelMessage::Accent(rgb)),
@@ -651,6 +662,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let messages = ipc.poll();
         if self.panel_ipc.as_ref().is_some_and(|ipc| !ipc.is_connected()) {
             self.forget_panel_previews();
+            // A panel that has gone cannot take its dim down, and a question
+            // that is no longer on screen must not leave the desktop dark.
+            self.dim = crate::dim::Dim::off();
             return;
         }
 
@@ -724,6 +738,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         self.end_session(pending.what);
                     }
                 }
+                PanelMessage::Dim(on) => self.set_dim(on),
                 PanelMessage::Cancel => {
                     // The panel changed its mind. The apps that were asked to
                     // close may still close: they were asked, and the answer
@@ -1239,6 +1254,23 @@ mod tests {
             message("accent\t0.5\t0.5\t0.5"),
             Some(PanelMessage::Accent([0.5, 0.5, 0.5]))
         ));
+    }
+
+    #[test]
+    fn the_panel_can_ask_for_the_dim() {
+        assert!(matches!(
+            message("dim\t1"),
+            Some(PanelMessage::Dim(true))
+        ));
+        assert!(matches!(
+            message("dim\t0"),
+            Some(PanelMessage::Dim(false))
+        ));
+        // A flag this version does not know, or a frame with fields missing or
+        // extra, is not one to guess at.
+        for bad in ["dim", "dim\t", "dim\t2", "dim\ttrue", "dim\t1\t1", "dim\t-1"] {
+            assert!(ignored(bad), "{bad:?} should have been ignored");
+        }
     }
 
     #[test]

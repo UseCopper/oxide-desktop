@@ -13,8 +13,13 @@ use smithay::{
             },
         },
     },
-    desktop::space::{
-        ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements, constrain_space_element,
+    desktop::{
+        LayerSurface,
+        layer_map_for_output,
+        space::{
+            ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements,
+            constrain_space_element,
+        },
     },
     output::Output,
     utils::{Logical, Point, Rectangle, Scale, Size},
@@ -24,6 +29,7 @@ use smithay::{
 #[cfg(feature = "debug")]
 use crate::drawing::FpsElement;
 use crate::{
+    dim,
     drawing::{CLEAR_COLOR, CLEAR_COLOR_FULLSCREEN, PointerRenderElement},
     shell::{
         FullscreenSurface, SNAP_PREVIEW_ALPHA, SnapPreviewState, WindowElement, preview_color,
@@ -61,7 +67,8 @@ smithay::backend::renderer::element::render_elements! {
     Space=SpaceRenderElements<R, E>,
     Window=Wrap<E>,
     Custom=CustomRenderElements<R>,
-    SnapPreview=SolidColorRenderElement,
+    /// A flat colour: the snap preview, and the panel's dim.
+    Solid=SolidColorRenderElement,
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
     Background=MemoryRenderBufferRenderElement<R>,
 }
@@ -74,7 +81,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Space(arg0) => f.debug_tuple("Space").field(arg0).finish(),
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Custom(arg0) => f.debug_tuple("Custom").field(arg0).finish(),
-            Self::SnapPreview(arg0) => f.debug_tuple("SnapPreview").field(arg0).finish(),
+            Self::Solid(arg0) => f.debug_tuple("Solid").field(arg0).finish(),
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::Background(arg0) => f.debug_tuple("Background").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
@@ -171,6 +178,7 @@ pub fn output_elements<R>(
     custom_elements: impl IntoIterator<Item = CustomRenderElements<R>>,
     renderer: &mut R,
     show_window_preview: bool,
+    dim_alpha: f32,
 ) -> (Vec<OutputRenderElements<R, WindowRenderElement<R>>>, Color32F)
 where
     R: Renderer + ImportAll + ImportMem,
@@ -182,36 +190,20 @@ where
         .and_then(|f| f.get())
     {
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let layer_map = smithay::desktop::layer_map_for_output(output);
         // A Top layer (e.g. the panel) is hidden while a window is fullscreen,
         // like most compositors do. Overlay layers (notifications, OSDs) stay
         // above the fullscreen window; everything else is drawn behind it.
-        let (overlay, below): (Vec<_>, Vec<_>) = layer_map
-            .layers()
-            .rev()
-            .filter(|surface| surface.layer() != Layer::Top)
-            .partition(|surface| surface.layer() == Layer::Overlay);
+        let (overlay, below) = layers_around_windows(output, true);
 
         let mut elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
 
-        for surface in overlay {
-            let Some(geo) = layer_map.layer_geometry(surface) else {
-                continue;
-            };
-            elements.extend(
-                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
-                    surface,
-                    renderer,
-                    geo.loc.to_physical_precise_round(scale),
-                    scale,
-                    1.0,
-                )
-                .into_iter()
-                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
-            );
+        elements.extend(layer_elements(renderer, output, &overlay));
+
+        if dim_alpha > 0.0 {
+            elements.push(OutputRenderElements::Solid(dim::element(output, dim_alpha)));
         }
 
         // Draw the fullscreen window at the output origin so it covers the
@@ -229,22 +221,7 @@ where
                 .map(|e| OutputRenderElements::Window(Wrap::from(e))),
         );
 
-        for surface in below {
-            let Some(geo) = layer_map.layer_geometry(surface) else {
-                continue;
-            };
-            elements.extend(
-                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
-                    surface,
-                    renderer,
-                    geo.loc.to_physical_precise_round(scale),
-                    scale,
-                    1.0,
-                )
-                .into_iter()
-                .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e))),
-            );
-        }
+        elements.extend(layer_elements(renderer, output, &below));
 
         (elements, CLEAR_COLOR_FULLSCREEN)
     } else {
@@ -259,7 +236,7 @@ where
             let scale = Scale::from(output.current_scale().fractional_scale());
             let [red, green, blue] = preview_color();
             let buffer = SolidColorBuffer::new(rect.size, [red, green, blue, 1.0]);
-            output_render_elements.push(OutputRenderElements::SnapPreview(
+            output_render_elements.push(OutputRenderElements::Solid(
                 SolidColorRenderElement::from_buffer(
                     &buffer,
                     rect.loc.to_physical_precise_round(scale),
@@ -274,14 +251,34 @@ where
             output_render_elements.extend(space_preview_elements(renderer, space, output));
         }
 
-        let space_elements = smithay::desktop::space::space_render_elements::<_, WindowElement, _>(
-            renderer,
-            [space],
-            output,
-            1.0,
-        )
-        .expect("output without mode?");
-        output_render_elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+        // The layers in front of the windows, then the dim, then the windows,
+        // then the layers behind them. The dim's place is the point of this:
+        // it darkens the desktop and everything on it, and the panel — which
+        // is a Top layer, and is where the question itself is drawn — stays
+        // lit above it.
+        let (above, below) = layers_around_windows(output, false);
+        output_render_elements.extend(layer_elements(renderer, output, &above));
+
+        if dim_alpha > 0.0 {
+            output_render_elements
+                .push(OutputRenderElements::Solid(dim::element(output, dim_alpha)));
+        }
+
+        if let Some(geometry) = space.output_geometry(output) {
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            output_render_elements.extend(
+                space
+                    .render_elements_for_region(renderer, &geometry, scale, 1.0)
+                    .into_iter()
+                    .map(|element| {
+                        OutputRenderElements::Space(SpaceRenderElements::Element(Wrap::from(
+                            element,
+                        )))
+                    }),
+            );
+        }
+
+        output_render_elements.extend(layer_elements(renderer, output, &below));
 
         // The wallpaper, last, which is the back: these lists run front to
         // back, so everything above is already in place. It is built after the
@@ -293,6 +290,63 @@ where
 
         (output_render_elements, CLEAR_COLOR)
     }
+}
+
+/// The layer surfaces of `output`, split the way they sit around the windows.
+///
+/// Each list is in the order the compositor draws it, front to back: the layer
+/// map keeps surfaces in mapping order, and walking it in reverse puts the most
+/// recently mapped surface first. While a window is fullscreen the panel's own
+/// layer is hidden, as it is everywhere else in this compositor, so only the
+/// Overlay layers stay in front of the window.
+fn layers_around_windows(
+    output: &Output,
+    fullscreen: bool,
+) -> (Vec<LayerSurface>, Vec<LayerSurface>) {
+    let map = layer_map_for_output(output);
+    let (above, below): (Vec<_>, Vec<_>) = map
+        .layers()
+        .rev()
+        .filter(|surface| !fullscreen || surface.layer() != Layer::Top)
+        .partition(|surface| matches!(surface.layer(), Layer::Overlay | Layer::Top));
+    (
+        above.into_iter().cloned().collect(),
+        below.into_iter().cloned().collect(),
+    )
+}
+
+/// Draw a set of layer surfaces, in order.
+fn layer_elements<R>(
+    renderer: &mut R,
+    output: &Output,
+    surfaces: &[LayerSurface],
+) -> Vec<OutputRenderElements<R, WindowRenderElement<R>>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Send + 'static,
+{
+    let map = layer_map_for_output(output);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    surfaces
+        .iter()
+        .filter_map(|surface| {
+            let geometry = map.layer_geometry(surface)?;
+            Some(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
+                    renderer,
+                    geometry.loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(|element| {
+                    OutputRenderElements::Space(SpaceRenderElements::Surface(element))
+                }),
+            )
+        })
+        .flatten()
+        .collect()
 }
 
 /// The wallpaper, under everything.
@@ -325,12 +379,13 @@ pub fn render_output<'a, 'd, R>(
     damage_tracker: &'d mut OutputDamageTracker,
     age: usize,
     show_window_preview: bool,
+    dim_alpha: f32,
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
 where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Clone + Send + 'static,
 {
     let (elements, clear_color) =
-        output_elements(output, space, custom_elements, renderer, show_window_preview);
+        output_elements(output, space, custom_elements, renderer, show_window_preview, dim_alpha);
     damage_tracker.render_output(renderer, framebuffer, age, &elements, clear_color)
 }

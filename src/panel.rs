@@ -3708,6 +3708,8 @@ impl ClosingApp {
 /// out loud.
 struct Dialog {
     window: gtk4::Window,
+    /// The plate itself, background and all: what fades with the dim behind it.
+    plate: GtkBox,
     /// The plate's size: an empty box whose size request is what is animated.
     sizer: GtkBox,
     /// What is on the plate. Its size does not decide the plate's -- the plate
@@ -3732,8 +3734,9 @@ struct Dialog {
     /// The menu the question was asked from, so that answering it can put the
     /// menu away as well.
     launcher: RefCell<std::rc::Weak<Launcher>>,
-    /// Bumped by every fade, so only the newest one touches the window.
-    token: Cell<u64>,
+    /// Bumped by every fade of the plate as a whole, so only the newest one
+    /// touches its opacity.
+    plate_token: Cell<u64>,
     /// Bumped by every resize, so only the newest one touches the plate.
     size_token: Cell<u64>,
     /// Bumped by every fade of what is on the plate, so only the newest one
@@ -3763,17 +3766,20 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     // While the question is up the keyboard belongs to it: Escape is how a
     // question is answered no.
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
-    window.set_opacity(0.0);
 
-    // The dimming, and the click that takes the question back. One surface
-    // behind the dialog, dark enough to see the dialog by and light enough
-    // that the desktop is still there behind it.
-    let dim = DrawingArea::new();
-    dim.set_hexpand(true);
-    dim.set_vexpand(true);
-    dim.set_draw_func(|_, context, width, height| {
-        let _ = context.set_source_rgba(0.0, 0.0, 0.0, 0.55);
-        let _ = context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
+    // The question takes the whole output so that a click anywhere on it is a
+    // click on the question rather than on what is behind it. It paints almost
+    // nothing now: the darkness is the compositor's (see [`crate::dim`]),
+    // because a fullscreen client surface that faded itself would re-upload the
+    // whole output on every tick, and a layer-shell window only covers the one
+    // output it is on. One in a hundred alpha is enough for the input region to
+    // be a surface at all.
+    let shield = DrawingArea::new();
+    shield.set_hexpand(true);
+    shield.set_vexpand(true);
+    shield.set_draw_func(|_, context, width, height| {
+        context.set_source_rgba(0.0, 0.0, 0.0, 0.01);
+        context.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
         let _ = context.fill();
     });
 
@@ -3829,15 +3835,16 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     plate.set_halign(gtk4::Align::Center);
     plate.set_valign(gtk4::Align::Center);
 
-    // The dialog over the dimming, so a click on the dimming is a click on
+    // The dialog over the shield, so a click on the shield is a click on
     // nothing in particular and the question is taken back.
     let root = gtk4::Overlay::new();
-    root.set_child(Some(&dim));
+    root.set_child(Some(&shield));
     root.add_overlay(&plate);
     window.set_child(Some(&root));
 
     let dialog = Rc::new(Dialog {
         window: window.clone(),
+        plate: plate.clone(),
         sizer,
         content: content.clone(),
         question,
@@ -3849,7 +3856,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         action: Cell::new(None),
         closing: RefCell::new(Vec::new()),
         launcher: RefCell::new(std::rc::Weak::new()),
-        token: Cell::new(0),
+        plate_token: Cell::new(0),
         size_token: Cell::new(0),
         content_token: Cell::new(0),
         answer_token: Cell::new(0),
@@ -3858,8 +3865,8 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     });
 
     let dismissed = dialog.clone();
-    let dim_click = gtk4::GestureClick::new();
-    dim_click.connect_pressed(glib::clone!(
+    let shield_click = gtk4::GestureClick::new();
+    shield_click.connect_pressed(glib::clone!(
         #[weak]
         dismissed,
         #[upgrade_or]
@@ -3868,7 +3875,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
             dialog_cancel(&dismissed);
         }
     ));
-    dim.add_controller(dim_click);
+    shield.add_controller(shield_click);
 
     let cancelled = dialog.clone();
     cancel.connect_clicked(move |_| {
@@ -3915,9 +3922,16 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     dialog.sizer.set_size_request(width.max(1), height.max(1));
     dialog.content.set_opacity(1.0);
     dialog.confirm.set_opacity(1.0);
-    dialog.window.set_opacity(0.0);
+    // The plate comes up with the dim: it is put on at nothing first, so the
+    // first frame the window draws is the darkness rather than the question
+    // already sitting on it. A question asked while an earlier one is still on
+    // its way out keeps whatever it had got to, so it turns around rather than
+    // blinking.
+    if !dialog.window.is_visible() {
+        dialog.plate.set_opacity(0.0);
+    }
     dialog.window.present();
-    dialog_fade(dialog, true);
+    dialog_dim(dialog, true);
     // And the "anyway" button comes back on its own, three seconds after the
     // dialog opened -- or after the wait it is already in the middle of. It is
     // wider than the dialog was without it, so the plate makes room for it:
@@ -4277,31 +4291,47 @@ fn dialog_close(dialog: &Rc<Dialog>) {
         return;
     }
     dialog.state.set(DialogState::None);
-    dialog_fade(dialog, false);
+    dialog_dim(dialog, false);
 }
 
-/// The question's arrival and departure: the dimming comes up and goes down.
-fn dialog_fade(dialog: &Rc<Dialog>, showing: bool) {
-    let token = dialog.token.get().wrapping_add(1);
-    dialog.token.set(token);
-    let window = dialog.window.clone();
+/// The desktop behind the question, and the question with it.
+///
+/// The dim is the compositor's to draw: a fullscreen surface faded here would
+/// re-upload the whole output on every tick of the fade, and a layer-shell
+/// window is on one output, so the overlay stopped at that output's edge. The
+/// plate is still the panel's, and it fades here — the same curve, over the same
+/// span, from the same moment the dim is asked for — because the two are one
+/// arrival: the question and the darkness it is asked in come up together, and
+/// go away together. `MENU_FADE` is the compositor's `DIM_FADE`; the two ends are
+/// separate processes, so the number is repeated rather than shared.
+fn dialog_dim(dialog: &Rc<Dialog>, showing: bool) {
+    dialog.stream.send(if showing { "dim\t1" } else { "dim\t0" });
+    dialog_fade_plate(dialog, showing);
+}
+
+/// Fade the plate in or out.
+///
+/// Only the plate: a widget's opacity damages the rectangle it covers, while the
+/// window's opacity damaged the whole output-sized surface — which is what made
+/// the fade look like a slideshow. The window is hidden at the end of the way
+/// out, once there is nothing left on it to see (or to click).
+fn dialog_fade_plate(dialog: &Rc<Dialog>, showing: bool) {
+    let token = dialog.plate_token.get().wrapping_add(1);
+    dialog.plate_token.set(token);
     let owned = dialog.clone();
     let start = Instant::now();
-    let from = window.opacity();
+    let from = dialog.plate.opacity();
     let to = if showing { 1.0 } else { 0.0 };
     glib::timeout_add_local(Duration::from_millis(16), move || {
-        if owned.token.get() != token {
+        if owned.plate_token.get() != token {
             return glib::ControlFlow::Break;
         }
         let t = (start.elapsed().as_secs_f64() / MENU_FADE.as_secs_f64()).clamp(0.0, 1.0);
-        // The smoothstep, in both directions: the same motion played forwards
-        // and backwards, and the one that is always moving at a visible rate.
-        let eased = ease_in_out(t);
-        window.set_opacity(from + (to - from) * eased);
+        owned.plate.set_opacity(from + (to - from) * ease_in_out(t));
         if t >= 1.0 {
-            window.set_opacity(to);
+            owned.plate.set_opacity(to);
             if !showing {
-                window.set_visible(false);
+                owned.window.set_visible(false);
             }
             return glib::ControlFlow::Break;
         }
