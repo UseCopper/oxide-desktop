@@ -226,10 +226,18 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub pending_session_end: Option<PendingSessionEnd>,
     /// The screen going black as the session ends, once it has been told to.
     ///
-    /// The session does not come back from here, so the blackout stays; the
-    /// session's last frame is the desktop going dark rather than whatever the
-    /// scanout happened to hold when the loop stopped.
+    /// It stays: the session's last frame is the desktop going dark rather than
+    /// whatever the scanout happened to hold when the loop stopped. Only a
+    /// poweroff that is refused takes it down again, because then the session
+    /// is not ending after all.
     pub blackout: Option<crate::dim::Blackout>,
+    /// What the session was asked to do, once the screen has gone black.
+    pub ending: Option<EndSession>,
+    /// The `systemctl poweroff` the session asked for, until it answers.
+    ///
+    /// Kept so a refusal can be noticed: if the machine is not going anywhere,
+    /// the screen must not stay black with nothing left to say so on.
+    pub poweroff: Option<std::process::Child>,
     /// What the Super key is doing.
     ///
     /// The Super key on its own opens the app menu, and the Super key with
@@ -923,6 +931,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             super_key: Rc::new(Cell::new(SuperKey::default())),
             pending_session_end: None,
             blackout: None,
+            ending: None,
+            poweroff: None,
             cursor_status: CursorImageStatus::default_named(),
             dim: crate::dim::Dim::off(),
             seat_name,

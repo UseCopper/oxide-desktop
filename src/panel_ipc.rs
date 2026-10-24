@@ -1006,41 +1006,75 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         });
     }
 
-    /// End the session, or bring the machine down.
+    /// End the session, or bring the machine down, once the screen has gone
+    /// black.
+    ///
+    /// The screen goes black first and the session goes away behind it:
+    /// stopping on the frame the last app closed is a cut to whatever is behind
+    /// the compositor, and there is nothing behind it to come back to. What was
+    /// asked for happens in [`Self::tick_ending`], once the fade has arrived.
     fn end_session(&mut self, what: EndSession) {
-        match what {
-            EndSession::Logout => {
-                // The screen goes black first and the loop stops behind it:
-                // stopping on the frame the last app closed is a cut to
-                // whatever is behind the compositor, and there is nothing
-                // behind it to come back to. `tick_ending` does the stopping
-                // once the fade has arrived.
-                if self.blackout.is_some() {
-                    return;
-                }
-                info!("the session is ending");
-                self.blackout = Some(crate::dim::Blackout::start(Instant::now()));
-            }
-            EndSession::Shutdown => {
-                // Asked through systemd, so the machine is brought down the way
-                // it is meant to be brought down -- and so whatever usually
-                // asks for permission to do it still gets to.
-                info!("the machine is going down");
-                if let Err(err) = Command::new("systemctl").arg("poweroff").spawn() {
-                    warn!(%err, "could not ask for the machine to power off");
-                }
-            }
+        if self.blackout.is_some() {
+            return;
         }
+        info!(?what, "the session is ending");
+        self.blackout = Some(crate::dim::Blackout::start(Instant::now()));
+        self.ending = Some(what);
     }
 
-    /// Stop the session once the screen has finished going black.
+    /// Do what the session was asked for, once the screen is black.
     ///
-    /// Called every frame; does nothing until the blackout has arrived. The
-    /// blackout is never taken down: the last frame the session draws stays
-    /// what it was, so nothing behind the compositor is shown in its place.
+    /// Called every frame. A logout stops the loop here and the blackout is
+    /// never taken down. A poweroff is asked for at the same point and then
+    /// watched: systemd can refuse, and a machine that is not going anywhere
+    /// must not leave a black screen with no way to say anything else.
     pub fn tick_ending(&mut self, now: Instant) {
-        if self.blackout.is_some_and(|blackout| blackout.finished(now)) {
-            self.running.store(false, Ordering::SeqCst);
+        if self.blackout.is_none_or(|blackout| !blackout.finished(now)) {
+            return;
+        }
+        if let Some(what) = self.ending.take() {
+            match what {
+                EndSession::Logout => {
+                    // The compositor is the session, so the compositor is what
+                    // stops.
+                    self.running.store(false, Ordering::SeqCst);
+                }
+                EndSession::Shutdown => {
+                    // Asked through systemd, so the machine is brought down the
+                    // way it is meant to be brought down -- and so whatever
+                    // usually asks for permission to do it still gets to.
+                    info!("the machine is going down");
+                    match Command::new("systemctl").arg("poweroff").spawn() {
+                        Ok(child) => self.poweroff = Some(child),
+                        Err(err) => {
+                            warn!(%err, "could not ask for the machine to power off");
+                            self.blackout = None;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // A poweroff that has been asked for. Its answer is the only thing that
+        // can bring the screen back.
+        let Some(child) = self.poweroff.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            // Reaped either way, so nothing is left for the system to wait on.
+            Ok(Some(status)) if status.success() => self.poweroff = None,
+            Ok(Some(status)) => {
+                warn!(?status, "the machine is not going down");
+                self.poweroff = None;
+                self.blackout = None;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(%err, "could not wait for the machine to power off");
+                self.poweroff = None;
+                self.blackout = None;
+            }
         }
     }
 
