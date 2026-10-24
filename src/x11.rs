@@ -347,6 +347,7 @@ pub fn run_x11() {
             state.pre_repaint(&output, frame_target);
 
             let dim_alpha = state.dim_alpha(Instant::now());
+            let blackout_alpha = state.blackout_alpha(Instant::now());
 
             crate::shell::capture_window_snapshots(&state.space, &mut state.backend_data.renderer);
 
@@ -445,6 +446,7 @@ pub fn run_x11() {
                 age.into(),
                 state.show_window_preview,
                 dim_alpha,
+                blackout_alpha,
             );
 
             match render_res {

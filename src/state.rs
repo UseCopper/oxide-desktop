@@ -224,6 +224,12 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub suppressed_keys: Vec<Keysym>,
     /// A session the panel asked to end, and the apps that would not close.
     pub pending_session_end: Option<PendingSessionEnd>,
+    /// The screen going black as the session ends, once it has been told to.
+    ///
+    /// The session does not come back from here, so the blackout stays; the
+    /// session's last frame is the desktop going dark rather than whatever the
+    /// scanout happened to hold when the loop stopped.
+    pub blackout: Option<crate::dim::Blackout>,
     /// What the Super key is doing.
     ///
     /// The Super key on its own opens the app menu, and the Super key with
@@ -916,6 +922,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             suppressed_keys: Vec::new(),
             super_key: Rc::new(Cell::new(SuperKey::default())),
             pending_session_end: None,
+            blackout: None,
             cursor_status: CursorImageStatus::default_named(),
             dim: crate::dim::Dim::off(),
             seat_name,

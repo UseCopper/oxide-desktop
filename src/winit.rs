@@ -406,6 +406,7 @@ pub fn run_winit() {
             crate::shell::capture_window_snapshots(&state.space, state.backend_data.backend.renderer());
 
             let dim_alpha = state.dim_alpha(Instant::now());
+            let blackout_alpha = state.blackout_alpha(Instant::now());
 
             let backend = &mut state.backend_data.backend;
 
@@ -513,6 +514,7 @@ pub fn run_winit() {
                     age,
                     show_window_preview,
                     dim_alpha,
+                    blackout_alpha,
                 )
                 .map_err(|err| match err {
                     OutputDamageTrackerError::Rendering(err) => err.into(),

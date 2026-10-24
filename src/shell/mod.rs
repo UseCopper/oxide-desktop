@@ -1114,6 +1114,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         self.tick_visibility_animations(&windows, now);
         self.tick_snap_preview(now);
         self.tick_panel();
+        self.tick_ending(now);
     }
 
     /// Advance every window's open/close transition: start opens that were

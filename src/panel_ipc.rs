@@ -1010,9 +1010,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     fn end_session(&mut self, what: EndSession) {
         match what {
             EndSession::Logout => {
-                // The compositor is the session, so the compositor is what stops.
+                // The screen goes black first and the loop stops behind it:
+                // stopping on the frame the last app closed is a cut to
+                // whatever is behind the compositor, and there is nothing
+                // behind it to come back to. `tick_ending` does the stopping
+                // once the fade has arrived.
+                if self.blackout.is_some() {
+                    return;
+                }
                 info!("the session is ending");
-                self.running.store(false, Ordering::SeqCst);
+                self.blackout = Some(crate::dim::Blackout::start(Instant::now()));
             }
             EndSession::Shutdown => {
                 // Asked through systemd, so the machine is brought down the way
@@ -1023,6 +1030,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     warn!(%err, "could not ask for the machine to power off");
                 }
             }
+        }
+    }
+
+    /// Stop the session once the screen has finished going black.
+    ///
+    /// Called every frame; does nothing until the blackout has arrived. The
+    /// blackout is never taken down: the last frame the session draws stays
+    /// what it was, so nothing behind the compositor is shown in its place.
+    pub fn tick_ending(&mut self, now: Instant) {
+        if self.blackout.is_some_and(|blackout| blackout.finished(now)) {
+            self.running.store(false, Ordering::SeqCst);
         }
     }
 

@@ -1,16 +1,18 @@
-//! The darkening behind the panel's question, drawn by the compositor.
+//! The dark the compositor draws over the desktop: the panel's dim, and the
+//! black the session goes away behind.
 //!
-//! It used to be the panel's own: a fullscreen [`DrawingArea`] in the dialog's
-//! window, faded by easing that window's opacity on a 16 ms timer. Every tick of
-//! that fade repainted the whole output-sized surface and re-uploaded it over
-//! the Wayland socket, so the fade ran at a handful of steps a second instead of
-//! at the monitor's rate. A layer-shell window is also placed on one output, so
-//! the overlay stopped at that output's edge.
+//! The panel's dim used to be the panel's own: a fullscreen [`DrawingArea`] in
+//! the dialog's window, faded by easing that window's opacity on a 16 ms timer.
+//! Every tick of that fade repainted the whole output-sized surface and
+//! re-uploaded it over the Wayland socket, so the fade ran at a handful of steps
+//! a second instead of at the monitor's rate. A layer-shell window is also
+//! placed on one output, so the overlay stopped at that output's edge.
 //!
 //! Here there is no surface and no upload: the compositor blends one solid
 //! colour over each output as it draws the frame it was already drawing, and
 //! runs the fade on its own clock. The panel only says when to put the dim up
-//! and when to take it down.
+//! and when to take it down. The same machinery is what blacks the screen out
+//! when the session ends, so the last thing drawn is not a cut.
 //!
 //! [`DrawingArea`]: gtk4::DrawingArea
 
@@ -101,6 +103,13 @@ impl Dim {
     }
 }
 
+/// How long the screen takes to go black when the session ends.
+///
+/// Longer than the dim's fade: this one is not a piece of furniture arriving,
+/// it is the session leaving, and a cut to whatever is behind the compositor is
+/// what it is there to avoid.
+pub const BLACKOUT_FADE: Duration = Duration::from_millis(400);
+
 /// Slowest and fastest at the ends, quickest in the middle.
 ///
 /// The same curve the panel fades opacity on (`ease_in_out` there): a cubic is
@@ -108,6 +117,40 @@ impl Dim {
 /// its clock and then arrives in three frames reads as a jump, not a fade.
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+/// The screen going away when the session ends.
+///
+/// It starts when the session has been told to end and stays: there is nothing
+/// behind it to come back to. The compositor keeps drawing while it rises, so
+/// the last thing on the display is the desktop going dark rather than whatever
+/// frame happened to be scanned out when the loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Blackout {
+    /// When it started going black.
+    since: Instant,
+}
+
+impl Blackout {
+    /// Start going black at `now`.
+    pub fn start(now: Instant) -> Self {
+        Self { since: now }
+    }
+
+    /// How black the screen is at `now` (`0.0..=1.0`).
+    pub fn alpha(&self, now: Instant) -> f32 {
+        let t = (now.saturating_duration_since(self.since).as_secs_f32()
+            / BLACKOUT_FADE.as_secs_f32())
+        .clamp(0.0, 1.0);
+        smoothstep(t)
+    }
+
+    /// Whether it has arrived at black.
+    ///
+    /// From here the session may stop: the screen is already gone.
+    pub fn finished(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.since) >= BLACKOUT_FADE
+    }
 }
 
 /// The buffer an output's dim is drawn from.
@@ -119,11 +162,18 @@ fn smoothstep(t: f32) -> f32 {
 /// a change of colour is exactly what the fade is.
 struct DimBuffer(RefCell<SolidColorBuffer>);
 
-/// The dim over `output`, at `alpha`.
+/// The buffer an output's blackout is drawn from, for the same reason and with
+/// a separate identity: it and the dim can be on screen together.
+struct BlackoutBuffer(RefCell<SolidColorBuffer>);
+
+/// Stretch a one-colour buffer over the whole of `output` at `alpha`.
 ///
-/// A one-colour buffer stretched to the output: the cost is one solid quad, not
-/// a pixel per frame.
-pub fn element(output: &Output, alpha: f32) -> SolidColorRenderElement {
+/// The cost is one solid quad, not a pixel per frame.
+fn stretch(
+    output: &Output,
+    alpha: f32,
+    buffer: &RefCell<SolidColorBuffer>,
+) -> SolidColorRenderElement {
     let scale = output.current_scale().fractional_scale();
     let size = output
         .current_mode()
@@ -136,13 +186,9 @@ pub fn element(output: &Output, alpha: f32) -> SolidColorRenderElement {
             Size::<i32, Logical>::from((logical.w.round() as i32, logical.h.round() as i32))
         })
         .unwrap_or_default();
-    output
-        .user_data()
-        .insert_if_missing(|| DimBuffer(RefCell::new(SolidColorBuffer::new(size, [0.0; 4]))));
-    let buffer = output.user_data().get::<DimBuffer>().expect("just inserted");
-    let mut buffer = buffer.0.borrow_mut();
+    let mut buffer = buffer.borrow_mut();
     // The colour carries the fade, so its commit counter moves exactly when the
-    // dim does.
+    // darkness does.
     buffer.update(size, [0.0, 0.0, 0.0, alpha]);
     SolidColorRenderElement::from_buffer(
         &buffer,
@@ -151,6 +197,27 @@ pub fn element(output: &Output, alpha: f32) -> SolidColorRenderElement {
         1.0,
         Kind::Unspecified,
     )
+}
+
+/// The dim over `output`, at `alpha`, drawn below the panel's layers.
+pub fn element(output: &Output, alpha: f32) -> SolidColorRenderElement {
+    output
+        .user_data()
+        .insert_if_missing(|| DimBuffer(RefCell::new(SolidColorBuffer::default())));
+    let buffer = output.user_data().get::<DimBuffer>().expect("just inserted");
+    stretch(output, alpha, &buffer.0)
+}
+
+/// The blackout over `output`, at `alpha`, drawn above everything.
+pub fn blackout_element(output: &Output, alpha: f32) -> SolidColorRenderElement {
+    output
+        .user_data()
+        .insert_if_missing(|| BlackoutBuffer(RefCell::new(SolidColorBuffer::default())));
+    let buffer = output
+        .user_data()
+        .get::<BlackoutBuffer>()
+        .expect("just inserted");
+    stretch(output, alpha, &buffer.0)
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
@@ -162,6 +229,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// How dark each output is at `now`.
     pub fn dim_alpha(&self, now: Instant) -> f32 {
         self.dim.alpha(now)
+    }
+
+    /// How black the screen is at `now`, as the session goes away.
+    pub fn blackout_alpha(&self, now: Instant) -> f32 {
+        self.blackout.map(|blackout| blackout.alpha(now)).unwrap_or(0.0)
     }
 }
 
@@ -245,5 +317,17 @@ mod tests {
             }
             last = alpha;
         }
+    }
+
+    #[test]
+    fn the_blackout_arrives_at_black_and_stays() {
+        let start = Instant::now();
+        let blackout = Blackout::start(start);
+        assert_eq!(blackout.alpha(start), 0.0);
+        assert!(!blackout.finished(start));
+        assert!(blackout.alpha(start + BLACKOUT_FADE / 2) > 0.0);
+        assert_eq!(blackout.alpha(start + BLACKOUT_FADE), 1.0);
+        assert!(blackout.finished(start + BLACKOUT_FADE));
+        assert_eq!(blackout.alpha(start + BLACKOUT_FADE * 5), 1.0);
     }
 }

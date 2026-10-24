@@ -179,6 +179,7 @@ pub fn output_elements<R>(
     renderer: &mut R,
     show_window_preview: bool,
     dim_alpha: f32,
+    blackout_alpha: f32,
 ) -> (Vec<OutputRenderElements<R, WindowRenderElement<R>>>, Color32F)
 where
     R: Renderer + ImportAll + ImportMem,
@@ -222,6 +223,15 @@ where
         );
 
         elements.extend(layer_elements(renderer, output, &below));
+
+        // Last of all, over the picture: the session going away is black over
+        // everything, the panel and the cursor included.
+        if blackout_alpha > 0.0 {
+            elements.insert(
+                0,
+                OutputRenderElements::Solid(dim::blackout_element(output, blackout_alpha)),
+            );
+        }
 
         (elements, CLEAR_COLOR_FULLSCREEN)
     } else {
@@ -286,6 +296,13 @@ where
         // own thread, and only the element is per-frame.
         if let Some(element) = background_element(renderer, output) {
             output_render_elements.push(element);
+        }
+
+        if blackout_alpha > 0.0 {
+            output_render_elements.insert(
+                0,
+                OutputRenderElements::Solid(dim::blackout_element(output, blackout_alpha)),
+            );
         }
 
         (output_render_elements, CLEAR_COLOR)
@@ -380,12 +397,20 @@ pub fn render_output<'a, 'd, R>(
     age: usize,
     show_window_preview: bool,
     dim_alpha: f32,
+    blackout_alpha: f32,
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
 where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Clone + Send + 'static,
 {
-    let (elements, clear_color) =
-        output_elements(output, space, custom_elements, renderer, show_window_preview, dim_alpha);
+    let (elements, clear_color) = output_elements(
+        output,
+        space,
+        custom_elements,
+        renderer,
+        show_window_preview,
+        dim_alpha,
+        blackout_alpha,
+    );
     damage_tracker.render_output(renderer, framebuffer, age, &elements, clear_color)
 }
