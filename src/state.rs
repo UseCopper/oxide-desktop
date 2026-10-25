@@ -178,6 +178,20 @@ pub struct SuperKey {
     pub combined: bool,
 }
 
+/// An Alt+Tab in progress: the windows to step through, and where in them the
+/// keyboard is.
+///
+/// The list is taken when the first Tab is pressed and kept for as long as Alt
+/// is held, so the next Tab goes to the next window rather than back to the one
+/// just left. Letting Alt go ends it.
+#[derive(Debug)]
+pub struct WindowSwitcher {
+    /// The windows open when the stepping started, most recently focused first.
+    pub windows: Vec<WindowElement>,
+    /// Which of them is selected now.
+    pub index: usize,
+}
+
 #[derive(Debug)]
 pub struct AnvilState<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
@@ -246,6 +260,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// it is known when the key comes up, and only if nothing else joined it in
     /// between.
     pub super_key: Rc<Cell<SuperKey>>,
+    /// The windows an Alt+Tab is stepping through, while Alt is held.
+    pub switcher: Option<WindowSwitcher>,
     pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<AnvilState<BackendData>>,
@@ -929,6 +945,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             super_key: Rc::new(Cell::new(SuperKey::default())),
+            switcher: None,
             pending_session_end: None,
             blackout: None,
             ending: None,

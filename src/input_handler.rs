@@ -1,6 +1,12 @@
-use std::{convert::TryInto, sync::atomic::Ordering, time::Instant};
+use std::{
+    cell::Cell,
+    convert::TryInto,
+    rc::Rc,
+    sync::atomic::Ordering,
+    time::Instant,
+};
 
-use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}};
+use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}, state::WindowSwitcher};
 
 #[cfg(feature = "udev")]
 use crate::udev::UdevData;
@@ -37,6 +43,19 @@ use smithay::backend::input::AbsolutePositionEvent;
 #[cfg(any(feature = "winit", feature = "x11"))]
 use smithay::output::Output;
 use tracing::{debug, info};
+
+/// The next stop in a window switcher.
+///
+/// Four windows and the first selected: forward takes 0 → 1 → 2 → 3 → 0, and
+/// backwards 0 → 3 → 2 → 1 → 0. `count` is never zero here; the caller has
+/// already refused a switcher with nothing to switch to.
+fn step_index(index: usize, count: usize, backwards: bool) -> usize {
+    if backwards {
+        (index + count - 1) % count
+    } else {
+        (index + 1) % count
+    }
+}
 
 /// Whether a named cursor is one of the resize arrows.
 fn is_resize_icon(icon: CursorIcon) -> bool {
@@ -144,11 +163,60 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 self.restore_last_minimized();
             }
 
+            KeyAction::CycleWindows { backwards } => {
+                self.cycle_window(backwards);
+            }
+
+            KeyAction::FinishSwitcher => {
+                self.switcher = None;
+            }
+
             _ => unreachable!(
                 "Common key action handler encountered backend specific action {:?}",
                 action
             ),
         }
+    }
+
+    /// Step through the open windows, most recently focused first.
+    ///
+    /// The list is taken when the stepping starts and kept while Alt is held:
+    /// built fresh on every Tab, the raise that follows each step would make the
+    /// second one go straight back to the window it just left. Letting Alt go
+    /// (`KeyAction::FinishSwitcher`) drops the list.
+    fn cycle_window(&mut self, backwards: bool) {
+        let mut switcher = match self.switcher.take() {
+            Some(switcher) => switcher,
+            None => {
+                let windows: Vec<WindowElement> = self
+                    .space
+                    .elements()
+                    .rev()
+                    .filter(|window| !window.is_ghosting())
+                    .cloned()
+                    .collect();
+                if windows.len() < 2 {
+                    return;
+                }
+                WindowSwitcher { windows, index: 0 }
+            }
+        };
+
+        // A window can close while Alt is still down; one that has gone is not
+        // somewhere the next Tab can land.
+        let open: Vec<WindowElement> = self.space.elements().cloned().collect();
+        switcher
+            .windows
+            .retain(|window| open.contains(window) && !window.is_ghosting());
+        let count = switcher.windows.len();
+        if count < 2 {
+            return;
+        }
+
+        switcher.index = step_index(switcher.index, count, backwards);
+        let target = switcher.windows[switcher.index].clone();
+        self.switcher = Some(switcher);
+        self.focus_window(&target);
     }
 
     fn keyboard_key_to_action<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) -> KeyAction {
@@ -193,6 +261,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // The Super key's own state, shared with the closure below: the closure
         // cannot borrow the state it is delivering the key to.
         let super_key = self.super_key.clone();
+        // Alt is not suppressed -- a client that uses it, and Alt+click or a
+        // drag, must still see it -- so letting it go is only *observed* here.
+        // The action still finishes the switcher.
+        let alt_released = Rc::new(Cell::new(false));
         let action = keyboard
             .input(self, keycode, state, serial, time, |_, modifiers, handle| {
                 let keysym = handle.modified_sym();
@@ -202,6 +274,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 let is_super = handle.raw_syms().iter().any(|sym| {
                     matches!(sym.raw(), xkb::KEY_Super_L | xkb::KEY_Super_R)
                 });
+                let is_alt = handle
+                    .raw_syms()
+                    .iter()
+                    .any(|sym| matches!(sym.raw(), xkb::KEY_Alt_L | xkb::KEY_Alt_R));
 
                 debug!(
                     ?state,
@@ -254,6 +330,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         FilterResult::Forward
                     }
                 } else {
+                    if is_alt {
+                        alt_released.set(true);
+                    }
                     let suppressed = suppressed_keys.contains(&keysym);
                     if suppressed {
                         suppressed_keys.retain(|k| *k != keysym);
@@ -279,6 +358,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .unwrap_or(KeyAction::None);
 
         self.suppressed_keys = suppressed_keys;
+        if alt_released.get() {
+            return KeyAction::FinishSwitcher;
+        }
         action
     }
 
@@ -879,7 +961,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::Minimize
-                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
+                    | KeyAction::RestoreWindow
+                    | KeyAction::CycleWindows { .. }
+                    | KeyAction::FinishSwitcher => self.process_common_key_action(action),
 
                     _ => tracing::warn!(
                         ?action,
@@ -1106,7 +1190,9 @@ impl AnvilState<UdevData> {
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::Minimize
-                    | KeyAction::RestoreWindow => self.process_common_key_action(action),
+                    | KeyAction::RestoreWindow
+                    | KeyAction::CycleWindows { .. }
+                    | KeyAction::FinishSwitcher => self.process_common_key_action(action),
 
                     _ => unreachable!(),
                 },
@@ -1610,6 +1696,12 @@ enum KeyAction {
     Minimize,
     /// Restore the most recently minimized window
     RestoreWindow,
+    /// Step to the next window, or the previous one.
+    CycleWindows {
+        backwards: bool,
+    },
+    /// Alt was let go: the window switcher is over.
+    FinishSwitcher,
     /// Do nothing more
     None,
 }
@@ -1621,6 +1713,13 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         // ctrl+alt+backspace = quit
         // logo + q = quit
         Some(KeyAction::Quit)
+    } else if modifiers.alt && (keysym == Keysym::Tab || keysym == Keysym::ISO_Left_Tab) {
+        // Alt+Tab steps forward, Alt+Shift+Tab back. Shift turns Tab into
+        // `ISO_Left_Tab`, so both symbols are accepted; the direction is still
+        // read from the modifier, not from which symbol arrived.
+        Some(KeyAction::CycleWindows {
+            backwards: modifiers.shift,
+        })
     } else if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12).contains(&keysym.raw()) {
         // VTSwitch
         Some(KeyAction::VtSwitch(
@@ -1648,5 +1747,56 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::Minimize)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alt(shift: bool) -> ModifiersState {
+        ModifiersState {
+            alt: true,
+            shift,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_window_switcher_wraps_both_ways() {
+        let mut forward = Vec::new();
+        let mut index = 0;
+        for _ in 0..4 {
+            index = step_index(index, 4, false);
+            forward.push(index);
+        }
+        assert_eq!(forward, vec![1, 2, 3, 0]);
+
+        let mut backwards = Vec::new();
+        let mut index = 0;
+        for _ in 0..4 {
+            index = step_index(index, 4, true);
+            backwards.push(index);
+        }
+        assert_eq!(backwards, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn alt_tab_is_a_shortcut_and_shift_turns_it_around() {
+        assert!(matches!(
+            process_keyboard_shortcut(alt(false), Keysym::Tab),
+            Some(KeyAction::CycleWindows { backwards: false })
+        ));
+        // Shift turns Tab into ISO_Left_Tab; both symbols are the same key.
+        assert!(matches!(
+            process_keyboard_shortcut(alt(true), Keysym::ISO_Left_Tab),
+            Some(KeyAction::CycleWindows { backwards: true })
+        ));
+        assert!(matches!(
+            process_keyboard_shortcut(alt(true), Keysym::Tab),
+            Some(KeyAction::CycleWindows { backwards: true })
+        ));
+        // Tab on its own belongs to the client.
+        assert!(process_keyboard_shortcut(ModifiersState::default(), Keysym::Tab).is_none());
     }
 }
