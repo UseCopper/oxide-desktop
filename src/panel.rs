@@ -3724,6 +3724,8 @@ struct Dialog {
     /// The space in the middle of the answers, which goes when the answer at
     /// the end of them does.
     gap: GtkBox,
+    /// The way out that is always there, and where the keyboard starts.
+    cancel: Button,
     confirm: Button,
     /// What the question is about now.
     state: Cell<DialogState>,
@@ -3851,6 +3853,7 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         apps,
         answers: answers.clone(),
         gap,
+        cancel: cancel.clone(),
         confirm: confirm.clone(),
         state: Cell::new(DialogState::None),
         action: Cell::new(None),
@@ -3893,6 +3896,16 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
         if key == gdk::Key::Escape {
             dialog_cancel(&escaped);
             glib::Propagation::Stop
+        } else if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            // Answer with the button the keyboard is on. GTK's own Return goes
+            // to the window's default widget, and this dialog has none: the
+            // destructive answer is not one to make the default.
+            if let Some(focused) = gtk4::prelude::GtkWindowExt::focus(&escaped.window) {
+                focused.activate();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
         } else {
             glib::Propagation::Proceed
         }
@@ -3900,6 +3913,19 @@ fn build_dialog(app: &Application, monitor: &gdk::Monitor, stream: Channel) -> R
     window.add_controller(keys);
 
     dialog
+}
+
+/// The output the question should be on: the one the menu it was asked from is
+/// on.
+///
+/// The panel is one bar on one output, so this is that output — but it is read
+/// from the surface of the menu that asked instead of being nailed to whichever
+/// monitor GDK listed first at startup. A panel on several outputs would then
+/// get this right without the dialog having to know where the bar is.
+fn dialog_monitor(dialog: &Dialog) -> Option<gdk::Monitor> {
+    let launcher = dialog.launcher.borrow().upgrade()?;
+    let surface = launcher.window.surface()?;
+    gdk::Display::default()?.monitor_at_surface(&surface)
 }
 
 /// Ask the question, over the top of everything.
@@ -3930,7 +3956,17 @@ fn dialog_ask(dialog: &Rc<Dialog>, what: Confirm, launcher: &std::rc::Weak<Launc
     if !dialog.window.is_visible() {
         dialog.plate.set_opacity(0.0);
     }
+    // The question belongs on the output the menu it was asked from is on —
+    // which is the panel's output, not whichever one GDK happens to list first
+    // — and that is only known once the menu is actually up.
+    if let Some(monitor) = dialog_monitor(dialog) {
+        dialog.window.set_monitor(Some(&monitor));
+    }
     dialog.window.present();
+    // The keyboard starts on the way out. The other answer is the one that
+    // ends a session; it should be reached deliberately, not by pressing
+    // Return on a question that just appeared.
+    dialog.cancel.grab_focus();
     dialog_dim(dialog, true);
     // And the "anyway" button comes back on its own, three seconds after the
     // dialog opened -- or after the wait it is already in the middle of. It is
