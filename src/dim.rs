@@ -101,6 +101,15 @@ impl Dim {
         .clamp(0.0, 1.0);
         self.from + (self.to - self.from) * smoothstep(t)
     }
+
+    /// Whether the question's dim is between the desktop and the pointer at `now`.
+    ///
+    /// True from the moment it is asked for, even before the first frame has
+    /// drawn it, and until the last frame of its way out has gone: for all of
+    /// that time the desktop behind it is not something to click.
+    pub fn active(&self, now: Instant) -> bool {
+        self.to > 0.0 || self.alpha(now) > 0.0
+    }
 }
 
 /// How long the screen takes to go black when the session ends.

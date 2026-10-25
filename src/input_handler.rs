@@ -1,4 +1,4 @@
-use std::{convert::TryInto, sync::atomic::Ordering};
+use std::{convert::TryInto, sync::atomic::Ordering, time::Instant};
 
 use crate::{AnvilState, focus::{KeyboardFocusTarget, PointerFocusTarget}, shell::{FullscreenSurface, WindowElement, ssd::{BTN_LEFT, resize_cursor}}};
 
@@ -466,6 +466,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 }
             }
 
+            if self.dim.active(Instant::now()) {
+                // The question holds the keyboard as well as the screen. A
+                // press on another output must not take it away, and there is
+                // no window there to give it to; falling through to the empty
+                // space path would clear it and leave the question unable to
+                // answer Escape.
+                return;
+            }
+
             if let Some((window, _)) = self.space.element_under(location).map(|(w, p)| (w.clone(), p)) {
                 self.space.raise_element(&window, true);
                 #[cfg(feature = "xwayland")]
@@ -517,6 +526,32 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         })?;
         let output_geo = self.space.output_geometry(output).unwrap();
         let layers = layer_map_for_output(output);
+
+        // While the question is up, the only thing the pointer can reach is the
+        // panel: the question's own fullscreen shield on the output it was
+        // asked on, and nothing at all on the others. The dim covers every
+        // output but is not a surface; without this, a click on a monitor with
+        // no panel on it went to the window the dim was hiding.
+        if self.dim.active(Instant::now()) {
+            return layers
+                .layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
+                .or_else(|| layers.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64()))
+                .and_then(|layer| {
+                    let layer_loc = layers.layer_geometry(layer)?.loc;
+                    layer
+                        .surface_under(
+                            pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(surface, loc)| {
+                            (
+                                PointerFocusTarget::from(surface),
+                                loc + layer_loc + output_geo.loc,
+                            )
+                        })
+                })
+                .map(|(surface, loc)| (surface, loc.to_f64()));
+        }
 
         // The order here is the contract with the panel: a fullscreen window, then the
         // `Overlay` and `Top` layers, then the windows, then `Bottom` and `Background`.
