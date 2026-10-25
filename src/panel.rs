@@ -6338,15 +6338,6 @@ fn parse_frame(frame: &[u8]) -> Option<PanelEvent> {
     }
 }
 
-/// Write a message to the compositor.
-///
-/// A partial write is not treated as an error worth reporting: the socket is
-/// non-blocking, and these are short requests the compositor drains every frame. Silently
-/// dropping one costs a preview that is asked for again on the next tick.
-fn send(stream: &Rc<UnixStream>, message: &str) {
-    let _ = (&**stream).write_all(&panel_proto::encode_text(message));
-}
-
 /// The panel's handle on the compositor.
 ///
 /// A shared, replaceable pointer rather than an `Rc<UnixStream>` threaded through every
@@ -6355,32 +6346,90 @@ fn send(stream: &Rc<UnixStream>, message: &str) {
 /// be talking to the new one. Holding the socket in each of them would mean reconnecting
 /// each of them, and any one of them that was missed would keep writing into a dead
 /// connection forever.
+///
+/// Messages are queued rather than written straight to the socket. The socket is
+/// non-blocking, so a write can take part of a frame and leave the rest for later; writing
+/// the remainder by hand and hoping is how a stream ends up with half a length prefix in it
+/// and a compositor that treats everything after it as garbage. Here whole frames go into
+/// one buffer and are handed to the kernel until it stops taking them, so the invariant the
+/// framing depends on — a frame is either whole or absent — is kept even under backpressure.
 #[derive(Clone, Default)]
-struct Channel(Rc<RefCell<Option<Rc<UnixStream>>>>);
+struct Channel(Rc<RefCell<Connection>>);
+
+/// The socket and whatever of the queued frames the kernel has not taken yet.
+///
+/// A disconnect clears `pending` with it: bytes of a frame written to the old socket are
+/// owed to the old reader, not the new one, and replaying them on a new connection would
+/// put that frame's tail in front of the next frame's head.
+#[derive(Default)]
+struct Connection {
+    stream: Option<Rc<UnixStream>>,
+    pending: Vec<u8>,
+}
+
+impl Connection {
+    /// Hand as much of the queue to the socket as it will take.
+    fn flush(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            self.pending.clear();
+            return;
+        };
+        while !self.pending.is_empty() {
+            match (&**stream).write(&self.pending) {
+                Ok(0) => break,
+                Ok(written) => {
+                    self.pending.drain(..written);
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // The connection is gone. The stream is left in place so the
+                    // read side notices and the usual reconnect runs; there is no
+                    // point keeping a queue nothing will ever take.
+                    self.pending.clear();
+                    break;
+                }
+            }
+        }
+    }
+}
 
 impl Channel {
     fn new(stream: Option<Rc<UnixStream>>) -> Self {
-        Self(Rc::new(RefCell::new(stream)))
+        Self(Rc::new(RefCell::new(Connection {
+            stream,
+            pending: Vec::new(),
+        })))
     }
 
     fn get(&self) -> Option<Rc<UnixStream>> {
-        self.0.borrow().clone()
+        self.0.borrow().stream.clone()
     }
 
     /// Point every holder at a new socket, or at nothing.
     fn set(&self, stream: Option<Rc<UnixStream>>) {
-        *self.0.borrow_mut() = stream;
+        let mut connection = self.0.borrow_mut();
+        connection.pending.clear();
+        connection.stream = stream;
     }
 
     fn is_connected(&self) -> bool {
-        self.0.borrow().is_some()
+        self.0.borrow().stream.is_some()
     }
 
     /// Send one message, if there is anywhere to send it.
     fn send(&self, message: &str) {
-        if let Some(stream) = self.get() {
-            send(&stream, message);
+        let mut connection = self.0.borrow_mut();
+        if connection.stream.is_none() {
+            return;
         }
+        connection.pending.extend_from_slice(&panel_proto::encode_text(message));
+        connection.flush();
+    }
+
+    /// Try again to hand the socket whatever it would not take earlier.
+    fn flush(&self) {
+        self.0.borrow_mut().flush();
     }
 }
 
@@ -6845,6 +6894,9 @@ fn start_polling(
     let menu_tick = menu.clone();
 
     glib::timeout_add_local(POLL_INTERVAL, move || {
+        // Anything the socket would not take last time goes first.
+        channel_poll.flush();
+
         let mut buf = [0u8; 65536];
         let mut lost = false;
         // Through the channel rather than a captured socket, because the socket is
