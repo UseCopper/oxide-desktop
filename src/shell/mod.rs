@@ -1450,7 +1450,11 @@ fn place_new_window(
 
     // `map_element(.., true)` gives the window the xdg activated state, which
     // is all that top level needs to render its frame as the active one.
-    // The keyboard follows a click, not a mapping — Anvil's own rule.
+    //
+    // Mapping alone does not move the keyboard: a caller that is opening a new
+    // window does that itself (see the xdg and X11 map paths). A window that is
+    // re-mapped because an output changed, or because it is being restored, is
+    // not a new one and must not take the keyboard away from the hand.
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {

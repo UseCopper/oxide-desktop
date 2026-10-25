@@ -68,6 +68,9 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         let window = WindowElement(Window::new_x11_window(window));
         window.begin_open();
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+        // A new window is the thing the person just asked for, so it takes the
+        // keyboard as it arrives.
+        self.focus_window(&window);
         let Some(bbox) = self.space.element_bbox(&window) else {
             return;
         };
